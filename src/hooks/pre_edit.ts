@@ -88,16 +88,29 @@ export async function handlePreEdit(
   // hash_differs disambiguation is unavailable; a first-time editor (state
   // None) falls through to the normal acquire flow. Fires only after this
   // session has been explicitly preempted.
+  //
+  // A preempted session can also hold SHARED without having read the current
+  // version: a strict Bash / Grep deny re-arms SHARED so the retry it invites
+  // goes through, and records no observation because the command never ran
+  // (applyRegrants in _common.ts). Admitting that grant lets a whole-file
+  // write from the copy read before the peer's commit overwrite the commit
+  // (Cohexa-ai/agent-coherence#275), so it is stale too until a retried
+  // Bash command or a Read records the current version (a retried Grep
+  // records none: it never showed the file). A SHARED holder with no
+  // observation at all has acted on no version and is admitted like a
+  // first-time editor. Mirrors Python pre-edit.
   if (existing !== null && deps.policy.isStrictMode(path)) {
     const editorState = deps.registry.getAgentState(artifactId, agentId);
-    if (existing.version > 0 && editorState === MESIState.INVALID) {
+    const observed = deps.registry.lastObservedVersionFor(artifactId, agentId);
+    const unobservedShared =
+      editorState === MESIState.SHARED && observed !== null && observed < existing.version;
+    if (existing.version > 0 && (editorState === MESIState.INVALID || unobservedShared)) {
       const summary: StaleSummary = {
         path,
         current_version: existing.version,
         // R8: the observed version, not the inferred one -- see pre_read.ts.
         prior_version_seen_by_session:
-          deps.registry.lastObservedVersionFor(artifactId, agentId) ??
-          (existing.version > 0 ? existing.version - 1 : 0),
+          observed ?? (existing.version > 0 ? existing.version - 1 : 0),
         // R7: the registry's handle for the writer, not a recovered session id.
         last_writer_session_id: existing.last_writer_id ?? "<unknown>",
         last_writer_at_unix_ts: existing.updated_at,

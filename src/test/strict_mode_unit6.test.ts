@@ -1033,3 +1033,63 @@ test("a bash read leaves a held EXCLUSIVE grant alone", async () => {
     await cleanup();
   }
 });
+
+/*
+ * A denied shell read re-arms the grant, not the right to write
+ * (Cohexa-ai/agent-coherence#275). The strict Bash / Grep deny re-grants
+ * SHARED without an observation; the strict pre-edit gate used to look only
+ * for INVALID, so that grant admitted the session's next Edit or Write and a
+ * whole-file write from its pre-commit copy overwrote the peer's commit. The
+ * Python twins live in tests/integration/test_strict_mode.py.
+ */
+for (const [label, route, extra] of [
+  ["cat", "/hooks/pre-bash", { command: `cat ${STRICT_PATH}` }],
+  ["Grep tool", "/hooks/pre-grep", { search_root: "" }],
+] as const) {
+  test(`a write after a denied shell read (${label}) is the strict deny until the session reads`, async () => {
+    const { registry, sessions, post, cleanup } = await makeStrictServer([STRICT_PATH]);
+    try {
+      const ids = staleForA(registry, sessions, STRICT_PATH);
+      const r = await post(route, { session_id: SID_A, ...extra });
+      assert.equal(decision(r), "deny");
+      // Asserted, not assumed: the deny re-armed SHARED and recorded no read.
+      assert.equal(registry.getAgentState(ids.id, ids.agentA), MESIState.SHARED);
+      assert.equal(registry.lastObservedVersionFor(ids.id, ids.agentA), 1);
+
+      const edit = await post("/hooks/pre-edit", { session_id: SID_A, path: STRICT_PATH });
+      assert.equal(edit.ok, false);
+      assert.equal(decision(edit), "deny");
+      const summary = edit.summary as Record<string, unknown>;
+      assert.equal(summary.prior_version_seen_by_session, 1);
+      assert.equal(summary.current_version, 2);
+      // The deny takes nothing: A keeps the re-armed grant its Read relies on.
+      assert.equal(registry.getAgentState(ids.id, ids.agentA), MESIState.SHARED);
+
+      const read = await post("/hooks/pre-read", { session_id: SID_A, path: STRICT_PATH, content_hash: HASH_2 });
+      assert.equal(read.status, "fresh");
+      const again = await post("/hooks/pre-edit", { session_id: SID_A, path: STRICT_PATH });
+      assert.notEqual(decision(again), "deny");
+      assert.notEqual(again.ok, false);
+    } finally {
+      await cleanup();
+    }
+  });
+}
+
+test("a write after the retry a denied bash invites is admitted", async () => {
+  const { registry, sessions, post, cleanup } = await makeStrictServer([STRICT_PATH]);
+  try {
+    const ids = staleForA(registry, sessions, STRICT_PATH);
+    await post("/hooks/pre-bash", { session_id: SID_A, command: `cat ${STRICT_PATH}` });
+    const retry = await post("/hooks/pre-bash", { session_id: SID_A, command: `cat ${STRICT_PATH}` });
+    assert.equal(retry.status, "fresh");
+    assert.notEqual(decision(retry), "deny");
+    assert.equal(registry.lastObservedVersionFor(ids.id, ids.agentA), 2);
+
+    const edit = await post("/hooks/pre-edit", { session_id: SID_A, path: STRICT_PATH });
+    assert.notEqual(decision(edit), "deny");
+    assert.notEqual(edit.ok, false);
+  } finally {
+    await cleanup();
+  }
+});
