@@ -253,6 +253,20 @@ export function shortSessionId(identityId: string): string {
 }
 
 /**
+ * Literal `{key}` template substitution in ONE pass over the template, so a
+ * substituted value is never re-scanned — a tracked path carrying a brace
+ * token (`docs/{current}/plan.md` passes isValidPath) must render verbatim,
+ * exactly as Python's single-pass `str.format` renders it. The replacer
+ * form also keeps values containing `$` patterns from corrupting the prose
+ * — the templates are the byte-parity contract.
+ */
+export function fmt(template: string, subs: Record<string, string>): string {
+  return template.replace(/\{(\w+)\}/g, (match: string, key: string) =>
+    Object.hasOwn(subs, key) ? subs[key] : match,
+  );
+}
+
+/**
  * Build the strict-mode deny envelope — byte-parity with Python
  * `emit_strict_deny`:
  * - null/absent last_writer → the literal `<unknown>`;
@@ -268,18 +282,20 @@ export function emitStrictDeny(args: { source: string; summary: StaleSummary }):
     return {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
-      permissionDecisionReason: GRANT_CHANGE_DENY_REASON_TEMPLATE.replaceAll(
-        "{path}",
-        args.summary.path,
-      ).replace("{current_version}", String(args.summary.current_version)),
+      permissionDecisionReason: fmt(GRANT_CHANGE_DENY_REASON_TEMPLATE, {
+        path: args.summary.path,
+        current_version: String(args.summary.current_version),
+      }),
     };
   }
   const lastWriterFull = args.summary.last_writer_session_id || "<unknown>";
   const lastWriterShort = shortSessionId(lastWriterFull);
   const lastWriterTsIso = pythonIsoUtc(args.summary.last_writer_at_unix_ts);
-  const reason = STRICT_MODE_DENY_REASON_TEMPLATE.replaceAll("{path}", args.summary.path)
-    .replace("{last_writer_short}", lastWriterShort)
-    .replace("{last_writer_ts_iso}", lastWriterTsIso);
+  const reason = fmt(STRICT_MODE_DENY_REASON_TEMPLATE, {
+    path: args.summary.path,
+    last_writer_short: lastWriterShort,
+    last_writer_ts_iso: lastWriterTsIso,
+  });
   return {
     hookEventName: "PreToolUse",
     permissionDecision: "deny",

@@ -32,6 +32,7 @@ import { MESIState } from "../states.js";
 import { sessionToAgentId } from "../agent_id.js";
 import {
   emitSessionStart,
+  fmt,
   preemptionNoticeText,
   shortSessionId,
   SESSION_START_HEADER,
@@ -68,20 +69,6 @@ export const SESSION_START_ARTIFACT_VERBATIM_CAP = 3;
 
 interface SessionStartBody {
   session_id?: unknown;
-}
-
-/**
- * Literal `{key}` template substitution in ONE pass over the template, so a
- * substituted value is never re-scanned — a tracked path carrying a brace
- * token (`docs/{current}/plan.md` passes isValidPath) must render verbatim,
- * exactly as Python's single-pass `str.format` renders it. The replacer
- * form also keeps values containing `$` patterns from corrupting the prose
- * — the templates are the byte-parity contract.
- */
-function fmt(template: string, subs: Record<string, string>): string {
-  return template.replace(/\{(\w+)\}/g, (match: string, key: string) =>
-    Object.hasOwn(subs, key) ? subs[key] : match,
-  );
 }
 
 interface SessionStartContext {
