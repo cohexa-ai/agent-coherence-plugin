@@ -165,7 +165,10 @@ test("appendPolicyYaml: refuses a valid list whose layout an appended line would
   // Each of these loads entries today. A block line after a flow list, an
   // empty `[]`, an indented list or a `...` end marker stops the file parsing,
   // so the write would erase entries that were working. Nothing is written.
-  for (const content of ['["a.md", "*.md"]\n', "[]\n", '  - "a.md"\n', '- "a.md"\n...\n', "~\n"]) {
+  // The last one parses after an append but changes an entry: the trailing
+  // newlines a keep-chomped block scalar holds are trimmed, so only the
+  // entry-by-entry comparison catches it.
+  for (const content of ['["a.md", "*.md"]\n', "[]\n", '  - "a.md"\n', '- "a.md"\n...\n', "~\n", "- |+\n  a\n\n"]) {
     const { root, cleanup } = makeRoot();
     try {
       const yamlPath = seedTracked(root, content);
@@ -210,6 +213,26 @@ test("appendPolicyYaml: appends to an empty, comment-only or CRLF file, with any
     } finally {
       cleanup();
     }
+  }
+});
+
+test("appendPolicyYaml: appends to a file in the layout the Python library writes", () => {
+  // Bytes from PyYAML's `safe_dump(sorted(entries), default_flow_style=False)`,
+  // the call CoherentVolume._merge_yaml_list uses on the same files: single
+  // quotes, `\N` and `\xE9` escapes, a long plain scalar. A load-back check
+  // that mishandled them would refuse every track in such a workspace.
+  const { root, cleanup } = makeRoot();
+  try {
+    const pythonWritten =
+      "- '**/*.md'\n- '*.log'\n- '123'\n- \"a\\Nb.md\"\n- \"caf\\xE9.md\"\n" +
+      `- deep/${"n".repeat(90)}.md\n- 'docs/x #1.md'\n- 'null'\n- 'yes'\n`;
+    const yamlPath = seedTracked(root, pythonWritten);
+    const entries = ["**/*.md", "*.log", "123", "a\u0085b.md", "café.md", `deep/${"n".repeat(90)}.md`, "docs/x #1.md", "null", "yes"];
+    assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, entries);
+    assert.deepEqual(appendPolicyYaml(yamlPath, ["new.md"]).added, ["new.md"]);
+    assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, [...entries, "new.md"]);
+  } finally {
+    cleanup();
   }
 });
 
