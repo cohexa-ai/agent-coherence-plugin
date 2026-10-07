@@ -226,9 +226,6 @@ test("session-start: peer advanced past last-observed renders the stale line wit
     const agentB = sessions.registerSession(SID_B);
     registry.acquireExclusive(id, agentB, 20); // A → INVALID (last_observed stays 1)
     registry.commit(id, agentB, HASH_2, 30); // v2, last_writer = B
-    // Node queues the SHARED victim a preemption notice (Python: M∪E only);
-    // drain it so this scenario pins the pure stale-line payload.
-    registry.popPendingNoticesForAgent(agentA);
 
     const r = await post("/hooks/session-start", { session_id: SID_A });
     assert.equal(r.status, 200);
@@ -259,7 +256,6 @@ test("session-start: own last-writer renders the plain version line, never the s
     const agentB = sessions.registerSession(SID_B);
     registry.acquireExclusive(id, agentB, 20);
     registry.commit(id, agentB, HASH_2, 30); // v2 > A's last-observed v1
-    registry.popPendingNoticesForAgent(agentA);
 
     // Seam: make A itself the recorded last writer. The natural flow advances
     // the writer's own last_observed in the same transaction (KTD4's FIRST
@@ -346,7 +342,7 @@ test("session-start: pending preemption notice rendered READ-ONLY — appears in
   try {
     const id = registry.resolveOrRegisterArtifact("AGENTS.md", HASH_1);
     const agentA = sessions.registerSession(SID_A);
-    registry.grantShared(id, agentA, 10);
+    registry.acquireExclusive(id, agentA, 10);
     const agentB = sessions.registerSession(SID_B);
     registry.acquireExclusive(id, agentB, 20); // queues A a notice; A → INVALID
 
@@ -526,7 +522,6 @@ test("session-start: a tracked path carrying a template token renders VERBATIM (
     const agentB = sessions.registerSession(SID_B);
     registry.acquireExclusive(braced, agentB, 20); // A → INVALID at v1
     registry.commit(braced, agentB, HASH_2, 30); // v2, last_writer = B
-    registry.popPendingNoticesForAgent(agentA);
 
     const r = await post("/hooks/session-start", { session_id: SID_A });
     assert.equal(r.status, 200);
@@ -557,7 +552,7 @@ test("session-start: the flattened notice block honours the verbatim cap (R5 siz
     const agentB = sessions.registerSession(SID_B);
     for (let i = 0; i < 40; i++) {
       const id = registry.resolveOrRegisterArtifact(`docs/plans/p${i}.md`, HASH_1);
-      registry.grantShared(id, agentA, 10);
+      registry.acquireExclusive(id, agentA, 10);
       // Preemption timestamps ASCEND with i, so the newest three are p37,
       // p38, p39 — which ASCII path order (p0, p1, p10, p11, …) does NOT
       // put first. Which three survive the cap is therefore observable.

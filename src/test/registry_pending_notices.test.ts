@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ArtifactRegistry } from "../registry.js";
+import { MESIState } from "../states.js";
 
 function makeRegistry(): { registry: ArtifactRegistry; cleanup: () => void } {
   const tmp = mkdtempSync(join(tmpdir(), "notices-test-"));
@@ -34,11 +35,13 @@ const VICTIM = "a".repeat(32);
 const PREEMPTER = "b".repeat(32);
 const PREEMPTER_2 = "c".repeat(32);
 const HASH_1 = "1".repeat(64);
+const HASH_2 = "2".repeat(64);
 
 /** Queue one notice for VICTIM on a fresh artifact, preempted at `ts`. */
 function queueNotice(registry: ArtifactRegistry, name: string, ts: number): void {
   const id = registry.resolveOrRegisterArtifact(name, HASH_1);
-  registry.grantShared(id, VICTIM, ts);
+  // A notice is for a lost write grant, so the victim must hold one (#163).
+  registry.acquireExclusive(id, VICTIM, ts);
   registry.acquireExclusive(id, PREEMPTER, ts);
 }
 
@@ -105,13 +108,14 @@ test("a same-second re-preemption names the NEW preempter, not the first one", (
     // wrong session, which is the operator's only record of who took the
     // grant.
     //
-    // Reachable on the strict-mode path specifically: `pre_bash.ts` re-grants
-    // SHARED, then returns the deny BEFORE `drainNoticeText`, so the row from
-    // the first preemption is still queued when the second one lands.
+    // The victim re-arms with a second write grant without draining; a
+    // reader re-grant (the strict pre-bash/pre-grep re-arm) is queued no
+    // notice, so it cannot reach this. The guard is the "latest preempter
+    // wins" contract.
     const id = registry.resolveOrRegisterArtifact("docs/plans/contended.md", HASH_1);
-    registry.grantShared(id, VICTIM, 5000);
+    registry.acquireExclusive(id, VICTIM, 5000);
     registry.acquireExclusive(id, PREEMPTER, 5000);
-    registry.grantShared(id, VICTIM, 5000); // the strict-path re-arm
+    registry.acquireExclusive(id, VICTIM, 5000); // re-arms without draining
     registry.acquireExclusive(id, PREEMPTER_2, 5000);
 
     const notices = registry.peekPendingNoticesForAgent(VICTIM);
@@ -133,9 +137,9 @@ test("an out-of-order older preemption still cannot overwrite a newer notice", (
     // a strictly OLDER timestamp is still refused, so only same-second
     // last-write-wins changed.
     const id = registry.resolveOrRegisterArtifact("docs/plans/ordered.md", HASH_1);
-    registry.grantShared(id, VICTIM, 7000);
+    registry.acquireExclusive(id, VICTIM, 7000);
     registry.acquireExclusive(id, PREEMPTER, 7000);
-    registry.grantShared(id, VICTIM, 6000);
+    registry.acquireExclusive(id, VICTIM, 6000);
     registry.acquireExclusive(id, PREEMPTER_2, 6000); // older: must not win
 
     const notices = registry.peekPendingNoticesForAgent(VICTIM);
@@ -198,6 +202,53 @@ test("a consume limit at or above the queue length leaves nothing behind", () =>
     assert.equal(registry.popPendingNoticesForAgent(VICTIM, 3).length, 3);
     assert.equal(registry.peekPendingNoticesForAgent(VICTIM).length, 0);
     assert.equal(registry.popPendingNoticesForAgent(VICTIM, 5).length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("only a peer that held a write grant is told it lost one (#163)", () => {
+  // The notice says the victim's EXCLUSIVE grant was revoked, and Python
+  // queues it only for a peer in EXCLUSIVE or MODIFIED (pre-edit's
+  // `_peers_in_me_excluding`). A reader is still invalidated, so its next
+  // read of the file is warned stale, but it held no grant to lose.
+  const { registry, cleanup } = makeRegistry();
+  const READER = "d".repeat(32);
+  try {
+    // acquireExclusive over an EXCLUSIVE holder, a MODIFIED holder, a reader.
+    const held = registry.resolveOrRegisterArtifact("docs/held.md", HASH_1);
+    registry.acquireExclusive(held, VICTIM, 1000);
+    registry.acquireExclusive(held, PREEMPTER, 1001);
+
+    const written = registry.resolveOrRegisterArtifact("docs/written.md", HASH_1);
+    registry.acquireExclusive(written, VICTIM, 1000);
+    registry.commit(written, VICTIM, HASH_2, 1000);
+    assert.equal(registry.getAgentState(written, VICTIM), MESIState.MODIFIED);
+    registry.acquireExclusive(written, PREEMPTER, 1002);
+
+    const read = registry.resolveOrRegisterArtifact("docs/read.md", HASH_1);
+    registry.grantShared(read, READER, 1000);
+    registry.acquireExclusive(read, PREEMPTER, 1003);
+
+    // commit needs the caller to hold the write grant, and commitCas refuses
+    // while a peer holds one, so every peer either invalidates is a reader.
+    const committed = registry.resolveOrRegisterArtifact("docs/committed.md", HASH_1);
+    registry.acquireExclusive(committed, PREEMPTER, 1000);
+    registry.grantShared(committed, READER, 1000);
+    registry.commit(committed, PREEMPTER, HASH_2, 1004);
+
+    const casCommitted = registry.resolveOrRegisterArtifact("docs/cas.md", HASH_1);
+    registry.grantShared(casCommitted, READER, 1000);
+    assert.equal(registry.commitCas(casCommitted, PREEMPTER, 1, HASH_2, 1005).kind, "win");
+
+    for (const id of [read, committed, casCommitted]) {
+      assert.equal(registry.getAgentState(id, READER), MESIState.INVALID);
+    }
+    assert.deepEqual(registry.peekPendingNoticesForAgent(READER), []);
+    assert.deepEqual(
+      registry.peekPendingNoticesForAgent(VICTIM).map((n) => n.artifactId),
+      [written, held],
+    );
   } finally {
     cleanup();
   }

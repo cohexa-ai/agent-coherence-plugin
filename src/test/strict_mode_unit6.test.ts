@@ -87,6 +87,56 @@ test("emitStrictDeny: byte-identical reason (real writer, fractional ts) + no ad
   assert.equal("additionalContext" in out, false);
 });
 
+test("emitStrictDeny: the path is inserted verbatim — no $-pattern or placeholder inside it expands (#164)", () => {
+  // Python renders both templates with `str.format`: each value is inserted
+  // once and never re-read. A `replaceAll`/`replace` chain gets both halves
+  // wrong — a replacement STRING expands `$&` `$$` `` $` `` `$'`, and the
+  // next link re-scans the path it just inserted, so a placeholder inside the
+  // path takes the value while the real one ships unexpanded. `isValidPath`
+  // admits all of these names. The expected text below interpolates the path
+  // with a template literal (verbatim by construction) and was checked
+  // byte-for-byte against Python's `emit_strict_deny` for every path here.
+  const writeReason = (p: string): string =>
+    `Stale read denied: ${p} was updated by agent 01234567 ` +
+    `at 2026-09-21T14:13:20.500000+00:00. Re-read ${p} via the Read tool before ` +
+    "proceeding. This denial is structural (v0.2 strict mode); retrying " +
+    "the same operation will produce the same denial.";
+  const grantReason = (p: string): string =>
+    `Stale read denied: your grant on ${p} was revoked and no new version ` +
+    `was committed — ${p} is still at v3. Re-read ` +
+    `${p} via the Read tool before proceeding. This denial is structural ` +
+    "(v0.2 strict mode); retrying the same operation will produce the same " +
+    "denial.";
+  // `prior` picks the template via summaryReportsAWrite: null (never observed)
+  // renders the write text; 3 (equal to current_version) the grant-change text.
+  const render = (path: string, prior: number | null): string | undefined =>
+    emitStrictDeny({
+      source: "pre_read_strict_deny",
+      summary: {
+        path,
+        current_version: 3,
+        prior_version_seen_by_session: prior,
+        last_writer_session_id: "0123456789abcdef0123456789abcdef",
+        last_writer_at_unix_ts: 1790000000.5,
+        warning_generated_at_unix_ts: 1790000001,
+        hash_differs: false,
+      },
+    }).permissionDecisionReason;
+
+  const dollarPatterns = ["docs/a$&b.md", "docs/a$$b.md", "docs/a$`b.md", "docs/a$'b.md"];
+  // Controls a replacement-string renderer also gets right (a string pattern has
+  // no capture groups, `$i` is no pattern), so they check the expected text itself.
+  const controls = ["docs/plain.md", "docs/a$1b.md", "routes/$id.tsx", "docs/a{path}b.md"];
+  const writePlaceholders = ["docs/a{last_writer_short}b.md", "docs/a{last_writer_ts_iso}b.md"];
+
+  for (const p of [...dollarPatterns, ...writePlaceholders, ...controls]) {
+    assert.equal(render(p, null), writeReason(p), `write text, path ${JSON.stringify(p)}`);
+  }
+  for (const p of [...dollarPatterns, "docs/a{current_version}b.md", ...controls]) {
+    assert.equal(render(p, 3), grantReason(p), `grant-change text, path ${JSON.stringify(p)}`);
+  }
+});
+
 test("warn renderers speak Python's timestamp dialect, not toISOString's", () => {
   // `pythonIsoUtc` exists in this module and reproduces `datetime.isoformat()`
   // exactly, but only `emitStrictDeny` used it; the three warn renderers called
@@ -457,15 +507,13 @@ test("SHARED-hash arm: a SUBAGENT's own recent commit is suppressed, not denied 
   }
 });
 
-test("strict re-arm without drain: a same-second second preemption renames the notice", async () => {
-  // Reachability test for the stale-preempter defect, not the state
-  // transition (registry_pending_notices.test.ts owns that). It exists
-  // because the defect was twice recorded as "synthetic only" on #138 — the
-  // whole question was whether any real path re-arms a victim WITHOUT
-  // draining its notice queue, and the strict path does exactly that:
-  // pre_bash.ts:134 re-grants SHARED, then :137-146 returns the deny before
-  // drainNoticeText at :149. Only `contended.md` is strict, so the victim's
-  // final pre-read on a different tracked path is free to drain.
+test("strict re-arm without drain: a re-granted reader is queued no second notice (#163)", async () => {
+  // The strict pre-bash deny re-grants SHARED and returns before draining
+  // notices. That re-grant is a read, not a write grant, so another
+  // session's pre-edit must queue it nothing: the victim keeps exactly one
+  // notice, naming the session that took its EXCLUSIVE grant. Only
+  // `contended.md` is strict, so the victim's final pre-read of a different
+  // tracked path is free to drain.
   const CONTENDED = "docs/plans/contended.md";
   const { post, cleanup } = await makeStrictServer([CONTENDED]);
   try {
@@ -488,16 +536,14 @@ test("strict re-arm without drain: a same-second second preemption renames the n
     const text = (read.hookSpecificOutput as { additionalContext?: string } | undefined)
       ?.additionalContext;
     assert.ok(text, "the victim's next admit hook must carry the drained notice");
-    const bullet = text.split("\n").find((l) => l.includes("preempted by agent"));
-    assert.ok(bullet, `expected a preemption bullet; got:\n${text}`);
-    // R7 moved this from the session id to the agent id; the property under
-    // test is unchanged -- WHICH identity the notice names.
+    const bullets = text.split("\n").filter((l) => l.includes("preempted by agent"));
+    assert.equal(bullets.length, 1, `expected exactly one notice:\n${text}`);
     assert.match(
-      bullet,
-      new RegExp(`preempted by agent ${sessionToAgentId(second).slice(0, 8)} `),
-      "the notice must name the agent that holds the grant NOW, not the one it replaced",
+      bullets[0]!,
+      new RegExp(`preempted by agent ${sessionToAgentId(first).slice(0, 8)} `),
+      "the notice must name the session that took the victim's write grant",
     );
-    assert.doesNotMatch(bullet, /bbbbbbbb/);
+    assert.doesNotMatch(bullets[0]!, new RegExp(sessionToAgentId(second).slice(0, 8)));
   } finally {
     await cleanup();
   }
