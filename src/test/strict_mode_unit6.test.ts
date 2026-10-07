@@ -87,6 +87,56 @@ test("emitStrictDeny: byte-identical reason (real writer, fractional ts) + no ad
   assert.equal("additionalContext" in out, false);
 });
 
+test("emitStrictDeny: the path is inserted verbatim — no $-pattern or placeholder inside it expands (#164)", () => {
+  // Python renders both templates with `str.format`: each value is inserted
+  // once and never re-read. A `replaceAll`/`replace` chain gets both halves
+  // wrong — a replacement STRING expands `$&` `$$` `` $` `` `$'`, and the
+  // next link re-scans the path it just inserted, so a placeholder inside the
+  // path takes the value while the real one ships unexpanded. `isValidPath`
+  // admits all of these names. The expected text below interpolates the path
+  // with a template literal (verbatim by construction) and was checked
+  // byte-for-byte against Python's `emit_strict_deny` for every path here.
+  const writeReason = (p: string): string =>
+    `Stale read denied: ${p} was updated by agent 01234567 ` +
+    `at 2026-09-21T14:13:20.500000+00:00. Re-read ${p} via the Read tool before ` +
+    "proceeding. This denial is structural (v0.2 strict mode); retrying " +
+    "the same operation will produce the same denial.";
+  const grantReason = (p: string): string =>
+    `Stale read denied: your grant on ${p} was revoked and no new version ` +
+    `was committed — ${p} is still at v3. Re-read ` +
+    `${p} via the Read tool before proceeding. This denial is structural ` +
+    "(v0.2 strict mode); retrying the same operation will produce the same " +
+    "denial.";
+  // `prior` picks the template via summaryReportsAWrite: null (never observed)
+  // renders the write text; 3 (equal to current_version) the grant-change text.
+  const render = (path: string, prior: number | null): string | undefined =>
+    emitStrictDeny({
+      source: "pre_read_strict_deny",
+      summary: {
+        path,
+        current_version: 3,
+        prior_version_seen_by_session: prior,
+        last_writer_session_id: "0123456789abcdef0123456789abcdef",
+        last_writer_at_unix_ts: 1790000000.5,
+        warning_generated_at_unix_ts: 1790000001,
+        hash_differs: false,
+      },
+    }).permissionDecisionReason;
+
+  const dollarPatterns = ["docs/a$&b.md", "docs/a$$b.md", "docs/a$`b.md", "docs/a$'b.md"];
+  // Controls a replacement-string renderer also gets right (a string pattern has
+  // no capture groups, `$i` is no pattern), so they check the expected text itself.
+  const controls = ["docs/plain.md", "docs/a$1b.md", "routes/$id.tsx", "docs/a{path}b.md"];
+  const writePlaceholders = ["docs/a{last_writer_short}b.md", "docs/a{last_writer_ts_iso}b.md"];
+
+  for (const p of [...dollarPatterns, ...writePlaceholders, ...controls]) {
+    assert.equal(render(p, null), writeReason(p), `write text, path ${JSON.stringify(p)}`);
+  }
+  for (const p of [...dollarPatterns, "docs/a{current_version}b.md", ...controls]) {
+    assert.equal(render(p, 3), grantReason(p), `grant-change text, path ${JSON.stringify(p)}`);
+  }
+});
+
 test("warn renderers speak Python's timestamp dialect, not toISOString's", () => {
   // `pythonIsoUtc` exists in this module and reproduces `datetime.isoformat()`
   // exactly, but only `emitStrictDeny` used it; the three warn renderers called
