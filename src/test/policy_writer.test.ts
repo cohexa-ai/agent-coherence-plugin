@@ -196,14 +196,13 @@ test("appendPolicyYaml: an entry already in a flow-style list is still a no-op s
   }
 });
 
-test("appendPolicyYaml: appends to an empty, comment-only or CRLF file, with any number of trailing newlines", () => {
+test("appendPolicyYaml: appends to an empty, comment-only or CRLF file, and with no or several trailing newlines", () => {
   for (const [content, already] of [
     ["", []],
     ["# tracked by hand\n", []],
     ['- "a.md"\r\n', ["a.md"]],
     ['- "a.md"', ["a.md"]],
     ['- "a.md"\n\n\n', ["a.md"]],
-    ['- "a.md"\n' + "\n".repeat(60_000) + '- "b.md"\n', ["a.md", "b.md"]],
   ] as const) {
     const { root, cleanup } = makeRoot();
     try {
@@ -231,6 +230,19 @@ test("appendPolicyYaml: appends to a file in the layout the Python library write
     assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, entries);
     assert.deepEqual(appendPolicyYaml(yamlPath, ["new.md"]).added, ["new.md"]);
     assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, [...entries, "new.md"]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("appendPolicyYaml: a long run of blank lines inside the list appends normally", () => {
+  // Tens of thousands of blank lines (still under the byte cap): a regex trim
+  // of trailing newlines backtracked over this run and blocked for seconds.
+  const { root, cleanup } = makeRoot();
+  try {
+    const yamlPath = seedTracked(root, '- "a.md"\n' + "\n".repeat(60_000) + '- "b.md"\n');
+    assert.deepEqual(appendPolicyYaml(yamlPath, ["new.md"]).added, ["new.md"]);
+    assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, ["a.md", "b.md", "new.md"]);
   } finally {
     cleanup();
   }
@@ -265,12 +277,14 @@ test("appendPolicyYaml: the refusal escapes every class of invisible character i
   // One representative per escaped class. Each reaches js-yaml's reason raw
   // (`unidentified alias "a<ch>b"`), so each must come back escaped.
   const cases: Array<[string, string]> = [
+    ["\u001b", "\\u001b"], // C0 (ESC)
     ["\u007f", "\\u007f"], // DEL
     ["\u009b", "\\u009b"], // C1 (CSI)
-    ["؜", "\\u061c"], // Arabic letter mark
-    ["​", "\\u200b"], // zero-width space
-    ["⁩", "\\u2069"], // pop directional isolate
-    ["﻿", "\\ufeff"], // BOM / zero-width no-break space
+    ["\u061c", "\\u061c"], // Arabic letter mark
+    ["\u200b", "\\u200b"], // zero-width space
+    ["\u202e", "\\u202e"], // right-to-left override
+    ["\u2069", "\\u2069"], // pop directional isolate
+    ["\ufeff", "\\ufeff"], // BOM / zero-width no-break space
     ["\u{E0041}", "\\u{e0041}"], // tag character, outside the BMP
   ];
   for (const [ch, escaped] of cases) {

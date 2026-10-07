@@ -347,7 +347,7 @@ const REWRITE_HINT =
 
 /**
  * `text` without its trailing "\n" run. A `/\n+$/` replace backtracks over every
- * run of newlines in the text, quadratic in its length: a few tens of
+ * run of newlines in the text, quadratic in the longest run: a few tens of
  * thousands of blank lines inside a list blocked the coordinator's only event
  * loop for seconds on every track and untrack.
  */
@@ -411,10 +411,14 @@ function escapeControlChars(text: string): string {
       (code >= 0x2066 && code <= 0x2069) ||
       code === 0xfeff ||
       (code >= 0xe0000 && code <= 0xe007f);
-    if (!hidden) out += c;
-    else out += code > 0xffff ? `\\u{${code.toString(16)}}` : `\\u${code.toString(16).padStart(4, "0")}`;
+    out += hidden ? escapeCodePoint(code) : c;
   }
   return out;
+}
+
+/** `\uXXXX`, or `\u{...}` for a code point outside the BMP. */
+function escapeCodePoint(code: number): string {
+  return code > 0xffff ? `\\u{${code.toString(16)}}` : `\\u${code.toString(16).padStart(4, "0")}`;
 }
 
 function unloadableMessage(

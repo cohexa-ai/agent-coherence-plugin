@@ -131,8 +131,8 @@ test("end-to-end: a refusal with no string error prints its status; a non-JSON s
 test("end-to-end: track writes YAML + prints; untrack uses `removed`; status renders JSON", async () => {
   const root = mkdtempSync(join(tmpdir(), "cli-e2e-"));
   const secret = "s".repeat(32);
-  // Created before the try and closed in the finally: closed inside the try,
-  // a failed assertion left the server listening and node --test never exited.
+  // Closed in the finally, so a failed assertion cannot leave the server
+  // listening (node --test would never exit).
   const registry = new ArtifactRegistry(join(root, ".coherence", "state.db"));
   const server = createServer({
     secret,
@@ -179,7 +179,6 @@ test("end-to-end: track writes YAML + prints; untrack uses `removed`; status ren
     } finally {
       rmSync(deadRoot, { recursive: true, force: true });
     }
-
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
     registry.close();
