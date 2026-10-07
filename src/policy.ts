@@ -22,7 +22,8 @@
  * fnmatch's fnmatchcase semantics; KTD-B.3 C5 prefix contract applies to
  * the parity scenarios that cover policy decisions.
  */
-import { readFileSync, statSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { readFileSync, statSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { dump as yamlDump, load as yamlLoad, type YAMLException } from "js-yaml";
 
@@ -327,9 +328,17 @@ export function appendPolicyYaml(
     throw new Error(`policy YAML cap of ${MAX_POLICY_YAML_BYTES} bytes would be exceeded`);
   }
 
-  const tmpPath = `${yamlPath}.tmp`;
-  writeFileSync(tmpPath, newContent, "utf8");
-  renameSync(tmpPath, yamlPath);
+  // A random name, created exclusively: a fixed `<file>.tmp` written with a
+  // plain write follows a symlink planted at that path, so a repository could
+  // commit one and have the next track overwrite its target. Same pattern as
+  // storeCallerPrincipal.
+  const tmpPath = `${yamlPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tmpPath, newContent, { encoding: "utf8", flag: "wx" });
+    renameSync(tmpPath, yamlPath);
+  } finally {
+    rmSync(tmpPath, { force: true });
+  }
   return { added: trulyNew, rejected };
 }
 

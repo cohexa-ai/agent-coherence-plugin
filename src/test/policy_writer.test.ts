@@ -8,7 +8,17 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  chmodSync,
+  symlinkSync,
+  lstatSync,
+  readdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -220,6 +230,28 @@ test("appendPolicyYaml: a policy file it cannot read is refused, not replaced", 
       }
       assert.equal(readFileSync(yamlPath, "utf8"), '- "keep.md"\n');
     }
+  } finally {
+    cleanup();
+  }
+});
+
+test("appendPolicyYaml: a planted <file>.tmp symlink cannot redirect the write", () => {
+  // A fixed `<file>.tmp` written with a plain write follows a symlink at that
+  // path, so a repository could commit `.coherence/tracked.yaml.tmp` pointing
+  // anywhere and have the next track or untrack overwrite the target.
+  const { root, cleanup } = makeRoot();
+  try {
+    const yamlPath = seedTracked(root, '- "keep.md"\n');
+    const victim = join(root, "victim.txt");
+    writeFileSync(victim, "untouched\n", "utf8");
+    symlinkSync(victim, `${yamlPath}.tmp`);
+
+    assert.deepEqual(appendPolicyYaml(yamlPath, ["new.md"]).added, ["new.md"]);
+    assert.equal(readFileSync(victim, "utf8"), "untouched\n");
+    assert.equal(lstatSync(yamlPath).isSymbolicLink(), false);
+    assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, ["keep.md", "new.md"]);
+    // No temporary file of the writer's own is left behind.
+    assert.deepEqual(readdirSync(join(root, ".coherence")).sort(), ["tracked.yaml", "tracked.yaml.tmp"]);
   } finally {
     cleanup();
   }
