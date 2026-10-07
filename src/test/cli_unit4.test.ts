@@ -7,6 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -92,22 +93,57 @@ test("end-to-end: a refused write reaches the operator as HTTP <status>: <error>
   }
 });
 
+test("end-to-end: a refusal with no string error prints its status; a non-JSON success says so (exit 2)", async () => {
+  // A coordinator that answers whatever this test sets: the two fallbacks the
+  // real one cannot produce on demand.
+  const root = mkdtempSync(join(tmpdir(), "cli-fallback-"));
+  let answer: [status: number, body: string] = [400, "{}"];
+  const fake = createHttpServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(answer[0], { "Content-Type": "application/json" });
+      res.end(answer[1]);
+    });
+  });
+  await new Promise<void>((r) => fake.listen(0, "127.0.0.1", () => r()));
+  try {
+    const port = (fake.address() as AddressInfo).port;
+    mkdirSync(join(root, ".coherence"), { recursive: true });
+    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
+
+    const refused = await runCli("cli_untrack.js", ["notes.md", "--root", root], root);
+    assert.equal(refused.status, 2);
+    assert.match(refused.stderr, /^agent-coherence-untrack: HTTP 400$/m);
+    assert.equal(refused.stdout, "");
+
+    answer = [200, "not json"];
+    const garbled = await runCli("cli_track.js", ["notes.md", "--root", root], root);
+    assert.equal(garbled.status, 2);
+    assert.match(garbled.stderr, /^agent-coherence-track: coordinator returned a non-JSON response$/m);
+    assert.equal(garbled.stdout, "");
+  } finally {
+    await new Promise<void>((r) => fake.close(() => r()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("end-to-end: track writes YAML + prints; untrack uses `removed`; status renders JSON", async () => {
   const root = mkdtempSync(join(tmpdir(), "cli-e2e-"));
   const secret = "s".repeat(32);
+  // Created before the try and closed in the finally: closed inside the try,
+  // a failed assertion left the server listening and node --test never exited.
+  const registry = new ArtifactRegistry(join(root, ".coherence", "state.db"));
+  const server = createServer({
+    secret,
+    startedAtMs: Date.now(),
+    version: "test",
+    registry,
+    policy: PolicyRef.load(root),
+    sessions: new SessionRegistry(),
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   try {
-    const registry = new ArtifactRegistry(join(root, ".coherence", "state.db"));
-    const policy = PolicyRef.load(root);
-    const sessions = new SessionRegistry();
-    const server = createServer({
-      secret,
-      startedAtMs: Date.now(),
-      version: "test",
-      registry,
-      policy,
-      sessions,
-    });
-    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
     const port = (server.address() as AddressInfo).port;
     mkdirSync(join(root, ".coherence"), { recursive: true });
     writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`); // 2-line Python format
@@ -144,9 +180,9 @@ test("end-to-end: track writes YAML + prints; untrack uses `removed`; status ren
       rmSync(deadRoot, { recursive: true, force: true });
     }
 
+  } finally {
     await new Promise<void>((r) => server.close(() => r()));
     registry.close();
-  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
