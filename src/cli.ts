@@ -17,6 +17,7 @@ import {
   CoordinatorUnavailable,
   findCoordinatorRoot,
   requestJson,
+  requestJsonStatus,
   resolveEndpoint,
 } from "./hook_client_transport.js";
 
@@ -138,10 +139,10 @@ async function runPolicyMutation(
     return 1;
   }
 
-  let payload: Record<string, unknown> | null;
+  let answer: { status: number; body: Record<string, unknown> | null };
   try {
     const endpoint = resolveEndpoint(resolve(root));
-    payload = await requestJson(endpoint, "POST", endpointPath, { paths: valid });
+    answer = await requestJsonStatus(endpoint, "POST", endpointPath, { paths: valid });
   } catch (exc) {
     if (exc instanceof CoordinatorUnavailable) {
       err(`${prog}: ${exc.message}`);
@@ -150,8 +151,17 @@ async function runPolicyMutation(
     err(`${prog}: ${(exc as Error).message}`);
     return 2;
   }
+  // A refusal's `error` says what is wrong and how to fix it (a policy file
+  // that will not load, the byte cap); print it in the Python CLI's
+  // `HTTP <status>: <error>` form. Without a string `error`, print the status.
+  if (answer.status < 200 || answer.status >= 300) {
+    const error = answer.body?.error;
+    err(typeof error === "string" ? `${prog}: HTTP ${answer.status}: ${error}` : `${prog}: HTTP ${answer.status}`);
+    return 2;
+  }
+  const payload = answer.body;
   if (payload === null) {
-    err(`${prog}: coordinator rejected the request`);
+    err(`${prog}: coordinator returned a non-JSON response`);
     return 2;
   }
 

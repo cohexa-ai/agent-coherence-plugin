@@ -8,7 +8,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -118,6 +118,132 @@ test("appendPolicyYaml: escapes NEL, which the Python coordinator's YAML reader 
     appendPolicyYaml(yamlPath, ["a\u0085b.md"]);
     assert.equal(readFileSync(yamlPath, "utf8"), '- "a\\Nb.md"\n');
     assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, ["a\u0085b.md"]);
+  } finally {
+    cleanup();
+  }
+});
+
+/** Write `content` to a fresh tracked.yaml; return its path. */
+function seedTracked(root: string, content: string): string {
+  mkdirSync(join(root, ".coherence"), { recursive: true });
+  const yamlPath = join(root, ".coherence", "tracked.yaml");
+  writeFileSync(yamlPath, content, "utf8");
+  return yamlPath;
+}
+
+test("appendPolicyYaml: refuses a file that loads as no entries, and leaves it as it was", () => {
+  // Appending can never make such a file load: the loader still reads it as
+  // nothing, so the new entry never applies. Answering success would be false.
+  for (const [content, expected] of [
+    ["- keep.md\n- *.log\n", /\.coherence\/tracked\.yaml is not valid YAML.*near line 2/s],
+    ["mode: strict\n", /\.coherence\/tracked\.yaml holds a mapping, not a list/],
+    ["2026-10-07\n", /holds a date, not a list/],
+    ['- "a.md"\n---\n- "b.md"\n', /more than one YAML document; remove the extra --- separators/],
+  ] as const) {
+    const { root, cleanup } = makeRoot();
+    try {
+      const yamlPath = seedTracked(root, content);
+      assert.throws(() => appendPolicyYaml(yamlPath, ["new.md"]), expected);
+      assert.equal(readFileSync(yamlPath, "utf8"), content, `rewritten: ${JSON.stringify(content)}`);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+test("appendPolicyYaml: refuses a valid list whose layout an appended line would break", () => {
+  // Each of these loads entries today. A block line after a flow list, an
+  // empty `[]`, an indented list or a `...` end marker stops the file parsing,
+  // so the write would erase entries that were working. Nothing is written.
+  for (const content of ['["a.md", "*.md"]\n', "[]\n", '  - "a.md"\n', '- "a.md"\n...\n', "~\n"]) {
+    const { root, cleanup } = makeRoot();
+    try {
+      const yamlPath = seedTracked(root, content);
+      const before = TrackedArtifactPolicy.load(root).userAddedPatterns;
+      assert.throws(
+        () => appendPolicyYaml(yamlPath, ["new.md"]),
+        /cannot take a new line without breaking/,
+        `layout ${JSON.stringify(content)}`,
+      );
+      assert.equal(readFileSync(yamlPath, "utf8"), content);
+      assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, before);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+test("appendPolicyYaml: an entry already in a flow-style list is still a no-op success", () => {
+  const { root, cleanup } = makeRoot();
+  try {
+    const yamlPath = seedTracked(root, '["a.md"]\n');
+    assert.deepEqual(appendPolicyYaml(yamlPath, ["a.md"]).added, []);
+  } finally {
+    cleanup();
+  }
+});
+
+test("appendPolicyYaml: appends to an empty, comment-only or CRLF file", () => {
+  for (const [content, already] of [
+    ["", []],
+    ["# tracked by hand\n", []],
+    ['- "a.md"\r\n', ["a.md"]],
+  ] as const) {
+    const { root, cleanup } = makeRoot();
+    try {
+      const yamlPath = seedTracked(root, content);
+      assert.deepEqual(appendPolicyYaml(yamlPath, ["new.md"]).added, ["new.md"]);
+      assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, [...already, "new.md"]);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+test("appendPolicyYaml: a policy file it cannot read is refused, not replaced", () => {
+  // Treating a read error as an empty file would rename a one-entry file over
+  // every pattern the user had.
+  const { root, cleanup } = makeRoot();
+  try {
+    const dirPath = join(root, ".coherence", "tracked.yaml");
+    mkdirSync(dirPath, { recursive: true });
+    assert.throws(() => appendPolicyYaml(dirPath, ["new.md"]), /could not be read \(EISDIR\)/);
+
+    if (process.getuid?.() !== 0) {
+      const yamlPath = join(root, ".coherence", "ignored.yaml");
+      writeFileSync(yamlPath, '- "keep.md"\n', "utf8");
+      chmodSync(yamlPath, 0o000);
+      try {
+        assert.throws(() => appendPolicyYaml(yamlPath, ["new.md"]), /could not be read \(EACCES\)/);
+      } finally {
+        chmodSync(yamlPath, 0o600);
+      }
+      assert.equal(readFileSync(yamlPath, "utf8"), '- "keep.md"\n');
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("appendPolicyYaml: the refusal never echoes control characters from the file", () => {
+  // The message reaches a terminal through both CLIs, and the parser's reason
+  // quotes file content.
+  const { root, cleanup } = makeRoot();
+  try {
+    const yamlPath = seedTracked(root, "- *a\u0085\u001b[31mb\n");
+    assert.throws(
+      () => appendPolicyYaml(yamlPath, ["new.md"]),
+      (err: Error) =>
+        /not valid YAML/.test(err.message) &&
+        ![...err.message].some((c) => c.charCodeAt(0) < 0x20 || (c.charCodeAt(0) >= 0x7f && c.charCodeAt(0) <= 0x9f)),
+    );
+    // A right-to-left override or line separator can make the printed line
+    // read differently from what it says.
+    writeFileSync(yamlPath, "- *a\u202eb\u2028c\n", "utf8");
+    assert.throws(
+      () => appendPolicyYaml(yamlPath, ["new.md"]),
+      (err: Error) => /a\\u202eb\\u2028c/.test(err.message) && !/[\u202e\u2028]/.test(err.message),
+    );
   } finally {
     cleanup();
   }

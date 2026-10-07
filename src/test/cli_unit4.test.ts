@@ -56,6 +56,42 @@ function runCli(
   });
 }
 
+test("end-to-end: a refused write reaches the operator as HTTP <status>: <error>, exit 2", async () => {
+  // The coordinator's 400 says what is wrong with the policy file and how to
+  // fix it; printing only "coordinator rejected the request" threw that away.
+  // Same line as the Python CLI (`coherence_track.py`).
+  const root = mkdtempSync(join(tmpdir(), "cli-refusal-"));
+  const secret = "s".repeat(32);
+  const registry = new ArtifactRegistry(join(root, ".coherence", "state.db"));
+  const server = createServer({
+    secret,
+    startedAtMs: Date.now(),
+    version: "test",
+    registry,
+    policy: PolicyRef.load(root),
+    sessions: new SessionRegistry(),
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
+    writeFileSync(join(root, ".coherence", "tracked.yaml"), "- keep.md\n- *.log\n");
+
+    const track = await runCli("cli_track.js", ["notes.md", "--root", root], root);
+    assert.equal(track.status, 2);
+    assert.match(
+      track.stderr,
+      /^agent-coherence-track: HTTP 400: \.coherence\/tracked\.yaml is not valid YAML, so it loads as no entries/m,
+    );
+    assert.equal(track.stdout, "");
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("end-to-end: track writes YAML + prints; untrack uses `removed`; status renders JSON", async () => {
   const root = mkdtempSync(join(tmpdir(), "cli-e2e-"));
   const secret = "s".repeat(32);
