@@ -193,11 +193,14 @@ test("appendPolicyYaml: an entry already in a flow-style list is still a no-op s
   }
 });
 
-test("appendPolicyYaml: appends to an empty, comment-only or CRLF file", () => {
+test("appendPolicyYaml: appends to an empty, comment-only or CRLF file, with any number of trailing newlines", () => {
   for (const [content, already] of [
     ["", []],
     ["# tracked by hand\n", []],
     ['- "a.md"\r\n', ["a.md"]],
+    ['- "a.md"', ["a.md"]],
+    ['- "a.md"\n\n\n', ["a.md"]],
+    ['- "a.md"\n' + "\n".repeat(60_000) + '- "b.md"\n', ["a.md", "b.md"]],
   ] as const) {
     const { root, cleanup } = makeRoot();
     try {

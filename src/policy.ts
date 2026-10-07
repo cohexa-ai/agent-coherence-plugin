@@ -307,7 +307,7 @@ export function appendPolicyYaml(
   // escapes NEL, which PyYAML would fold to a space when the Python backend
   // reads the same file.
   const newLines = yamlDump(trulyNew, { forceQuotes: true, quotingType: '"', lineWidth: -1 });
-  const newContent = existing !== "" ? existing.replace(/\n+$/, "") + "\n" + newLines : newLines;
+  const newContent = existing !== "" ? trimTrailingNewlines(existing) + "\n" + newLines : newLines;
   // A block line after a [ ... ] list, an indented list or a "..." end marker
   // stops valid files parsing, which would erase entries that were working.
   const written = readPolicyEntries(newContent);
@@ -344,6 +344,18 @@ export function appendPolicyYaml(
 
 const REWRITE_HINT =
   'Rewrite it with one entry per line, each a double-quoted string such as - "*.md", then retry.';
+
+/**
+ * `text` without its trailing "\n" run. A `/\n+$/` replace backtracks over every
+ * run of newlines in the text, quadratic in its length: a few tens of
+ * thousands of blank lines inside a list blocked the coordinator's only event
+ * loop for seconds on every track and untrack.
+ */
+function trimTrailingNewlines(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x0a) end--;
+  return text.slice(0, end);
+}
 
 /**
  * What the loader reads from a policy YAML body: the string entries of a list
