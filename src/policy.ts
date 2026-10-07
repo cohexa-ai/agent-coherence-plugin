@@ -391,27 +391,23 @@ function policyFileName(yamlPath: string): string {
 }
 
 /**
+ * Characters a refusal must never print raw: controls (Cc), format characters
+ * (Cf: zero-width, bidi marks, embeddings and isolates, the Arabic letter mark,
+ * soft hyphen, BOM, tags), and line/paragraph separators. By category rather
+ * than by list, so a format character nobody listed is still caught; the tag
+ * block is named because its unassigned code points are Cn, not Cf.
+ */
+const HIDDEN_CHAR = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{E0000}-\u{E007F}]/u;
+
+/**
  * Both CLIs print the refusal to a terminal, and the parser's reason quotes
- * file content: escape C0, DEL and C1, plus the invisible format characters
- * that can make printed text read differently from what it is (the Arabic
- * letter mark, zero-width characters, bidi marks, embeddings and isolates,
- * line/paragraph separators, BOM, tag characters). Iterates by code point:
- * a tag character is one character but two UTF-16 units.
+ * file content that could make the printed line read differently from what it
+ * is. Iterates by code point: a tag character is two UTF-16 units.
  */
 function escapeControlChars(text: string): string {
   let out = "";
   for (const c of text) {
-    const code = c.codePointAt(0)!;
-    const hidden =
-      code < 0x20 ||
-      (code >= 0x7f && code <= 0x9f) ||
-      code === 0x061c ||
-      (code >= 0x200b && code <= 0x200f) ||
-      (code >= 0x2028 && code <= 0x202e) ||
-      (code >= 0x2066 && code <= 0x2069) ||
-      code === 0xfeff ||
-      (code >= 0xe0000 && code <= 0xe007f);
-    out += hidden ? escapeCodePoint(code) : c;
+    out += HIDDEN_CHAR.test(c) ? escapeCodePoint(c.codePointAt(0)!) : c;
   }
   return out;
 }

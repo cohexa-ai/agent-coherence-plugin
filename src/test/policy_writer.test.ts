@@ -289,6 +289,8 @@ test("appendPolicyYaml: the refusal escapes every class of invisible character i
     ["\u202e", "\\u202e"], // right-to-left override
     ["\u2069", "\\u2069"], // pop directional isolate
     ["\ufeff", "\\ufeff"], // BOM / zero-width no-break space
+    ["\u2060", "\\u2060"], // word joiner (any other format character)
+    ["\u00ad", "\\u00ad"], // soft hyphen
     ["\u{E0041}", "\\u{e0041}"], // tag character, outside the BMP
   ];
   for (const [ch, escaped] of cases) {
