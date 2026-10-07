@@ -22,9 +22,10 @@
  * fnmatch's fnmatchcase semantics; KTD-B.3 C5 prefix contract applies to
  * the parity scenarios that cover policy decisions.
  */
-import { readFileSync, statSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { load as yamlLoad } from "js-yaml";
+import { randomBytes } from "node:crypto";
+import { readFileSync, statSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
+import { join, dirname, basename } from "node:path";
+import { dump as yamlDump, load as yamlLoad, type YAMLException } from "js-yaml";
 
 /** Mirror of Python coordinator_server.MAX_POLICY_PATHS_PER_REQUEST. */
 export const MAX_POLICY_PATHS_PER_REQUEST = 20;
@@ -238,7 +239,13 @@ export class PolicyRef {
  *   `..` → "contains '..'") — defense-in-depth; routes pre-validate;
  * - dedupe against patterns already in the file — a fully-duplicate request
  *   returns `added: []`;
- * - append `- <p>` lines preserving existing content;
+ * - append one double-quoted `- "<p>"` line per entry, preserving existing
+ *   content (Python writes them unquoted until Cohexa-ai/agent-coherence#284);
+ * - refuse, writing nothing, when the file cannot be read, does not load as a
+ *   list, or would not load back as its old entries plus the new ones → route
+ *   maps to 400. For the last two Python appends anyway, reporting success for
+ *   an entry that never takes effect; for an unreadable file it also writes
+ *   nothing but answers 500;
  * - byte cap → throws with Python's exact message
  *   (`policy YAML cap of 65536 bytes would be exceeded`) → route maps to 400.
  *
@@ -269,46 +276,166 @@ export function appendPolicyYaml(
     return { added: [], rejected };
   }
 
-  let existing = "";
+  const name = policyFileName(yamlPath);
+  let existing: string;
   try {
     existing = readFileSync(yamlPath, "utf8");
-  } catch {
+  } catch (err) {
+    // Only a missing file is empty. Reading any other failure as empty would
+    // rename a file holding just the new entries over every pattern it had.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      throw new Error(`${name} could not be read (${code ?? String(err)}); nothing was written.`);
+    }
     existing = "";
   }
-  const alreadyPresent = parseYamlPatternLines(existing);
+  // A file that loads as no entries still loads as none after an append, so
+  // the new entry would never apply; refusing is the only true answer.
+  const current = readPolicyEntries(existing);
+  if (!("entries" in current)) {
+    throw new Error(unloadableMessage(name, current));
+  }
+  const alreadyPresent = new Set(current.entries);
   const trulyNew = candidate.filter((p) => !alreadyPresent.has(p));
   if (trulyNew.length === 0) {
     return { added: [], rejected };
   }
 
-  const newLines = trulyNew.map((p) => `- ${p}`).join("\n");
-  const newContent =
-    existing !== ""
-      ? existing.replace(/\n+$/, "") + "\n" + newLines + "\n"
-      : newLines + "\n";
+  // Quoted, never plain: a plain `- ${p}` lets YAML read the entry as an
+  // alias, tag, comment, mapping or non-string, and one such entry stops the
+  // whole file parsing, which loads as no entries. js-yaml's dumper also
+  // escapes NEL, which PyYAML would fold to a space when the Python backend
+  // reads the same file.
+  const newLines = yamlDump(trulyNew, { forceQuotes: true, quotingType: '"', lineWidth: -1 });
+  const newContent = existing !== "" ? trimTrailingNewlines(existing) + "\n" + newLines : newLines;
+  // A block line after a [ ... ] list, an indented list or a "..." end marker
+  // stops valid files parsing, which would erase entries that were working.
+  const written = readPolicyEntries(newContent);
+  const expected = [...current.entries, ...trulyNew];
+  if (
+    !("entries" in written) ||
+    written.entries.length !== expected.length ||
+    written.entries.some((entry, i) => entry !== expected[i])
+  ) {
+    throw new Error(
+      `${name} cannot take a new line without breaking what it holds ` +
+        `(such as a [ ... ] list, an indented list, a "..." end marker or a lone ~ or null); ` +
+        `nothing was written. ` +
+        REWRITE_HINT,
+    );
+  }
   if (Buffer.byteLength(newContent, "utf8") > MAX_POLICY_YAML_BYTES) {
     throw new Error(`policy YAML cap of ${MAX_POLICY_YAML_BYTES} bytes would be exceeded`);
   }
 
-  const tmpPath = `${yamlPath}.tmp`;
-  writeFileSync(tmpPath, newContent, "utf8");
-  renameSync(tmpPath, yamlPath);
+  // A random name, created exclusively: a fixed `<file>.tmp` written with a
+  // plain write follows a symlink planted at that path, so a repository could
+  // commit one and have the next track overwrite its target. Same pattern as
+  // storeCallerPrincipal.
+  const tmpPath = `${yamlPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tmpPath, newContent, { encoding: "utf8", flag: "wx" });
+    renameSync(tmpPath, yamlPath);
+  } finally {
+    rmSync(tmpPath, { force: true });
+  }
   return { added: trulyNew, rejected };
 }
 
-/** Parse the pattern strings out of a policy YAML body (tolerant; mirrors Python `_parse_yaml_pattern_lines`). */
-function parseYamlPatternLines(text: string): Set<string> {
-  if (text === "") return new Set();
+const REWRITE_HINT =
+  'Rewrite it with one entry per line, each a double-quoted string such as - "*.md", then retry.';
+
+/**
+ * `text` without its trailing "\n" run. A `/\n+$/` replace backtracks over every
+ * run of newlines in the text, quadratic in the longest run: a few tens of
+ * thousands of blank lines inside a list blocked the coordinator's only event
+ * loop for seconds on every track and untrack.
+ */
+function trimTrailingNewlines(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x0a) end--;
+  return text.slice(0, end);
+}
+
+/**
+ * What the loader reads from a policy YAML body: the string entries of a list
+ * (an empty or null document reads as none), or why it reads nothing. Mirrors
+ * `loadYamlPatterns` without its per-pattern guard, which treats an entry the
+ * same wherever it appears.
+ */
+function readPolicyEntries(
+  text: string,
+): { entries: string[] } | { parseError: YAMLException } | { notAList: string } {
+  let raw: unknown;
   try {
-    const raw = yamlLoad(text);
-    if (Array.isArray(raw)) {
-      return new Set(raw.filter((x): x is string => typeof x === "string"));
-    }
-  } catch {
-    // Malformed YAML: fall through to the empty set — the append will
-    // still produce a parseable file (existing content preserved verbatim).
+    raw = yamlLoad(text);
+  } catch (err) {
+    return { parseError: err as YAMLException };
   }
-  return new Set();
+  if (raw === null || raw === undefined) return { entries: [] };
+  if (!Array.isArray(raw)) return { notAList: describeYamlValue(raw) };
+  return { entries: raw.filter((x): x is string => typeof x === "string") };
+}
+
+function describeYamlValue(value: unknown): string {
+  if (value instanceof Date) return "a date";
+  if (ArrayBuffer.isView(value)) return "binary data";
+  if (typeof value === "object") return "a mapping";
+  if (typeof value === "string") return "a single string";
+  return `a ${typeof value}`;
+}
+
+/** `.coherence/tracked.yaml`, the way the rest of the coordinator's prose names these files. */
+function policyFileName(yamlPath: string): string {
+  return `${basename(dirname(yamlPath))}/${basename(yamlPath)}`;
+}
+
+/**
+ * Characters a refusal must never print raw: controls (Cc), format characters
+ * (Cf: zero-width, bidi marks, embeddings and isolates, the Arabic letter mark,
+ * soft hyphen, BOM, tags), and line/paragraph separators. By category rather
+ * than by list, so a format character nobody listed is still caught; the tag
+ * block is named because its unassigned code points are Cn, not Cf.
+ */
+const HIDDEN_CHAR = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{E0000}-\u{E007F}]/u;
+
+/**
+ * Both CLIs print the refusal to a terminal, and the parser's reason quotes
+ * file content that could make the printed line read differently from what it
+ * is. Iterates by code point: a tag character is two UTF-16 units.
+ */
+function escapeControlChars(text: string): string {
+  let out = "";
+  for (const c of text) {
+    out += HIDDEN_CHAR.test(c) ? escapeCodePoint(c.codePointAt(0)!) : c;
+  }
+  return out;
+}
+
+/** `\uXXXX`, or `\u{...}` for a code point outside the BMP. */
+function escapeCodePoint(code: number): string {
+  return code > 0xffff ? `\\u{${code.toString(16)}}` : `\\u${code.toString(16).padStart(4, "0")}`;
+}
+
+function unloadableMessage(
+  name: string,
+  problem: { parseError: YAMLException } | { notAList: string },
+): string {
+  if ("notAList" in problem) {
+    return `${name} holds ${problem.notAList}, not a list, so it loads as no entries; nothing was written. ${REWRITE_HINT}`;
+  }
+  // js-yaml's mark can land past the bad token (an unclosed quote is reported
+  // at end of file) and is absent for a multi-document file.
+  const { reason, mark } = problem.parseError;
+  const where = mark ? ` near line ${mark.line + 1}, column ${mark.column + 1}` : "";
+  const cause = /single document/.test(reason ?? "")
+    ? "The file holds more than one YAML document; remove the extra --- separators."
+    : "An unclosed quote or bracket on an earlier line can cause this.";
+  return (
+    `${name} is not valid YAML, so it loads as no entries; nothing was written. ` +
+    `The parser stopped${where}: ${escapeControlChars(reason ?? "unknown error")}. ` +
+    `${cause} ${REWRITE_HINT}`
+  );
 }
 
 // ----------------------------------------------------------------------
