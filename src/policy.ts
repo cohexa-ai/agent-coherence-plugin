@@ -393,21 +393,26 @@ function policyFileName(yamlPath: string): string {
 /**
  * Both CLIs print the refusal to a terminal, and the parser's reason quotes
  * file content: escape C0, DEL and C1, plus the invisible format characters
- * (zero-width, bidi embeddings and isolates, line/paragraph separators, BOM)
- * that can make printed text read differently from what it is.
+ * that can make printed text read differently from what it is (the Arabic
+ * letter mark, zero-width characters, bidi marks, embeddings and isolates,
+ * line/paragraph separators, BOM, tag characters). Iterates by code point:
+ * a tag character is one character but two UTF-16 units.
  */
 function escapeControlChars(text: string): string {
   let out = "";
   for (const c of text) {
-    const code = c.charCodeAt(0);
+    const code = c.codePointAt(0)!;
     const hidden =
       code < 0x20 ||
       (code >= 0x7f && code <= 0x9f) ||
+      code === 0x061c ||
       (code >= 0x200b && code <= 0x200f) ||
       (code >= 0x2028 && code <= 0x202e) ||
       (code >= 0x2066 && code <= 0x2069) ||
-      code === 0xfeff;
-    out += hidden ? `\\u${code.toString(16).padStart(4, "0")}` : c;
+      code === 0xfeff ||
+      (code >= 0xe0000 && code <= 0xe007f);
+    if (!hidden) out += c;
+    else out += code > 0xffff ? `\\u{${code.toString(16)}}` : `\\u${code.toString(16).padStart(4, "0")}`;
   }
   return out;
 }

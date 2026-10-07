@@ -238,6 +238,33 @@ test("appendPolicyYaml: a policy file it cannot read is refused, not replaced", 
   }
 });
 
+test("appendPolicyYaml: the refusal escapes every class of invisible character it can quote", () => {
+  // One representative per escaped class. Each reaches js-yaml's reason raw
+  // (`unidentified alias "a<ch>b"`), so each must come back escaped.
+  const cases: Array<[string, string]> = [
+    ["\u007f", "\\u007f"], // DEL
+    ["\u009b", "\\u009b"], // C1 (CSI)
+    ["؜", "\\u061c"], // Arabic letter mark
+    ["​", "\\u200b"], // zero-width space
+    ["⁩", "\\u2069"], // pop directional isolate
+    ["﻿", "\\ufeff"], // BOM / zero-width no-break space
+    ["\u{E0041}", "\\u{e0041}"], // tag character, outside the BMP
+  ];
+  for (const [ch, escaped] of cases) {
+    const { root, cleanup } = makeRoot();
+    try {
+      const yamlPath = seedTracked(root, `- *a${ch}b\n`);
+      assert.throws(
+        () => appendPolicyYaml(yamlPath, ["new.md"]),
+        (err: Error) => err.message.includes(`a${escaped}b`) && !err.message.includes(ch),
+        `U+${ch.codePointAt(0)!.toString(16)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+});
+
 test("appendPolicyYaml: a planted <file>.tmp symlink cannot redirect the write", () => {
   // A fixed `<file>.tmp` written with a plain write follows a symlink at that
   // path, so a repository could commit `.coherence/tracked.yaml.tmp` pointing
