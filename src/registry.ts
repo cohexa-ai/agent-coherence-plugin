@@ -356,8 +356,10 @@ export class ArtifactRegistry {
    * (per KTD-10 MESI subset: no transient states, no event bus).
    *
    * Side effects (all in one BEGIN IMMEDIATE):
-   * - For each peer in {M, E, S}: UPSERT agent_states to INVALID; UPSERT a
-   *   pending_notice with `agentId` as preempter and `nowUnixTs`.
+   * - For each peer in {M, E, S}: UPSERT agent_states to INVALID. A peer that
+   *   was M or E lost a write grant, so it also gets a pending_notice with
+   *   `agentId` as preempter and `nowUnixTs`; an S peer gets none (as Python's
+   *   pre-edit queues notices only for `_peers_in_me_excluding`).
    * - UPSERT agent_states[agentId] to EXCLUSIVE; stamp granted_at_tick.
    * - checkSingleWriter on the post-mutation state map → rollback if
    *   violated.
@@ -385,7 +387,10 @@ export class ArtifactRegistry {
           );
         }
         this.setAgentStateInternal(artifactId, peerId, peerState, MESIState.INVALID, nowTick, "write");
-        this.upsertPendingNotice(peerId, artifactId, agentId, nowTick);
+        // A reader lost no write grant; its next read is warned stale instead.
+        if (isWriter(peerState)) {
+          this.upsertPendingNotice(peerId, artifactId, agentId, nowTick);
+        }
         invalidatedPeers.push(peerId);
       }
 
@@ -433,8 +438,9 @@ export class ArtifactRegistry {
    * - Verify agent_states[agentId] ∈ {EXCLUSIVE, MODIFIED}; raise otherwise
    * - Bump artifacts.version (monotonicity invariant check)
    * - Update artifacts.content_hash, last_writer_id, updated_at
-   * - For each peer ≠ agentId in {S}: UPSERT agent_states to INVALID + pending_notice
-   *   (any M/E peers would already be INVALID via acquireExclusive — they don't recur)
+   * - For each peer ≠ agentId in {S}: UPSERT agent_states to INVALID, with no
+   *   pending_notice: a reader held no write grant to lose (any M/E peers
+   *   would already be INVALID via acquireExclusive — they don't recur)
    * - UPSERT agent_states[agentId] to MODIFIED
    * - checkSingleWriter
    *
@@ -479,10 +485,11 @@ export class ArtifactRegistry {
         )
         .run(nextVersion, newContentHash, sizeTokens, agentId, updatedAt, artifactId);
 
-      // Invalidate any SHARED peers. M/E peers should already be INVALID per
-      // single-writer + the acquireExclusive call that preceded this commit;
-      // if any are still M/E that's a single-writer violation that the
-      // post-commit checkSingleWriter will catch.
+      // Invalidate every peer. Each is a reader: the caller holds the write
+      // grant (checked above), and every transition that grants one runs
+      // checkSingleWriter, so no other M/E peer can exist here. That is why
+      // none is queued a preemption notice. (A stray writer would NOT be
+      // caught by the post-commit check below: this loop invalidates it first.)
       const stateMap = this.getStateMap(artifactId);
       const invalidatedPeers: string[] = [];
       for (const [peerId, peerState] of stateMap) {
@@ -494,7 +501,6 @@ export class ArtifactRegistry {
           );
         }
         this.setAgentStateInternal(artifactId, peerId, peerState, MESIState.INVALID, nowTick, "commit");
-        this.upsertPendingNotice(peerId, artifactId, agentId, nowTick);
         invalidatedPeers.push(peerId);
       }
 
@@ -559,8 +565,8 @@ export class ArtifactRegistry {
    * 6. WIN: version+1, content_hash/last_writer_id/updated_at updated
    *    (size_tokens preserved on null), committer S/I → SHARED (an OCC writer
    *    never acquired a grant, so SHARED is the honest end-state and keeps a
-   *    repeat commit_cas eligible), every non-INVALID peer → INVALID + a
-   *    pending notice, single-writer re-checked.
+   *    repeat commit_cas eligible), every non-INVALID peer → INVALID with no
+   *    pending notice (each is a reader), single-writer re-checked.
    *
    * Parity notes (plan §Review corrections, decision A):
    * - `caller_in_transient_state` is STRUCTURALLY UNREACHABLE on Node: the
@@ -637,7 +643,7 @@ export class ArtifactRegistry {
         .run(nextVersion, newContentHash, sizeTokens, agentId, Date.now() / 1000, artifactId);
 
       // Invalidate every non-INVALID peer (SHARED readers; M/E was excluded
-      // above) + queue a preemption notice — same shape as commit().
+      // above). No preemption notice — same shape as commit().
       const stateMap = this.getStateMap(artifactId);
       const invalidatedPeers: string[] = [];
       for (const [peerId, peerState] of stateMap) {
@@ -647,7 +653,6 @@ export class ArtifactRegistry {
           throw new Error(`commitCas: peer ${peerId} in ${peerState} cannot transition to INVALID`);
         }
         this.setAgentStateInternal(artifactId, peerId, peerState, MESIState.INVALID, nowTick, "commit_cas");
-        this.upsertPendingNotice(peerId, artifactId, agentId, nowTick);
         invalidatedPeers.push(peerId);
       }
 
@@ -1023,9 +1028,10 @@ export class ArtifactRegistry {
    * within a second while still refusing a strictly OLDER timestamp, which
    * is the only thing the comparison was ever load-bearing for.
    *
-   * Reachable on the strict-mode path: `pre_bash`/`pre_grep` re-grant SHARED
-   * and then return the deny BEFORE draining notices, so the first row is
-   * still queued when a second preempter arrives in the same second.
+   * Only a write-grant holder is queued a notice, so this takes a victim that
+   * re-acquires a write grant between two preemptions without draining. A
+   * reader re-grant (the strict-mode `pre_bash`/`pre_grep` re-arm) is queued
+   * nothing and cannot reach it.
    */
   private upsertPendingNotice(
     victimAgentId: string,

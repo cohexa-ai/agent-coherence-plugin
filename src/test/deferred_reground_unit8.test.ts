@@ -131,7 +131,6 @@ test("strict deny with pending flag: deny bytes identical, no additionalContext,
     const agentB = sessions.registerSession(SID_B);
     registry.acquireExclusive(id, agentB, 20); // A → INVALID
     registry.commit(id, agentB, HASH_2, 30); // v2, last_writer = B
-    registry.popPendingNoticesForAgent(agentA); // isolate the deny bytes
 
     // Baseline deny, BEFORE any flag exists (today's bytes).
     const baseline = await post("/hooks/pre-read", {
@@ -173,13 +172,13 @@ test("strict deny with pending flag: deny bytes identical, no additionalContext,
 test("after a strict deny, the follow-up allowed re-read renders notices → stale warning → re-ground (KTD6 order)", async () => {
   const { registry, sessions, post, cleanup } = await makeServer(["CLAUDE.md"]);
   try {
-    // A holds SHARED on strict CLAUDE.md and warn-mode plan.md; B preempts
+    // A holds EXCLUSIVE on strict CLAUDE.md and warn-mode plan.md; B preempts
     // and commits BOTH (A → INVALID, notices queued for A on both).
     const cid = registry.resolveOrRegisterArtifact("CLAUDE.md", HASH_1);
     const pid = registry.resolveOrRegisterArtifact("plan.md", HASH_1);
     const agentA = sessions.registerSession(SID_A);
-    registry.grantShared(cid, agentA, 10);
-    registry.grantShared(pid, agentA, 10);
+    registry.acquireExclusive(cid, agentA, 10);
+    registry.acquireExclusive(pid, agentA, 10);
     const agentB = sessions.registerSession(SID_B);
     registry.acquireExclusive(cid, agentB, 20);
     registry.commit(cid, agentB, HASH_2, 30);
@@ -555,7 +554,6 @@ test("delivery onto an EXISTING envelope leaves its decision untouched (merge pa
     const agentB = sessions.registerSession(SID_B);
     registry.acquireExclusive(pid, agentB, 20); // A → INVALID
     registry.commit(pid, agentB, HASH_2, 30); // v2, last_writer = B
-    registry.popPendingNoticesForAgent(agentA); // pure stale envelope
 
     const armed = await post("/hooks/session-start", { session_id: SID_A });
     assert.equal(armed.status, 200);
