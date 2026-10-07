@@ -24,7 +24,7 @@
  */
 import { readFileSync, statSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { load as yamlLoad } from "js-yaml";
+import { dump as yamlDump, load as yamlLoad } from "js-yaml";
 
 /** Mirror of Python coordinator_server.MAX_POLICY_PATHS_PER_REQUEST. */
 export const MAX_POLICY_PATHS_PER_REQUEST = 20;
@@ -238,7 +238,8 @@ export class PolicyRef {
  *   `..` → "contains '..'") — defense-in-depth; routes pre-validate;
  * - dedupe against patterns already in the file — a fully-duplicate request
  *   returns `added: []`;
- * - append `- <p>` lines preserving existing content;
+ * - append one double-quoted `- "<p>"` line per entry, preserving existing
+ *   content (Python writes them unquoted until Cohexa-ai/agent-coherence#284);
  * - byte cap → throws with Python's exact message
  *   (`policy YAML cap of 65536 bytes would be exceeded`) → route maps to 400.
  *
@@ -281,11 +282,13 @@ export function appendPolicyYaml(
     return { added: [], rejected };
   }
 
-  const newLines = trulyNew.map((p) => `- ${p}`).join("\n");
-  const newContent =
-    existing !== ""
-      ? existing.replace(/\n+$/, "") + "\n" + newLines + "\n"
-      : newLines + "\n";
+  // Quoted, never plain: a plain `- ${p}` lets YAML read the entry as an
+  // alias, tag, comment, mapping or non-string, and one such entry stops the
+  // whole file parsing, which loads as no entries. js-yaml's dumper also
+  // escapes NEL, which PyYAML would fold to a space when the Python backend
+  // reads the same file.
+  const newLines = yamlDump(trulyNew, { forceQuotes: true, quotingType: '"', lineWidth: -1 });
+  const newContent = existing !== "" ? existing.replace(/\n+$/, "") + "\n" + newLines : newLines;
   if (Buffer.byteLength(newContent, "utf8") > MAX_POLICY_YAML_BYTES) {
     throw new Error(`policy YAML cap of ${MAX_POLICY_YAML_BYTES} bytes would be exceeded`);
   }
@@ -305,8 +308,10 @@ function parseYamlPatternLines(text: string): Set<string> {
       return new Set(raw.filter((x): x is string => typeof x === "string"));
     }
   } catch {
-    // Malformed YAML: fall through to the empty set — the append will
-    // still produce a parseable file (existing content preserved verbatim).
+    // Malformed YAML: fall through to the empty set and append anyway. The
+    // existing content is preserved verbatim, so a file that is already
+    // malformed stays malformed (and loads as no entries) until the offending
+    // line is fixed by hand.
   }
   return new Set();
 }

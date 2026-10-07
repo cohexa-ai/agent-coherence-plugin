@@ -14,6 +14,7 @@ import { join } from "node:path";
 import {
   appendPolicyYaml,
   PolicyRef,
+  TrackedArtifactPolicy,
   MAX_POLICY_YAML_BYTES,
 } from "../policy.js";
 
@@ -43,7 +44,7 @@ test("appendPolicyYaml: fresh file — adds valid paths, rejects traversal/absol
       { path: "\\leading-backslash.md", reason: "path must be relative (no leading \\)" },
     ]);
     // The newline-injection candidate never reaches disk — only the safe path.
-    assert.equal(readFileSync(yamlPath, "utf8"), "- notes.md\n");
+    assert.equal(readFileSync(yamlPath, "utf8"), '- "notes.md"\n');
   } finally {
     cleanup();
   }
@@ -56,7 +57,7 @@ test("appendPolicyYaml: dedupe — a fully-duplicate request returns added: []",
     appendPolicyYaml(yamlPath, ["notes.md"]);
     const out = appendPolicyYaml(yamlPath, ["notes.md"]);
     assert.deepEqual(out.added, []);
-    assert.equal(readFileSync(yamlPath, "utf8"), "- notes.md\n");
+    assert.equal(readFileSync(yamlPath, "utf8"), '- "notes.md"\n');
   } finally {
     cleanup();
   }
@@ -70,7 +71,53 @@ test("appendPolicyYaml: appends to existing content without clobbering it", () =
     writeFileSync(yamlPath, "- existing.md\n", "utf8");
     const out = appendPolicyYaml(yamlPath, ["new.md", "existing.md"]);
     assert.deepEqual(out.added, ["new.md"]);
-    assert.equal(readFileSync(yamlPath, "utf8"), "- existing.md\n- new.md\n");
+    // The existing line is kept byte-for-byte; only the new entry is written quoted.
+    assert.equal(readFileSync(yamlPath, "utf8"), '- existing.md\n- "new.md"\n');
+  } finally {
+    cleanup();
+  }
+});
+
+test("appendPolicyYaml: an entry that is YAML syntax round-trips, and so does every entry before it (#178)", () => {
+  // As a plain scalar (`- ${p}`) each of these means something to YAML: it
+  // stops the whole file parsing (the loader then keeps none of it), parses
+  // to a non-string the loader drops, or parses to a different, shorter
+  // pattern. All pass validatePolicyPath, so each must read back as exactly
+  // the string sent, without disturbing the entry before it.
+  const wholeFileLost = [
+    "*.log", "!x.md", "[a].md", "{a}.md", "|x.md", "%x.md", "@x.md", "`x.md", "'x.md", '"x.md',
+  ];
+  const entryDropped = ["&x.md", "#x.md", "a: b.md", "null", "~", "123", "true"];
+  const entryChanged = ["docs/x #1.md"];
+  for (const p of [...wholeFileLost, ...entryDropped, ...entryChanged]) {
+    const { root, cleanup } = makeRoot();
+    try {
+      const yamlPath = join(root, ".coherence", "tracked.yaml");
+      appendPolicyYaml(yamlPath, ["keep.md"]);
+      assert.deepEqual(appendPolicyYaml(yamlPath, [p]).added, [p]);
+      assert.deepEqual(
+        TrackedArtifactPolicy.load(root).userAddedPatterns,
+        ["keep.md", p],
+        `entry ${JSON.stringify(p)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+test("appendPolicyYaml: escapes NEL, which the Python coordinator's YAML reader folds to a space", () => {
+  // Both backends read these files. PyYAML (YAML 1.1) treats a raw U+0085
+  // inside a double-quoted scalar as a line break and folds it to a space,
+  // so `a<NEL>b.md` comes back as `a b.md`; js-yaml keeps it. NEL is a C1
+  // control, which validatePolicyPath does not reject, so it reaches the
+  // writer and must be written as the `\N` escape.
+  const { root, cleanup } = makeRoot();
+  try {
+    const yamlPath = join(root, ".coherence", "tracked.yaml");
+    appendPolicyYaml(yamlPath, ["a\u0085b.md"]);
+    assert.equal(readFileSync(yamlPath, "utf8"), '- "a\\Nb.md"\n');
+    assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, ["a\u0085b.md"]);
   } finally {
     cleanup();
   }

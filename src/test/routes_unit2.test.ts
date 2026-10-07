@@ -281,3 +281,30 @@ test("policy/untrack: response key is `removed`; ignore wins over tracked", asyn
     await cleanup();
   }
 });
+
+test("policy/untrack and /track: a '*'-led glob keeps every earlier entry in force (#178)", async () => {
+  // A plain `- *.log` is a YAML alias, which stops the file parsing and
+  // leaves the loader with no entries while the route still answers success.
+  const { post, cleanup } = await makeServer();
+  const casOnNotes = () =>
+    post("/hooks/post-edit-cas", {
+      session_id: SID_A,
+      path: "notes.md",
+      content_hash: HASH_1,
+      expected_version: 1,
+    });
+  try {
+    await post("/policy/track", { paths: ["notes.md"] });
+    await post("/policy/track", { paths: ["*.txt"] });
+    // Still tracked: unknown-at-commit, not the untracked fast path.
+    assert.deepEqual((await casOnNotes()).body, { ok: true, note: "untracked-at-commit" });
+
+    await post("/policy/untrack", { paths: ["notes.md"] });
+    const r = await post("/policy/untrack", { paths: ["*.log"] });
+    assert.deepEqual(r.body, { ok: true, removed: ["*.log"], rejected: [] });
+    // Still ignored: the earlier untrack of notes.md survives the '*' entry.
+    assert.deepEqual((await casOnNotes()).body, { ok: true });
+  } finally {
+    await cleanup();
+  }
+});

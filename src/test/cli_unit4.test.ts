@@ -88,7 +88,7 @@ test("end-to-end: track writes YAML + prints; untrack uses `removed`; status ren
     assert.match(track.stdout, /agent-coherence-track: tracked docs\/a\.md/);
     assert.match(track.stderr, /rejected '\/etc\/passwd': path outside workspace root/);
     const yaml = readFileSync(join(root, ".coherence", "tracked.yaml"), "utf8");
-    assert.equal(yaml, "- notes.md\n- docs/a.md\n");
+    assert.equal(yaml, '- "notes.md"\n- "docs/a.md"\n');
 
     const untrack = await runCli("cli_untrack.js", ["notes.md", "--root", root], root);
     assert.equal(untrack.status, 0);
