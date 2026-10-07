@@ -178,6 +178,7 @@ What happens when a strict + tracked artifact is read stale:
 - The model receives the deny + a static reason text. Per Phase 0 H1 falsification, the reason is byte-identical across retries (varied text actually *worsens* opus, which reads it as a prompt-injection pattern).
 - The model exits its bounded retry loop (typically 2-5 attempts per Phase 0) and surfaces the deny to the operator.
 - The agent's MESI state stays INVALID — retries see the same deny until the operator intervenes (re-reads via the Read tool to take a fresh SHARED grant).
+- An `Edit` or `Write` of a strict file the session has not read since a peer's commit is denied the same way. That includes a session whose Bash or Grep read of the file was just denied: the deny lets the retry run, but until a retried Bash command or a `Read` reads the current version, the session cannot write the file (a retried Grep does not count, because it lists files rather than showing them).
 
 **Strict mode is operator opt-in per artifact. Never global.** A literal `**` in `strict_mode_paths` triggers a startup warning (the coordinator counts matching tracked artifacts; default threshold is 50). The plugin will never silently lock down a workspace.
 
