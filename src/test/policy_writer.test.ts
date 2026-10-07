@@ -241,7 +241,11 @@ test("appendPolicyYaml: a long run of blank lines inside the list appends normal
   const { root, cleanup } = makeRoot();
   try {
     const yamlPath = seedTracked(root, '- "a.md"\n' + "\n".repeat(60_000) + '- "b.md"\n');
+    // Generous: the linear trim takes milliseconds, the regex it replaced about
+    // two seconds on this input.
+    const started = performance.now();
     assert.deepEqual(appendPolicyYaml(yamlPath, ["new.md"]).added, ["new.md"]);
+    assert.ok(performance.now() - started < 1000, "appending took over a second");
     assert.deepEqual(TrackedArtifactPolicy.load(root).userAddedPatterns, ["a.md", "b.md", "new.md"]);
   } finally {
     cleanup();
