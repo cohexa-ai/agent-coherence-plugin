@@ -151,6 +151,24 @@ gh api -X POST repos/Cohexa-ai/agent-coherence-plugin/rulesets \
 JSON
 ```
 
+### Create the forward-merge GitHub App
+
+`.github/workflows/forward-merge-main.yml` merges `main` into `dev` whenever `main` holds commits `dev` lacks: Dependabot security updates (they always target the default branch), the release merge and bump (§2), and hot-fixes (§3). It needs a GitHub App token rather than `GITHUB_TOKEN`, because `GITHUB_TOKEN` cannot push changes to `.github/workflows/`, its PRs get their checks held for manual approval, and its merges fire no push workflows. The workflow header has the detail.
+
+1. Create the App at <https://github.com/organizations/Cohexa-ai/settings/apps/new>. Any unique name. Untick **Webhook → Active**. Repository permissions: **Contents**, **Pull requests** and **Workflows**, each *Read and write* (Metadata read-only is added automatically). Where can it be installed: *Only on this account*.
+2. **Install App** → *Only select repositories* → `agent-coherence-plugin`.
+3. On the App's settings page, copy the **Client ID**, then **Generate a private key** (a `.pem` downloads).
+4. Store both, then delete the `.pem`:
+
+   ```bash
+   gh variable set FORWARD_MERGE_APP_CLIENT_ID -R Cohexa-ai/agent-coherence-plugin --body '<client id>'
+   gh secret set FORWARD_MERGE_APP_PRIVATE_KEY -R Cohexa-ai/agent-coherence-plugin < path/to/key.pem
+   ```
+
+5. Verify: `gh workflow run forward-merge-main.yml -R Cohexa-ai/agent-coherence-plugin --ref dev` and expect a green run. Use `--ref dev`: a dispatch reads the workflow from the ref it names, and `dev` always carries this file, while `main` carries it only once a release or a bootstrap has put it there. A manual run always mints the App token, so green means the App works even when `dev` has nothing to take.
+
+Do not add the App to any bypass list. Its PR merges only once `dev`'s required checks pass, which is the point. Until the App exists, the workflow stays green while `dev` contains `main`, and fails red, naming this section, only when `dev` is behind.
+
 ### Verify
 
 ```bash
@@ -221,6 +239,8 @@ Replace `X.Y.Z` with the target version (e.g. `0.3.2`) throughout.
    git push origin main
    ```
 
+   Each push to `main` here and the merge in step 2 starts `forward-merge-main.yml`, which opens a PR merging `main` into `dev` and merges it once `dev`'s checks pass. Confirm it lands before the next release. If it fails on a conflict, merge by hand per §3 step 5.
+
 7. **Create the annotated tag.** Use `-a` so the tag carries metadata (tagger, date, message) — lightweight tags are harder to audit.
 
    ```bash
@@ -289,6 +309,8 @@ Use this when a critical security or correctness fix must land on `main` immedia
 4. **Tag if a release is warranted.** Follow section 2 steps 4–10 (version bump, commit, tag, push tag, smoke check).
 
 5. **Forward-merge into `dev`.** Critical — otherwise the next `dev → main` PR will look like it's re-introducing the hot-fix as a divergence (or worse, revert it during a rebase).
+
+   `forward-merge-main.yml` does this automatically once the hot-fix merges: it opens a PR merging `main` into `dev` and merges it after `dev`'s checks pass. Run the commands below only when that workflow fails on a conflict. If you resolve through a PR instead, use any branch except `chore/auto-forward-merge-main`, which the workflow rebuilds from scratch:
 
    ```bash
    git checkout dev && git pull --ff-only origin dev

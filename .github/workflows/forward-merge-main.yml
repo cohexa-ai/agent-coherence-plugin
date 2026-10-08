@@ -1,0 +1,253 @@
+# Merge `main` into `dev` whenever `main` holds commits `dev` lacks.
+#
+# WHAT REACHES `main` WITHOUT PASSING THROUGH `dev`. No setting redirects any
+# of these:
+#   - Dependabot SECURITY updates. They always open against the default
+#     branch; `target-branch` in .github/dependabot.yml moves version updates
+#     only. A transitive fix (brace-expansion, PR #175) can reach `dev` no other
+#     way, because npm version updates cover direct dependencies only.
+#   - The release merge commit and the release bump (docs/RELEASE.md §2).
+#   - Hot-fixes (docs/RELEASE.md §3).
+#
+# WHY A GITHUB APP TOKEN, NOT GITHUB_TOKEN. GITHUB_TOKEN has no `workflows`
+# permission, so GitHub refuses any git push it makes that changes a file under
+# .github/workflows/, and building the sync branch is such a push routinely: GitHub Actions version
+# bumps land on `dev`, so the two branches' workflow files differ between
+# releases, and an Actions security update or a workflow hot-fix lands on
+# `main`. A PR opened with GITHUB_TOKEN also gets its pull_request runs held
+# for manual approval, so `dev`'s required checks would never report, and a
+# merge made with it fires no push workflow on `dev`. An App installation token
+# has none of those limits. The App is created once (docs/RELEASE.md §1); it
+# holds no bypass, so its PR merges only through `dev`'s branch protection.
+#
+# TRIGGERS. A push to `main` or `dev` made by a human or by the App fires at
+# once; a push to `dev` matters because `dev`'s strict up-to-date rule leaves
+# an open sync PR behind whenever `dev` moves, and the run rebuilds it. A merge
+# made with GITHUB_TOKEN fires nothing, and that includes every
+# dependabot-automerge.yml merge, onto either branch, so the daily schedule is
+# the backstop for those. The `main` push trigger and the schedule both resolve
+# this file from `main` (schedules run only from the default branch), so they
+# act only once the file is there.
+#
+# The App is needed only when there is work to do. A run that finds `dev`
+# already containing `main` stays green without it, so the workflow does not go
+# red on every push before the App exists — only when `dev` really is behind.
+#
+# CONFLICTS ARE LEFT TO A HUMAN. The run fails red and names the files. The
+# sync branch is this workflow's own and is rebuilt from scratch on every sync,
+# so a hand-resolved forward-merge must use a different branch name.
+#
+# ONLY ITS OWN PR, ONLY ITS OWN COMMIT. A fork can open a PR from a branch with
+# the same name, and `gh pr list --head` matches it; `dev` needs no review, so
+# queueing that PR would merge an outsider's code. Fork PRs are filtered out,
+# and every merge this workflow queues or performs is pinned to the commit it
+# pushed or checked. Once queued, only writers and the App can move the branch.
+#
+# NO THIRD-PARTY CODE BESIDE THE APP TOKEN. The job fetches with plain git
+# instead of actions/checkout. Any action that runs in this job could rewrite
+# PATH or the git config that later steps use while they hold the App token,
+# which can push workflows and so reach every repo secret; checkout bumps are
+# auto-merged into `dev` with no review. The one action left,
+# actions/create-github-app-token, is excluded from auto-merge in
+# dependabot-automerge.yml for the same reason.
+name: forward-merge-main
+
+on:
+  push:
+    branches: [main, dev]
+  schedule:
+    - cron: '30 13 * * *'
+  workflow_dispatch:
+
+# GITHUB_TOKEN only reads. Every write goes through the App token.
+# `actions: read` is required by `gh pr checks`: its query reads each check
+# run's workflow, and without it the call fails with "Resource not accessible
+# by integration" (cli/cli#8821).
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+  actions: read
+
+# Runs queue rather than cancel: two runs force-pushing the same branch would
+# race, and a cancelled run would leave a half-built sync branch.
+concurrency:
+  group: forward-merge-main
+  cancel-in-progress: false
+
+jobs:
+  forward-merge:
+    name: Forward-merge main into dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SYNC_BRANCH: chore/auto-forward-merge-main
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # Every branch, because the ancestry checks below read main, dev and the
+      # sync branch. git authenticates through gh's credential helper, which
+      # reads GH_TOKEN when git calls it: GITHUB_TOKEN here, the App token in
+      # the steps that push.
+      - name: Fetch every branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          gh auth setup-git
+          git fetch -q --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          git checkout -q -B dev origin/dev
+
+      - name: Decide what dev needs
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          behind="$(git rev-list --count origin/dev..origin/main)"
+          pr="$(gh pr list --head "$SYNC_BRANCH" --base dev --state open --json number,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository | not)][0].number // empty')"
+          head=""
+          action=none
+          if [ "$behind" = "0" ]; then
+            # dev caught up some other way: retire whatever this workflow left.
+            if [ -n "$pr" ]; then
+              action=close
+            elif git rev-parse --verify -q "refs/remotes/origin/$SYNC_BRANCH" >/dev/null; then
+              action=delete-branch
+            fi
+          elif [ -n "$pr" ] &&
+               git merge-base --is-ancestor origin/dev "origin/$SYNC_BRANCH" &&
+               git merge-base --is-ancestor origin/main "origin/$SYNC_BRANCH"; then
+            # The open PR already holds both tips. Rebuilding would only restart
+            # its checks, so judge the ones it has. A failure is the one state
+            # nothing else will report, so it turns this run red. With --json,
+            # gh exits 0 whether checks pass, fail or are pending; it exits
+            # non-zero only when none have reported yet (still pending) or when
+            # it could not ask, and the second must not pass for the first.
+            checks_err="$(mktemp)"
+            if ! failed="$(gh pr checks "$pr" --required --json bucket \
+                --jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")] | length' 2>"$checks_err")"; then
+              if grep -q 'checks reported' "$checks_err"; then
+                failed=0
+              else
+                echo "::error::Could not read the required checks on forward-merge PR #$pr: $(cat "$checks_err")"
+                exit 1
+              fi
+            fi
+            if [ "$failed" -gt 0 ]; then
+              echo "::error::Forward-merge PR #$pr is failing $failed required check(s), and dev is still $behind commit(s) behind main. Fix or re-run them on the PR."
+              exit 1
+            fi
+            head="$(git rev-parse "origin/$SYNC_BRANCH")"
+            action=requeue
+          else
+            action=sync
+          fi
+          echo "dev is $behind commit(s) behind main; open sync PR: ${pr:-none}; action: $action"
+          {
+            echo "action=$action"
+            echo "behind=$behind"
+            echo "pr=$pr"
+            echo "head=$head"
+          } >> "$GITHUB_OUTPUT"
+
+      # A manual run always mints the token, so a green dispatch proves the App
+      # is set up even when dev has nothing to take.
+      - name: Require the forward-merge App
+        if: steps.plan.outputs.action != 'none' || github.event_name == 'workflow_dispatch'
+        env:
+          CLIENT_ID: ${{ vars.FORWARD_MERGE_APP_CLIENT_ID }}
+          HAS_KEY: ${{ secrets.FORWARD_MERGE_APP_PRIVATE_KEY != '' }}
+          ACTION: ${{ steps.plan.outputs.action }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ "$HAS_KEY" != "true" ]; then
+            if [ "$ACTION" = "none" ]; then
+              need="This manual run checks the App"
+            else
+              need="dev needs '$ACTION'"
+            fi
+            echo "::error::$need, but the forward-merge GitHub App is not configured. Set repository variable FORWARD_MERGE_APP_CLIENT_ID and secret FORWARD_MERGE_APP_PRIVATE_KEY (docs/RELEASE.md §1), or forward-merge by hand (docs/RELEASE.md §3 step 5)."
+            exit 1
+          fi
+
+      - name: Mint the App token
+        if: steps.plan.outputs.action != 'none' || github.event_name == 'workflow_dispatch'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ vars.FORWARD_MERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FORWARD_MERGE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      # A merge commit, never a squash or rebase: main's commits must become
+      # ancestors of dev, or every later forward-merge replays them (#160 was
+      # squash-merged into dev, so #182 had to carry #157 and #158 again).
+      - name: Rebuild the sync branch as dev + main
+        if: steps.plan.outputs.action == 'sync'
+        id: rebuild
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          user_id="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          gh auth setup-git
+          git switch -C "$SYNC_BRANCH" origin/dev
+          if ! git merge --no-ff -m 'chore: forward-merge main into dev' origin/main; then
+            conflicts="$(git diff --name-only --diff-filter=U | paste -sd ' ' -)"
+            git merge --abort
+            echo "::error::main does not merge cleanly into dev (conflicts: $conflicts). Merge it by hand (docs/RELEASE.md §3 step 5), never on $SYNC_BRANCH. For package.json and package-lock.json, keep dev's side wherever dev's version is at or above main's."
+            exit 1
+          fi
+          git push --force origin "$SYNC_BRANCH"
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Auto-merge waits for dev's required checks; the App holds no bypass.
+      # A PR whose checks already passed is CLEAN, where enabling auto-merge
+      # can be refused, so that case falls through to a plain merge, which
+      # branch protection still gates.
+      - name: Open or reuse the PR and queue its merge
+        if: steps.plan.outputs.action == 'sync' || steps.plan.outputs.action == 'requeue'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.plan.outputs.pr }}
+          BEHIND: ${{ steps.plan.outputs.behind }}
+          HEAD_SHA: ${{ steps.rebuild.outputs.head || steps.plan.outputs.head }}
+        run: |
+          if [ -z "$PR" ]; then
+            PR="$(gh pr create --base dev --head "$SYNC_BRANCH" \
+              --title 'chore: forward-merge main into dev' \
+              --body "Opened by \`.github/workflows/forward-merge-main.yml\`: \`main\` had $BEHIND commit(s) that \`dev\` lacked. It merges once \`dev\`'s required checks pass. Rebuilt automatically whenever \`dev\` or \`main\` moves, so do not push to this branch.")"
+          fi
+          if [ "$(gh pr view "$PR" --json autoMergeRequest --jq '.autoMergeRequest != null')" = "true" ]; then
+            echo "Auto-merge is already queued on $PR."
+            exit 0
+          fi
+          # The merge is pinned to HEAD_SHA, and GitHub's PR record can trail a
+          # push by a few seconds; a pinned merge sent before it catches up is
+          # refused with "Head branch was modified".
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [ "$(gh pr view "$PR" --json headRefOid --jq .headRefOid)" = "$HEAD_SHA" ] && break
+            sleep 3
+          done
+          gh pr merge --auto --merge --match-head-commit "$HEAD_SHA" "$PR" ||
+            gh pr merge --merge --match-head-commit "$HEAD_SHA" "$PR"
+
+      - name: Close the sync PR dev no longer needs
+        if: steps.plan.outputs.action == 'close'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.plan.outputs.pr }}
+        run: |
+          gh pr close "$PR" --delete-branch \
+            --comment "\`dev\` already contains every commit on \`main\`; closed by forward-merge-main.yml."
+
+      - name: Delete the spent sync branch
+        if: steps.plan.outputs.action == 'delete-branch'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${SYNC_BRANCH}"

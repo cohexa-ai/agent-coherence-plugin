@@ -237,9 +237,10 @@ export function evaluateLockfileDrift(mainLock, devLock) {
     // merging main into dev cannot change dev's own transitive tree — naming
     // the forward-merge there strands the operator at a gate it cannot clear.
     const remedy = anyTopLevel
-      ? 'Dependabot only ever patches the default branch, so a green security alert does not mean ' +
-        'dev is patched — forward-merge main into dev. (docs/RELEASE.md §3 step 5 documents the ' +
-        'mechanics; §2 has no equivalent step.)'
+      ? 'Dependabot security updates only ever patch the default branch, so a green security alert ' +
+        'does not mean dev is patched — forward-merge main into dev. The forward-merge-main workflow ' +
+        'normally does this, so check its latest run and its chore/auto-forward-merge-main PR first; ' +
+        'docs/RELEASE.md §3 step 5 documents the manual mechanics for a conflict.'
       : "Every older copy above is nested under one of dev's dependencies, so check whether main " +
         'carries that package at that position at all — if it does not, this is dev’s own ' +
         'transitive tree and a forward-merge will not clear it.';
