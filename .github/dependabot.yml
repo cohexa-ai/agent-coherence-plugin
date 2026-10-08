@@ -1,11 +1,27 @@
 version: 2
 updates:
   # Node dependencies (build/dev tooling — the plugin coordinator itself ships
-  # locked deps via package-lock.json. Bumps target the default branch (main);
-  # dev is a mirror of main, and a dev target produced duplicate PRs when the
-  # two lines diverged (security updates always go to the default branch).
+  # locked deps via package-lock.json).
+  #
+  # VERSION updates target `dev`, the integration branch, and reach `main` with
+  # the next release merge like every other change. SECURITY updates ignore
+  # `target-branch` and this entry's labels and commit-message settings: they
+  # always open against the default branch (`main`), because Dependabot builds
+  # its dependency graph from the default branch only.
+  # .github/workflows/forward-merge-main.yml carries those main-only merges
+  # back to `dev`.
+  #
+  # Expect one duplicate shape: an advisory on a DIRECT dependency raises a
+  # security PR on `main` (to the minimum patched version) while this entry
+  # raises a version PR on `dev` (to the latest). The two touch the same
+  # package-lock.json lines, so the forward-merge conflicts; keep `dev`'s side
+  # when its version is at or above `main`'s.
+  #
+  # This file is read from the default branch, so a change here takes effect
+  # only once it reaches `main`.
   - package-ecosystem: "npm"
     directory: "/"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -17,9 +33,10 @@ updates:
       - "dependencies"
       - "automated"
 
-  # GitHub Actions workflow versions (ci.yml + release.yml).
+  # GitHub Actions workflow versions (every file under .github/workflows/).
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
       day: "monday"
