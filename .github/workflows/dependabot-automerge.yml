@@ -1,20 +1,28 @@
-# Auto-merge policy for Dependabot PRs (which target `main` per
-# .github/dependabot.yml — dev is the integration branch, but security
-# updates always go to the default branch).
+# Auto-merge policy for Dependabot PRs. VERSION updates target `dev` per
+# .github/dependabot.yml; SECURITY updates always target the default branch,
+# `main`. This workflow runs on both.
 #
-# Scope — auto-approved + auto-merged once every required status check on
-# `main` passes (branch protection stays the real gate; auto-merge only
-# queues the merge):
-#   - GitHub Actions bumps (ci.yml / release.yml action versions)
-#   - npm devDependencies (direct:development), semver patch + minor only
+# Scope — auto-approved + auto-merged once every required status check on the
+# PR's base branch passes (branch protection stays the real gate; auto-merge
+# only queues the merge): npm devDependencies (direct:development), semver
+# patch + minor only.
 #
-# Everything else — production dependencies (better-sqlite3 is deliberately
-# pinned to the 12.x prebuilt line: its ABI coverage defines engines.node
-# and the ensure-coordinator-node stage-0 gate) and any semver-major bump —
-# gets no approval here and waits for a human.
+# Everything else gets no approval here and waits for a human:
+#   - production dependencies (better-sqlite3 is deliberately pinned to the
+#     12.x prebuilt line: its ABI coverage defines engines.node and the
+#     ensure-coordinator-node stage-0 gate);
+#   - any semver-major bump;
+#   - every GitHub Actions bump. An action is third-party code that runs inside
+#     the workflows, some of which hold write tokens or, in
+#     forward-merge-main.yml, the App's private key, and `dev` takes merges
+#     with no review. A human reading the new pin is the only review it gets.
+#     (In practice none ever auto-merged before either: GitHub refuses to
+#     enable auto-merge with this token on a PR that edits a workflow file.)
 #
-# After a merge lands on main, forward-merge into dev per docs/RELEASE.md §3
-# step 5 so the next release PR doesn't show the bump as a divergence.
+# A merge that lands on `main` reaches `dev` through
+# .github/workflows/forward-merge-main.yml. A merge made by this workflow uses
+# GITHUB_TOKEN and so fires no push-triggered workflow; that workflow's
+# schedule is what picks it up.
 name: Dependabot auto-merge
 
 on: pull_request
@@ -35,21 +43,20 @@ jobs:
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
-      # --squash, not --merge: the `protect-main` ruleset sets
-      # allowed_merge_methods: ["squash"] alongside required_linear_history, so
-      # a merge commit is rejected outright.
+      # --squash: a dependency bump is one logical change, and both bases
+      # accept it (`dev` has no merge-method rule; the `protect-main` ruleset
+      # allows merge and squash).
       #
-      # The approval is best-effort. Repo setting "Allow GitHub Actions to
-      # create and approve pull requests" is currently OFF, which makes
-      # `gh pr review --approve` fail with "GitHub Actions is not permitted to
-      # approve pull requests" — that must not fail the job, or the workflow is
-      # permanently red and never reaches the auto-merge call. With the setting
-      # off, a human still approves once and auto-merge does the rest; turn it
-      # on and the same step closes the loop unattended.
-      - name: Approve (best-effort) and enable auto-merge — actions + dev-deps, patch/minor
+      # The approval is best-effort. `main` needs one approving review, `dev`
+      # needs none. It succeeds only while the repo setting "Allow GitHub
+      # Actions to create and approve pull requests" is on; with it off,
+      # `gh pr review --approve` fails with "GitHub Actions is not permitted to
+      # approve pull requests", and that must not fail the job, or the workflow
+      # is permanently red and never reaches the auto-merge call. A `main` PR
+      # then waits for one human approval and auto-merge does the rest.
+      - name: Approve (best-effort) and enable auto-merge — npm dev-deps, patch/minor
         if: >-
-          (steps.metadata.outputs.package-ecosystem == 'github_actions' ||
-           steps.metadata.outputs.dependency-type == 'direct:development') &&
+          steps.metadata.outputs.dependency-type == 'direct:development' &&
           (steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
            steps.metadata.outputs.update-type == 'version-update:semver-minor')
         env:
