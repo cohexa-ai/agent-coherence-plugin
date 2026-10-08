@@ -17,6 +17,13 @@ updates:
   # package-lock.json lines, so the forward-merge conflicts; keep `dev`'s side
   # when its version is at or above `main`'s.
   #
+  # Moving version updates to `dev` takes away no human review. What merges
+  # without a human is decided by dependabot-automerge.yml's gate (npm
+  # devDependency patch/minor bumps only), the same on either branch; on
+  # `main` its own github-actions[bot] approval met the one required review for
+  # exactly those PRs. It does keep unreviewed bumps off `main`, the branch an
+  # unpinned marketplace install tracks.
+  #
   # This file is read from the default branch, so a change here takes effect
   # only once it reaches `main`.
   - package-ecosystem: "npm"

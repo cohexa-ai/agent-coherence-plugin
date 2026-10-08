@@ -4,40 +4,32 @@
 #
 # Scope — auto-approved + auto-merged once every required status check on the
 # PR's base branch passes (branch protection stays the real gate; auto-merge
-# only queues the merge):
-#   - GitHub Actions bumps (every workflow under .github/workflows/), EXCEPT
-#     actions/create-github-app-token. That action receives the forward-merge
-#     App's private key (forward-merge-main.yml), and `dev` needs no review, so
-#     auto-merging a new pin of it would hand the key to code no human has
-#     looked at. Its bumps wait for a human like any other. It is the only
-#     third-party action in that job; the job fetches with plain git rather
-#     than actions/checkout so that no auto-merged action runs beside the key.
-#   - npm devDependencies (direct:development), semver patch + minor only
+# only queues the merge): npm devDependencies (direct:development), semver
+# patch + minor only.
 #
-# Everything else — production dependencies (better-sqlite3 is deliberately
-# pinned to the 12.x prebuilt line: its ABI coverage defines engines.node
-# and the ensure-coordinator-node stage-0 gate) and any semver-major bump —
-# gets no approval here and waits for a human.
+# Everything else gets no approval here and waits for a human:
+#   - production dependencies (better-sqlite3 is deliberately pinned to the
+#     12.x prebuilt line: its ABI coverage defines engines.node and the
+#     ensure-coordinator-node stage-0 gate);
+#   - any semver-major bump;
+#   - every GitHub Actions bump. An action is third-party code that runs inside
+#     the workflows, some of which hold write tokens or, in
+#     forward-merge-main.yml, the App's private key, and `dev` takes merges
+#     with no review. A human reading the new pin is the only review it gets.
+#     (In practice none ever auto-merged before either: GitHub refuses to
+#     enable auto-merge with this token on a PR that edits a workflow file.)
 #
 # A merge that lands on `main` reaches `dev` through
 # .github/workflows/forward-merge-main.yml. A merge made by this workflow uses
-# GITHUB_TOKEN and so fires no push-triggered workflow; that workflow's daily
+# GITHUB_TOKEN and so fires no push-triggered workflow; that workflow's
 # schedule is what picks it up.
 name: Dependabot auto-merge
 
 on: pull_request
 
-# `actions: write` is what lets auto-merge go through on a GitHub Actions bump.
-# Every such PR edits a file under .github/workflows/, and without it GitHub
-# refuses to enable auto-merge ("refusing to allow a GitHub App to create or
-# update workflow ... without `workflows` permission"). GITHUB_TOKEN has no
-# `workflows` key. `actions: write` is the fix reported in cli/cli#11493 and
-# confirmed there by a second user; GitHub does not document it, so treat it
-# as a workaround and watch the first Actions bump on `dev`.
 permissions:
   contents: write
   pull-requests: write
-  actions: write
 
 jobs:
   automerge:
@@ -62,11 +54,9 @@ jobs:
       # approve pull requests", and that must not fail the job, or the workflow
       # is permanently red and never reaches the auto-merge call. A `main` PR
       # then waits for one human approval and auto-merge does the rest.
-      - name: Approve (best-effort) and enable auto-merge — actions + dev-deps, patch/minor
+      - name: Approve (best-effort) and enable auto-merge — npm dev-deps, patch/minor
         if: >-
-          !contains(steps.metadata.outputs.dependency-names, 'actions/create-github-app-token') &&
-          (steps.metadata.outputs.package-ecosystem == 'github_actions' ||
-           steps.metadata.outputs.dependency-type == 'direct:development') &&
+          steps.metadata.outputs.dependency-type == 'direct:development' &&
           (steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
            steps.metadata.outputs.update-type == 'version-update:semver-minor')
         env:
