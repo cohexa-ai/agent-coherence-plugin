@@ -170,7 +170,7 @@ The App's private key goes in an **environment** that only `main` may use, not i
      -f name=main -f type=branch
    ```
 
-   `protected_branches: true` would not do: it admits every protected branch, and `dev` is protected. Run these even if the environment already exists: GitHub creates a referenced environment with no branch policy, and so does the web UI by default. The workflow refuses to use the environment unless it admits exactly `main`. Never store the key as a repository secret; any workflow on any branch can read one.
+   `protected_branches: true` would not do: it admits every protected branch, and `dev` is protected. Run these even if the environment already exists: GitHub creates a referenced environment with no branch policy, and so does the web UI by default. The workflow refuses to use the environment unless it admits exactly `main`. Never store the key as a repository or organization secret; any workflow on any branch can read one. The workflow checks for such a copy on every run and fails red if it finds one: delete it, then rotate the App's private key, since it has been readable.
 5. Store the Client ID as a repository variable and the key as an environment secret, then delete the `.pem`:
 
    ```bash

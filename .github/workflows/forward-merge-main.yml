@@ -34,7 +34,9 @@
 # a referenced environment that does not exist yet with NO policy. So `plan`
 # confirms the environment exists and admits exactly `main` before `act` may
 # name it; a missing or loosened environment turns the run red instead of
-# being created or used.
+# being created or used. `plan` also fails on every run if the key is visible
+# to it at all, since a job that names no environment can only see repository
+# and organization secrets, the copies `dev` can read.
 #
 # One approval path stays open and is not this workflow's: while the repo
 # setting "Allow GitHub Actions to create and approve pull requests" is on, any
@@ -111,6 +113,20 @@ jobs:
       pr: ${{ steps.plan.outputs.pr }}
       head: ${{ steps.plan.outputs.head }}
     steps:
+      # `plan` names no environment, so the only secrets it can see are
+      # repository and organization secrets — exactly the copies every branch,
+      # `dev` included, can read. A key visible here is that exposure, and it
+      # would also be what `act` falls back to if the environment copy were
+      # missing. Only a yes/no reaches the shell, never the value.
+      - name: Refuse a repository- or organization-level copy of the key
+        env:
+          KEY_OUTSIDE_ENVIRONMENT: ${{ secrets.FORWARD_MERGE_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$KEY_OUTSIDE_ENVIRONMENT" = "true" ]; then
+            echo "::error::FORWARD_MERGE_APP_PRIVATE_KEY is stored as a repository or organization secret, which a workflow on any branch can read. Delete it there (gh secret delete FORWARD_MERGE_APP_PRIVATE_KEY -R ${GITHUB_REPOSITORY}), rotate the App's private key, and keep it only in the forward-merge environment (docs/RELEASE.md §1)."
+            exit 1
+          fi
+
       # Every branch, because the checks below read main, dev and the sync
       # branch. git authenticates through gh's credential helper, which reads
       # GH_TOKEN when git calls it.
