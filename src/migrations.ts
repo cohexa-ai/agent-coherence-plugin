@@ -172,9 +172,11 @@ function raiseCrossRuntime(detail: string): never {
       `the two ledgers assign different meanings to the same user_version numbers. ` +
       `This Node coordinator will not read or migrate a foreign-ledger db. To keep ` +
       `using the runtime that owns this store, set coherence.coordinator_backend = ` +
-      `"python"; to switch the store to the Node backend, use the supported migration ` +
-      `path. Do NOT delete state.db — it holds the sibling runtime's live coordination ` +
-      `state and retained version content, which a delete destroys.`,
+      `"python". No tool converts a store between backends: ` +
+      `\`agent-coherence-coordinator --prepare-for-migration\` only drains and stops a ` +
+      `running Python coordinator. Do NOT delete state.db — it holds the sibling ` +
+      `runtime's live coordination state and retained version content, which a delete ` +
+      `destroys.`,
   );
 }
 

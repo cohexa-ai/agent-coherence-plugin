@@ -190,8 +190,9 @@ function handleStatus(req: IncomingMessage, res: ServerResponse, options: Server
     // The Node coordinator serves no operator tier. `agent-coherence-status
     // --detail full` relays this text to the operator verbatim, so it says
     // where the tier is served. It names no backend switch: a store this
-    // coordinator owns is one the Python coordinator fails closed on, so a
-    // switch needs `agent-coherence-coordinator --prepare-for-migration`.
+    // coordinator owns is one the Python coordinator fails closed on, and
+    // `agent-coherence-coordinator --prepare-for-migration` does not convert
+    // it (this coordinator serves no /admin/prepare-for-migration route).
     writeError(
       res,
       501,
