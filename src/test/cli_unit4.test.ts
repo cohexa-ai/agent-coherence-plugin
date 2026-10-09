@@ -17,6 +17,7 @@ import { PolicyRef } from "../policy.js";
 import { SessionRegistry } from "../sessions.js";
 import { createServer } from "../server.js";
 import { normalizeWorkspacePath } from "../cli.js";
+import { CLI_REQUEST_TIMEOUT_MS, HOOK_REQUEST_TIMEOUT_MS } from "../hook_client_transport.js";
 
 const DIST = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -195,6 +196,30 @@ test("0.3.1: --self-test is rejected with exit 2, not a false-positive exit 0", 
   // exited 0 — so the README's flagship post-install validation reported
   // success without ever running. Non-zero is the whole point of this test.
   assert.equal(code, 2);
+});
+
+test("the --self-test refusal names the Python console script and no backend switch", async () => {
+  // The refusal used to prescribe `printf 'python\n' > .coherence/coordinator_backend`.
+  // On a store the Node coordinator created, the Python coordinator fails
+  // closed and the dispatcher honors the file verbatim, so following that
+  // advice left the workspace with no coordinator at all.
+  const cwd = mkdtempSync(join(tmpdir(), "cli-self-test-"));
+  try {
+    for (const entry of ["cli_status.js", "cli_track.js"]) {
+      const run = await runCli(entry, ["--self-test"], cwd);
+      assert.equal(run.status, 2, entry);
+      assert.equal(run.stdout, "", entry);
+      assert.match(
+        run.stderr,
+        /--self-test is not supported by the bundled Node CLI \(it runs a live four-step pre-read → pre-edit → post-edit → stale-read sequence, then checks counters only the Python coordinator serves\)\. It needs the Python library's console script \(`pip install "agent-coherence>=0\.8\.0"`, run by its install path\) on a workspace the Python coordinator serves\. On a Node workspace, plain `agent-coherence-status` confirms the coordinator answers\.$/m,
+        entry,
+      );
+      assert.doesNotMatch(run.stderr, /coordinator_backend|printf/, entry);
+      assert.doesNotMatch(run.stderr, /prepare-for-migration/, entry);
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("0.3.1: unknown/typo flags are rejected rather than ignored", async () => {
@@ -420,6 +445,89 @@ test("--detail full against the Node coordinator surfaces its 501, exit 2", asyn
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
     registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- how long a CLI waits for the coordinator ---------------------------------
+
+test("the CLIs wait as long as the Python console scripts (6 s); the hooks keep 5 s", () => {
+  // The Python scripts' limit is CLI_HTTP_TIMEOUT_SEC = 6.0 in _coherence_client.py.
+  assert.equal(CLI_REQUEST_TIMEOUT_MS, 6000);
+  assert.equal(HOOK_REQUEST_TIMEOUT_MS, 5000);
+});
+
+/** Past the hooks' 5 s limit, inside the CLIs' 6 s one. */
+const SLOW_ANSWER_MS = 5500;
+
+function runHookClient(
+  sub: string,
+  root: string,
+  input: string,
+): Promise<{ stdout: string; status: number | null }> {
+  return new Promise((resolveRun) => {
+    const child = spawn(process.execPath, [join(DIST, "hook_client.js"), sub, "--root", root], {
+      cwd: root,
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    let stdout = "";
+    child.stdout.on("data", (c: Buffer) => (stdout += c.toString("utf8")));
+    child.on("close", (status) => resolveRun({ stdout, status }));
+    child.stdin.end(input);
+  });
+}
+
+test("the CLIs wait for a coordinator answer that takes 5.5 s; a hook still gives up at 5 s", async () => {
+  // On a large workspace the Python coordinator can take just over 5 s to
+  // answer when a busy registry frees up late, and its own console scripts
+  // wait 6 s for that answer. A hook runs on every tool call and fails open,
+  // so it keeps the shorter limit.
+  const root = mkdtempSync(join(tmpdir(), "cli-slow-"));
+  const requests: string[] = [];
+  const server = createHttpServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      const url = req.url ?? "";
+      requests.push(url);
+      const body = url === "/policy/track" ? { added: ["notes.md"] } : { answered: url };
+      const timer = setTimeout(() => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(body));
+      }, SLOW_ANSWER_MS);
+      // A client that gave up has nothing left to answer.
+      res.on("close", () => clearTimeout(timer));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    mkdirSync(join(root, ".coherence"), { recursive: true });
+    // backend=node: the hook claims no caller principal, so its one request is
+    // the hook route itself.
+    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\nbackend=node\n`);
+    writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
+
+    const hookInput = JSON.stringify({
+      session_id: "44444444-4444-4444-8444-444444444444",
+      tool_input: { command: "ls" },
+    });
+    const [status, track, hook] = await Promise.all([
+      runCli("cli_status.js", ["--root", root], root),
+      runCli("cli_track.js", ["notes.md", "--root", root], root),
+      runHookClient("pre-bash", root, hookInput),
+    ]);
+
+    assert.equal(status.status, 0, status.stderr);
+    assert.deepEqual(JSON.parse(status.stdout), { answered: "/status" });
+    assert.equal(track.status, 0, track.stderr);
+    assert.match(track.stdout, /^agent-coherence-track: tracked notes\.md$/m);
+    // The hook's request reached the coordinator, so its `{}` is the fail-open
+    // answer to giving up, not a skip before the request.
+    assert.deepEqual([...requests].sort(), ["/hooks/pre-bash", "/policy/track", "/status"]);
+    assert.equal(hook.status, 0);
+    assert.equal(hook.stdout, "{}\n");
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
     rmSync(root, { recursive: true, force: true });
   }
 });

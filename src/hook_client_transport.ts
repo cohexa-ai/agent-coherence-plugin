@@ -126,6 +126,19 @@ export function resolveEndpoint(coordinatorRoot: string): CoordinatorEndpoint {
 }
 
 /**
+ * How long a hook waits for the coordinator. A hook runs on every tool call
+ * and fails open, so a stalled coordinator must not hold the tool call long.
+ */
+export const HOOK_REQUEST_TIMEOUT_MS = 5000;
+
+/**
+ * How long `agent-coherence-status`, `-track` and `-untrack` wait: as long as
+ * the Python console scripts do, so a /status answer the Python coordinator
+ * sends after a late-won registry lock still arrives.
+ */
+export const CLI_REQUEST_TIMEOUT_MS = 6000;
+
+/**
  * Authenticated JSON request. Resolves to the parsed body on 2xx, null on a
  * non-2xx response (the Python HTTPError→None degrade), and rejects on a
  * network error (caller maps to CoordinatorUnavailable semantics).
@@ -145,7 +158,8 @@ export async function requestJson(
  * The same request, resolving to the HTTP status beside the parsed body (null
  * when the body is not JSON). For callers that must tell a 404 (a route the
  * coordinator does not implement) from other refusals, or read a 400's
- * `{error}` — the caller-principal claim and its refusal report.
+ * `{error}` — the caller-principal claim and its refusal report. `timeoutMs`
+ * bounds how long the socket may sit idle; the hooks' limit unless given.
  */
 export function requestJsonStatus(
   endpoint: CoordinatorEndpoint,
@@ -153,6 +167,7 @@ export function requestJsonStatus(
   path: string,
   body?: unknown,
   extraHeaders?: Record<string, string>,
+  timeoutMs: number = HOOK_REQUEST_TIMEOUT_MS,
 ): Promise<{ status: number; body: Record<string, unknown> | null }> {
   return new Promise((resolvePromise, rejectPromise) => {
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8");
@@ -165,7 +180,7 @@ export function requestJsonStatus(
       ...(extraHeaders ?? {}),
     };
     const req = request(
-      { host: "127.0.0.1", port: endpoint.port, method, path, headers, timeout: 5000 },
+      { host: "127.0.0.1", port: endpoint.port, method, path, headers, timeout: timeoutMs },
       (res) => {
         const chunks: Buffer[] = [];
         // A connection that drops after the headers never fires `end`, and a
