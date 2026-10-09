@@ -26,8 +26,12 @@
 #      ledger (CrossRuntimeSchemaError, plugin #55) — so defaulting it to
 #      `node` would leave it with no coordinator at all: precisely the silent
 #      degrade this change exists to remove. Established workspaces therefore
-#      keep `python` until the operator opts in (or runs
-#      `agent-coherence-coordinator --prepare-for-migration`).
+#      keep `python` unless the operator selects a backend explicitly. No
+#      supported switch exists in either direction: the Python coordinator
+#      fails closed on a Node-created store just as the Node one does on a
+#      Python store, and `agent-coherence-coordinator --prepare-for-migration`
+#      only drains and stops a running Python coordinator (the Node
+#      coordinator answers it 404) — it converts nothing.
 #      NOTE: workspaces the Node default itself initializes are NOT caught by
 #      this heuristic — ensure-coordinator-node stamps
 #      `.coherence/coordinator_backend` = node after its first successful

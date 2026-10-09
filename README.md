@@ -82,7 +82,7 @@ Everything below is a **library console script** installed by `pip install "agen
 
 | Library console script | What it does | When to use |
 |---|---|---|
-| `agent-coherence-coordinator` | Spawn / inspect the lazy-spawned local HTTP coordinator | Manual recovery; backend-switch via `--prepare-for-migration` |
+| `agent-coherence-coordinator` | Spawn / inspect the lazy-spawned local HTTP coordinator | Manual recovery. `--prepare-for-migration` drains a running Python coordinator, releases its grants and stops it; it converts no store, so it does not switch backends |
 | `agent-coherence-status` | CLI form of `/agent-coherence:status`. `--detail metrics` works on both backends. `--detail full` sends the `Coherence-Local-Operator: true` opt-in header and returns the operator-tier fields, including, with `agent-coherence` releases after 0.14.1, which paths the crash-recovery sweep reclaimed from each session; it works against the Python coordinator only (the plugin's built-in Node coordinator answers 501 for it). **`--self-test` is Python-only** | Dashboard scraping (`--detail metrics`); seeing which grants the sweep reclaimed (`--detail full`, Python backend); post-install validation (`--self-test`, Python backend) |
 | `agent-coherence-hook-client` | Subprocess called by the plugin's command-type hooks | Internal — not for direct invocation |
 | `agent-coherence-migrate-rules` | Scan CLAUDE.md for prose tool-class rules; propose + optionally `--apply` `permissions.deny` entries | First-pass migration of `"use rg, not grep"`-style rules to enforceable policy |
@@ -127,7 +127,7 @@ command -v agent-coherence-coordinator
 command -v agent-coherence-hook-client
 ```
 
-**B. Node backend (zero-Python — the default for fresh workspaces).** The plugin's Node coordinator — built from the packaged `src/` into the plugin data dir on first session (marketplace installs ship no prebuilt `dist/`) — runs all six hooks, the track/untrack/status CLIs, and strict mode with **no Python required** (needs **Node 22, 24, or 25** — the majors where `better-sqlite3` ships prebuilts). A fresh workspace selects this automatically; to opt an **existing** workspace in explicitly:
+**B. Node backend (zero-Python — the default for fresh workspaces).** The plugin's Node coordinator — built from the packaged `src/` into the plugin data dir on first session (marketplace installs ship no prebuilt `dist/`) — runs all six hooks, the track/untrack/status CLIs, and strict mode with **no Python required** (needs **Node 22, 24, or 25** — the majors where `better-sqlite3` ships prebuilts). A fresh workspace selects this automatically. To select it explicitly on a workspace that has no `.coherence/state.db` yet (a store the Python coordinator created cannot be switched; see **Selecting the backend** under [Architecture](#architecture)):
 
 ```bash
 mkdir -p .coherence && printf 'node\n' > .coherence/coordinator_backend
@@ -236,7 +236,7 @@ Two coordinator backends:
 
 **Selecting the backend.** The default is **`node` for a fresh workspace** and **`python` for an established one** — resolved at `SessionStart` as: `COHERENCE_COORDINATOR_BACKEND` env → `<repo>/.coherence/coordinator_backend` file → guarded default. The default is guarded two ways, and both apply **only** when you haven't chosen explicitly:
 
-- **Established workspaces keep `python`.** If `<repo>/.coherence/state.db` already exists, the store is likely Python-owned, and the Node coordinator deliberately fails closed on a foreign ledger — so defaulting it to Node would leave you with no coordinator. Existing workspaces are left exactly as they were; switch deliberately with `agent-coherence-coordinator --prepare-for-migration`.
+- **Established workspaces keep `python`.** If `<repo>/.coherence/state.db` already exists, the store is likely Python-owned, and the Node coordinator deliberately fails closed on a foreign ledger — so defaulting it to Node would leave you with no coordinator. Existing workspaces are left exactly as they were.
 - **No `node`/`npm` on PATH → `python`.** The Node bootstrap needs both to self-provision.
 
 To choose explicitly (honored verbatim, guards bypassed), set the env var `COHERENCE_COORDINATOR_BACKEND=node|python`, or write the single word to `<repo>/.coherence/coordinator_backend`:
@@ -247,7 +247,9 @@ mkdir -p .coherence && printf 'node\n' > .coherence/coordinator_backend
 
 The env var takes precedence; an unknown value falls back to `python`. (This file — not a Claude Code plugin setting — is the selection mechanism; the Node zero-Python guarantee is scoped to the platforms with a prebuilt `better-sqlite3` for the pinned Node ABI range. That range is **Node 22, 24, or 25** (`engines.node` = `^22.0.0 || ^24.0.0 || ^25.0.0`): `better-sqlite3` 12.10.0 dropped its Node 20 prebuilts — Node 20 reached end-of-life 2026-04-30 — and never ships them for odd pre-25 majors, so on any other major the bootstrap **refuses up front** rather than fall back to node-gyp, which would need Python and a C++ toolchain. On those majors the plugin runs on the Python backend — a fresh workspace falls back to it automatically, with a stderr note saying why.)
 
-Both backends speak the same HTTP wire contract; the [`tests/protocol_corpus/`](https://github.com/Cohexa-ai/agent-coherence/tree/main/tests/protocol_corpus) suite in the library repo catches drift. Switch backends safely via `agent-coherence-coordinator --prepare-for-migration`. The canonical design lives in the library's `docs/plans/` directory.
+**Switching the backend of an existing workspace is not supported.** Each coordinator fails closed on a `.coherence/state.db` the other one created (`CrossRuntimeSchemaError`), and neither repository ships a tool that converts a store. A workspace whose store the Node coordinator created therefore cannot currently be switched to Python: with `python` selected, the dispatcher honors the selection verbatim, the Python coordinator refuses the Node store and never becomes reachable, and every hook fails open with `{}`, so the workspace runs with no coordinator. A store the Python coordinator created and a `node` selection end the same way. Select a backend explicitly only on a workspace with no `state.db` yet, or to name the backend that created it. `agent-coherence-coordinator --prepare-for-migration` does not change this. It drains a running **Python** coordinator, releases its grants and stops it, and leaves the store as it was. The Node coordinator serves no `/admin/prepare-for-migration` route, so against it the command gets HTTP 404 and exits 2; with no coordinator running it exits 0 and does nothing.
+
+Both backends speak the same HTTP wire contract; the [`tests/protocol_corpus/`](https://github.com/Cohexa-ai/agent-coherence/tree/main/tests/protocol_corpus) suite in the library repo catches drift. They do not share a store: each keeps its own migration ledger for `state.db`, so a workspace stays on the backend that created its store. The canonical design lives in the library's `docs/plans/` directory.
 
 ## Local development
 
