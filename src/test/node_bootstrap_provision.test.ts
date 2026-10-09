@@ -24,6 +24,7 @@ import {
   symlinkSync,
   existsSync,
   readFileSync,
+  renameSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -831,6 +832,95 @@ test('npm-failure hint DISCRIMINATES a fetch flake from a missing prebuilt', () 
     } finally {
       cleanup();
       rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+// --- Python-backend hint: offered only while the workspace has no store -----
+//
+// Both refusals used to print `echo python > .coherence/coordinator_backend`
+// unconditionally. On a store the Node coordinator created, the dispatcher
+// honors that file verbatim and the Python coordinator fails closed on the
+// Node ledger, so following the hint left the workspace with no coordinator.
+
+const STORE_PRESENT_HINT =
+  /state\.db exists, so select the Python backend only if the Python coordinator created it: it refuses a store the Node coordinator created, and no tool converts one\./;
+
+/** Runs the bootstrap with the workspace pinned, so printed paths are exact. */
+function runBootstrapIn(root: string, data: string, ws: string, pathPrefix?: string) {
+  return spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
+    cwd: ws,
+    encoding: 'utf8',
+    timeout: 120000,
+    env: {
+      ...process.env,
+      PATH: pathPrefix ? `${pathPrefix}:${process.env.PATH ?? ''}` : process.env.PATH,
+      AGENT_COHERENCE_WORKSPACE: ws,
+      CLAUDE_PLUGIN_ROOT: root,
+      CLAUDE_PLUGIN_DATA: data,
+    } as NodeJS.ProcessEnv,
+  });
+}
+
+function assertPythonBackendHint(stderr: string, ws: string, hadStore: boolean): void {
+  const label = `hadStore=${hadStore}`;
+  if (hadStore) {
+    assert.match(stderr, STORE_PRESENT_HINT, label);
+    assert.doesNotMatch(stderr, /echo python >/, label);
+  } else {
+    assert.ok(
+      stderr.includes(
+        `select the Python backend: mkdir -p '${ws}/.coherence' && echo python > '${ws}/.coherence/coordinator_backend'`,
+      ),
+      `${label}: missing the no-store hint:\n${stderr}`,
+    );
+    assert.doesNotMatch(stderr, STORE_PRESENT_HINT, label);
+  }
+}
+
+test('STAGE 0: an unsupported Node major offers the Python backend only when the workspace has no store', () => {
+  for (const hadStore of [false, true]) {
+    const root = makeStubRoot({});
+    const { data, ws, cleanup } = makeDirs();
+    const stubBin = mkdtempSync(join(tmpdir(), 'provision-nodestub-'));
+    writeFileSync(join(stubBin, 'node'), '#!/usr/bin/env bash\necho v23.11.0\n');
+    chmodSync(join(stubBin, 'node'), 0o755);
+    try {
+      if (hadStore) {
+        mkdirSync(join(ws, '.coherence'), { recursive: true });
+        writeFileSync(join(ws, '.coherence', 'state.db'), '');
+      }
+      const r = runBootstrapIn(root, data, ws, stubBin);
+      assert.equal(r.status, 1, `expected the stage-0 refusal:\n${r.stderr}`);
+      assert.match(r.stderr, /Node v23\.11\.0 is not supported by the Node coordinator/);
+      assertPythonBackendHint(r.stderr, ws, hadStore);
+    } finally {
+      rmSync(stubBin, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+      cleanup();
+    }
+  }
+});
+
+test('a build that emits no coordinator.js offers the Python backend only when the workspace has no store', () => {
+  for (const hadStore of [false, true]) {
+    const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
+    // tsc succeeds but emits dist/not_the_entry.js, so the entry point is missing.
+    renameSync(join(root, 'src', 'coordinator.ts'), join(root, 'src', 'not_the_entry.ts'));
+    const { data, ws, cleanup } = makeDirs();
+    try {
+      if (hadStore) {
+        mkdirSync(join(ws, '.coherence'), { recursive: true });
+        writeFileSync(join(ws, '.coherence', 'state.db'), '');
+      }
+      const r = runBootstrapIn(root, data, ws);
+      assert.equal(r.status, 1, `expected the missing-entry refusal:\n${r.stderr}`);
+      assert.match(r.stderr, /dist\/coordinator\.js missing after provisioning/);
+      assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
+      assertPythonBackendHint(r.stderr, ws, hadStore);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      cleanup();
     }
   }
 });
