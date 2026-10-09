@@ -11,7 +11,7 @@ import { createServer as createHttpServer, type IncomingHttpHeaders } from "node
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AddressInfo } from "node:net";
+import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { ArtifactRegistry } from "../registry.js";
 import { PolicyRef } from "../policy.js";
 import { SessionRegistry } from "../sessions.js";
@@ -316,6 +316,13 @@ test("a refused status request prints HTTP <status>: <error>, exit 2; non-JSON 2
     );
     assert.equal(refused.stdout, "");
 
+    // A refusal whose body carries no string `error` names only its status.
+    stub.answer = [403, "{}"];
+    const bare = await runCli("cli_status.js", ["--detail", "full", "--root", stub.root], stub.root);
+    assert.equal(bare.status, 2);
+    assert.match(bare.stderr, /^agent-coherence-status: HTTP 403$/m);
+    assert.equal(bare.stdout, "");
+
     stub.answer = [200, "not json"];
     const garbled = await runCli("cli_status.js", ["--root", stub.root], stub.root);
     assert.equal(garbled.status, 2);
@@ -323,6 +330,43 @@ test("a refused status request prints HTTP <status>: <error>, exit 2; non-JSON 2
     assert.equal(garbled.stdout, "");
   } finally {
     await stub.close();
+  }
+});
+
+test("a response cut off mid-body exits 2, not a silent 0", async () => {
+  // The connection drops after the headers and part of the body. Unless the
+  // transport treats that as a failure, the request never settles and the CLI
+  // exits 0 with no output, which a script reads as an empty success.
+  const root = mkdtempSync(join(tmpdir(), "cli-status-cut-"));
+  const server = createNetServer((socket) => {
+    // A client reset must fail this test, not crash the test process.
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.end(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n" +
+          '{"backend":',
+      );
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    mkdirSync(join(root, ".coherence"), { recursive: true });
+    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
+
+    const cut = await runCli("cli_status.js", ["--root", root], root);
+    assert.equal(cut.status, 2, `stdout=${JSON.stringify(cut.stdout)} stderr=${JSON.stringify(cut.stderr)}`);
+    // Pinned to the cut-off itself: a broken setup ("no coordinator running")
+    // also exits 2 and must not pass for it.
+    assert.match(
+      cut.stderr,
+      /^agent-coherence-status: coordinator closed the connection before the response was complete$/m,
+    );
+    assert.equal(cut.stdout, "");
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -348,7 +392,14 @@ test("--detail full against the Node coordinator surfaces its 501, exit 2", asyn
 
     const full = await runCli("cli_status.js", ["--detail", "full", "--root", root], root);
     assert.equal(full.status, 2);
-    assert.match(full.stderr, /^agent-coherence-status: HTTP 501: /m);
+    // The relayed text is the operator's only clue, so it must say where the
+    // tier is served. It must not prescribe a backend switch: this store is
+    // Node-owned, and the Python coordinator fails closed on it.
+    assert.match(
+      full.stderr,
+      /^agent-coherence-status: HTTP 501: detail=full \(the operator tier\) is served by the Python coordinator only; this Node coordinator serves the default and metrics tiers$/m,
+    );
+    assert.doesNotMatch(full.stderr, /coordinator_backend/);
     assert.equal(full.stdout, "");
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
