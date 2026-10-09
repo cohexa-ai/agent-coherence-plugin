@@ -283,25 +283,41 @@ test("--detail full sends Coherence-Local-Operator: true and prints the operator
   }
 });
 
-test("the default and metrics tiers do not send the operator header", async () => {
+test("the default, minimal and metrics tiers do not send the operator header", async () => {
   const stub = await startPythonStatusStub();
   try {
     const plain = await runCli("cli_status.js", ["--root", stub.root], stub.root);
+    const minimal = await runCli(
+      "cli_status.js",
+      ["--detail", "minimal", "--root", stub.root],
+      stub.root,
+    );
     const metrics = await runCli(
       "cli_status.js",
       ["--detail", "metrics", "--root", stub.root],
       stub.root,
     );
     assert.equal(plain.status, 0, plain.stderr);
+    assert.equal(minimal.status, 0, minimal.stderr);
     assert.equal(metrics.status, 0, metrics.stderr);
     assert.deepEqual(
       stub.requests.map((r) => r.url),
-      ["/status", "/status?detail=metrics"],
+      ["/status", "/status?detail=minimal", "/status?detail=metrics"],
     );
     for (const r of stub.requests) assert.equal(r.headers["coherence-local-operator"], undefined);
   } finally {
     await stub.close();
   }
+});
+
+test("/agent-coherence:status runs the status CLI at --detail minimal", () => {
+  // The shim runs the Python console script when it finds no Node CLI, and
+  // that script's own default was the operator tier (session names, the
+  // absolute root) printed into the transcript. Both CLIs accept `minimal`,
+  // and every Python release the plugin supports does.
+  const command = readFileSync(join(DIST, "..", "commands", "status.md"), "utf-8");
+  const invocations = [...command.matchAll(/\bRun `([^`]*)`/g)].map((m) => m[1]);
+  assert.deepEqual(invocations, ["agent-coherence-status --detail minimal"]);
 });
 
 test("a refused status request prints HTTP <status>: <error>, exit 2; non-JSON 2xx says so", async () => {

@@ -192,8 +192,11 @@ export async function runStatus(argv: string[]): Promise<number> {
   }
   const { root: rootArg } = parseArgs(argv);
   const detail = flagValue(argv, "--detail");
-  if (detail !== null && !["metrics", "full"].includes(detail)) {
-    err(`agent-coherence-status: --detail must be 'metrics' or 'full' (got '${detail}')`);
+  // `minimal` is the default tier asked for by name: both coordinators answer
+  // it as they answer a bare /status, and the Python CLI accepts it too, so
+  // the status command can pass it to whichever CLI the shim runs.
+  if (detail !== null && !["minimal", "metrics", "full"].includes(detail)) {
+    err(`agent-coherence-status: --detail must be 'minimal', 'metrics' or 'full' (got '${detail}')`);
     return 2;
   }
   const root = rootArg ?? findCoordinatorRoot();
