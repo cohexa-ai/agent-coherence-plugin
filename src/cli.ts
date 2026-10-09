@@ -14,6 +14,7 @@
  */
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
+  CLI_REQUEST_TIMEOUT_MS,
   CoordinatorUnavailable,
   findCoordinatorRoot,
   requestJsonStatus,
@@ -141,7 +142,14 @@ async function runPolicyMutation(
   let answer: { status: number; body: Record<string, unknown> | null };
   try {
     const endpoint = resolveEndpoint(resolve(root));
-    answer = await requestJsonStatus(endpoint, "POST", endpointPath, { paths: valid });
+    answer = await requestJsonStatus(
+      endpoint,
+      "POST",
+      endpointPath,
+      { paths: valid },
+      undefined,
+      CLI_REQUEST_TIMEOUT_MS,
+    );
   } catch (exc) {
     if (exc instanceof CoordinatorUnavailable) {
       err(`${prog}: ${exc.message}`);
@@ -209,7 +217,7 @@ export async function runStatus(argv: string[]): Promise<number> {
     // carries the Coherence-Local-Operator opt-in, so an operator asking for
     // the full tier sends it. The other tiers do not need it and go without.
     const extra = detail === "full" ? { "Coherence-Local-Operator": "true" } : undefined;
-    answer = await requestJsonStatus(endpoint, "GET", path, undefined, extra);
+    answer = await requestJsonStatus(endpoint, "GET", path, undefined, extra, CLI_REQUEST_TIMEOUT_MS);
   } catch (exc) {
     err(`agent-coherence-status: ${(exc as Error).message}`);
     return 2;
