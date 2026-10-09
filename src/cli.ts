@@ -75,7 +75,12 @@ const FLAGS_BY_PROG: Record<string, ReadonlySet<string>> = {
 
 /** Flags the Python console script implements that the Node CLI does not. */
 const PYTHON_ONLY_FLAGS: Record<string, string> = {
-  "--self-test": "runs a live four-step pre-read → pre-edit → post-edit → stale-read sequence",
+  // The counters clause is load-bearing: the Python self-test run against the
+  // Node coordinator passes all four steps, then exits 3 because this
+  // coordinator's `/status?detail=metrics` serves no counters.
+  "--self-test":
+    "runs a live four-step pre-read → pre-edit → post-edit → stale-read sequence, " +
+    "then checks counters only the Python coordinator serves",
 };
 
 /** Returns an error message if argv carries a flag this CLI cannot honor. */
@@ -87,11 +92,17 @@ function rejectUnsupportedFlags(prog: string, argv: string[]): string | null {
     if (allowed.has(name)) continue;
     const pythonOnly = PYTHON_ONLY_FLAGS[name];
     if (pythonOnly !== undefined) {
+      // Names no backend switch. Writing `python` to
+      // .coherence/coordinator_backend on a store the Node coordinator created
+      // leaves the workspace with no coordinator (the Python one fails closed
+      // on a Node ledger), and `--prepare-for-migration` does not convert the
+      // store. "By its install path" because the plugin's shim of the same
+      // name prefers this CLI whenever node is on PATH.
       return (
         `${prog}: ${name} is not supported by the bundled Node CLI (it ${pythonOnly}). ` +
-        `Install the Python library (\`pip install "agent-coherence>=0.8.0"\`) and run the ` +
-        `console script directly, or select the Python backend for this workspace ` +
-        `(\`printf 'python\\n' > .coherence/coordinator_backend\`).`
+        `It needs the Python library's console script (\`pip install "agent-coherence>=0.8.0"\`, ` +
+        `run by its install path) on a workspace the Python coordinator serves. On a Node ` +
+        `workspace, plain \`agent-coherence-status\` confirms the coordinator answers.`
       );
     }
     return `${prog}: unknown option ${name}`;

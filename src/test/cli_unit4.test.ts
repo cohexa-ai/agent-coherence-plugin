@@ -197,6 +197,30 @@ test("0.3.1: --self-test is rejected with exit 2, not a false-positive exit 0", 
   assert.equal(code, 2);
 });
 
+test("the --self-test refusal names the Python console script and no backend switch", async () => {
+  // The refusal used to prescribe `printf 'python\n' > .coherence/coordinator_backend`.
+  // On a store the Node coordinator created, the Python coordinator fails
+  // closed and the dispatcher honors the file verbatim, so following that
+  // advice left the workspace with no coordinator at all.
+  const cwd = mkdtempSync(join(tmpdir(), "cli-self-test-"));
+  try {
+    for (const entry of ["cli_status.js", "cli_track.js"]) {
+      const run = await runCli(entry, ["--self-test"], cwd);
+      assert.equal(run.status, 2, entry);
+      assert.equal(run.stdout, "", entry);
+      assert.match(
+        run.stderr,
+        /--self-test is not supported by the bundled Node CLI \(it runs a live four-step pre-read → pre-edit → post-edit → stale-read sequence, then checks counters only the Python coordinator serves\)\. It needs the Python library's console script \(`pip install "agent-coherence>=0\.8\.0"`, run by its install path\) on a workspace the Python coordinator serves\. On a Node workspace, plain `agent-coherence-status` confirms the coordinator answers\.$/m,
+        entry,
+      );
+      assert.doesNotMatch(run.stderr, /coordinator_backend|printf/, entry);
+      assert.doesNotMatch(run.stderr, /prepare-for-migration/, entry);
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("0.3.1: unknown/typo flags are rejected rather than ignored", async () => {
   const { runStatus, runTrack, runUntrack } = await import("../cli.js");
   assert.equal(await runStatus(["--detial", "metrics"]), 2);
