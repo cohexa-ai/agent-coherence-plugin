@@ -168,6 +168,16 @@ export function requestJsonStatus(
       { host: "127.0.0.1", port: endpoint.port, method, path, headers, timeout: 5000 },
       (res) => {
         const chunks: Buffer[] = [];
+        // A connection that drops after the headers never fires `end`, and a
+        // promise that never settles lets the process drain and exit 0, so a
+        // caller would read a failed request as an empty success. Treat an
+        // incomplete response as the network error it is.
+        const cutOff = () =>
+          rejectPromise(new Error("coordinator closed the connection before the response was complete"));
+        res.on("error", cutOff);
+        res.on("close", () => {
+          if (!res.complete) cutOff();
+        });
         res.on("data", (c: Buffer) => chunks.push(c));
         res.on("end", () => {
           const status = res.statusCode ?? 0;

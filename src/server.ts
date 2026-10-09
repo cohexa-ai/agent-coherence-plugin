@@ -187,8 +187,17 @@ function handleStatus(req: IncomingMessage, res: ServerResponse, options: Server
   const detail = parseDetailParam(req.url ?? "/status");
 
   if (detail === "full") {
-    // Unit 8 lands the operator opt-in header check + unmasked body.
-    writeError(res, 501, "detail=full not implemented in v0.1.1 unit 1");
+    // The Node coordinator serves no operator tier. `agent-coherence-status
+    // --detail full` relays this text to the operator verbatim, so it says
+    // where the tier is served. It names no backend switch: a store this
+    // coordinator owns is one the Python coordinator fails closed on, so a
+    // switch needs `agent-coherence-coordinator --prepare-for-migration`.
+    writeError(
+      res,
+      501,
+      "detail=full (the operator tier) is served by the Python coordinator only; " +
+        "this Node coordinator serves the default and metrics tiers",
+    );
     return;
   }
 
