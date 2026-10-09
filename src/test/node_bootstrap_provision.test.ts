@@ -294,6 +294,94 @@ test("an operator's existing coordinator_backend file is never overwritten by th
   }
 });
 
+/** Run the bootstrap with `pathPrefix` ahead of the inherited PATH. */
+function runBootstrapWithPath(root: string, data: string, ws: string, pathPrefix: string) {
+  return spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
+    cwd: ws,
+    encoding: 'utf8',
+    timeout: 120000,
+    env: {
+      ...process.env,
+      PATH: `${pathPrefix}:${process.env.PATH ?? ''}`,
+      CLAUDE_PLUGIN_ROOT: root,
+      CLAUDE_PLUGIN_DATA: data,
+    } as NodeJS.ProcessEnv,
+  });
+}
+
+test('STAGE 0: the unsupported-Node refusal offers the Python backend only on a workspace with no state.db', () => {
+  // A Node upgrade to an unsupported major hits this preflight on workspaces
+  // the Node coordinator already serves. The Python coordinator fails closed
+  // on a Node-created store and nothing converts one, so advising
+  // `echo python > .coherence/coordinator_backend` there would leave the
+  // workspace with no coordinator at all.
+  const root = makeStubRoot({});
+  const stubBin = mkdtempSync(join(tmpdir(), 'provision-nodestub-'));
+  writeFileSync(join(stubBin, 'node'), '#!/bin/sh\necho v23.11.0\n');
+  chmodSync(join(stubBin, 'node'), 0o755);
+  const virgin = makeDirs();
+  const established = makeDirs();
+  try {
+    const fresh = runBootstrapWithPath(root, virgin.data, virgin.ws, stubBin);
+    assert.equal(fresh.status, 1, `expected the stage-0 refusal:\n${fresh.stdout}\n${fresh.stderr}`);
+    assert.match(fresh.stderr, /Node v23\.11\.0 is not supported by the Node coordinator/);
+    assert.match(
+      fresh.stderr,
+      /select the Python backend: echo python > \.coherence\/coordinator_backend/
+    );
+
+    mkdirSync(join(established.ws, '.coherence'), { recursive: true });
+    writeFileSync(join(established.ws, '.coherence', 'state.db'), '');
+    const r = runBootstrapWithPath(root, established.data, established.ws, stubBin);
+    assert.equal(r.status, 1, `expected the stage-0 refusal:\n${r.stdout}\n${r.stderr}`);
+    assert.match(r.stderr, /Node v23\.11\.0 is not supported by the Node coordinator/);
+    assert.match(r.stderr, /Install Node 22 or 24 \(LTS\)\.$/m);
+    assert.match(r.stderr, /refuses a Node-created store/);
+    assert.doesNotMatch(r.stderr, /echo python|select the Python backend/);
+    assert.equal(existsSync(join(established.ws, '.coherence', 'coordinator_backend')), false);
+  } finally {
+    rmSync(stubBin, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+    virgin.cleanup();
+    established.cleanup();
+  }
+});
+
+test('a missing built entry offers the Python-backend workaround only on a workspace with no state.db', () => {
+  // tsc builds src/ cleanly, but the package has no coordinator.ts, so the
+  // provision check finds no dist/coordinator.js. Same rule as stage 0: an
+  // existing state.db may be Node-created, and the Python coordinator
+  // refuses one.
+  const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
+  rmSync(join(root, 'src', 'coordinator.ts'));
+  writeFileSync(join(root, 'src', 'other.ts'), 'export {};\n');
+  const virgin = makeDirs();
+  const established = makeDirs();
+  try {
+    const fresh = runBootstrap(root, virgin.data, virgin.ws);
+    assert.equal(fresh.status, 1, `expected loud failure:\n${fresh.stdout}\n${fresh.stderr}`);
+    assert.match(
+      fresh.stderr,
+      /coordinator\.js missing after provisioning; coordinator will not start this session\. Next session retries\. \(Workaround: echo python > <workspace>\/\.coherence\/coordinator_backend to select the Python backend\.\)$/m
+    );
+
+    mkdirSync(join(established.ws, '.coherence'), { recursive: true });
+    writeFileSync(join(established.ws, '.coherence', 'state.db'), '');
+    const r = runBootstrap(root, established.data, established.ws);
+    assert.equal(r.status, 1, `expected loud failure:\n${r.stdout}\n${r.stderr}`);
+    assert.match(
+      r.stderr,
+      /coordinator\.js missing after provisioning; coordinator will not start this session\. Next session retries\.$/m
+    );
+    assert.doesNotMatch(r.stderr, /Workaround|echo python/);
+    assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    virgin.cleanup();
+    established.cleanup();
+  }
+});
+
 test('ABI STAMP: a successful provision records the running Node ABI', () => {
   const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
   const { data, ws, cleanup } = makeDirs();

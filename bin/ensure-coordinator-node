@@ -39,6 +39,20 @@ set -uo pipefail
 
 mkdir -p "${CLAUDE_PLUGIN_DATA}"
 
+# Workspace resolution (per-workspace state per KTD-C) + a virgin-store
+# marker for the post-spawn backend stamp. The marker MUST be read before
+# Stage 4 — the coordinator's own first boot creates state.db within
+# milliseconds, which would make every workspace look established. It also
+# gates the Python-backend advice below: an existing state.db may be one the
+# Node coordinator created, which the Python coordinator fails closed on, and
+# no supported path switches such a store to Python.
+WORKSPACE="${AGENT_COHERENCE_WORKSPACE:-$PWD}"
+PIDFILE="${WORKSPACE}/.coherence/server.pid"
+workspace_had_state_db=0
+if [ -f "${WORKSPACE}/.coherence/state.db" ]; then
+  workspace_had_state_db=1
+fi
+
 # Stage 0: Node-ABI preflight. The zero-Python guarantee (decision B) holds
 # only where better-sqlite3 ships a prebuilt binary for this Node ABI; on any
 # other major, Stage 1's `npm install` falls back to node-gyp — which needs
@@ -57,8 +71,16 @@ case "$NODE_MAJOR" in
       echo "agent-coherence: Node ${NODE_VERSION_RAW} is not supported by the Node coordinator."
       echo "agent-coherence: better-sqlite3 ships prebuilt binaries only for Node 22, 24, and 25;"
       echo "agent-coherence: other majors fall back to node-gyp (Python + C++ toolchain), which the"
-      echo "agent-coherence: zero-Python install guarantee forbids. Install Node 22 or 24 (LTS), or"
-      echo "agent-coherence: select the Python backend: echo python > .coherence/coordinator_backend"
+      if [ "$workspace_had_state_db" = "0" ]; then
+        echo "agent-coherence: zero-Python install guarantee forbids. Install Node 22 or 24 (LTS), or"
+        echo "agent-coherence: select the Python backend: echo python > .coherence/coordinator_backend"
+      else
+        echo "agent-coherence: zero-Python install guarantee forbids. Install Node 22 or 24 (LTS)."
+        echo "agent-coherence: This workspace already has a .coherence/state.db. If the Node coordinator"
+        echo "agent-coherence: created it, selecting the Python backend leaves the workspace with no"
+        echo "agent-coherence: coordinator: the Python coordinator refuses a Node-created store, and no"
+        echo "agent-coherence: supported path switches one to Python."
+      fi
     } >&2
     exit 1
     ;;
@@ -94,17 +116,6 @@ native_module_loads() {
     '
   ) >/dev/null 2>&1
 }
-
-# Workspace resolution (per-workspace state per KTD-C) + a virgin-store
-# marker for the post-spawn backend stamp. The marker MUST be read before
-# Stage 4 — the coordinator's own first boot creates state.db within
-# milliseconds, which would make every workspace look established.
-WORKSPACE="${AGENT_COHERENCE_WORKSPACE:-$PWD}"
-PIDFILE="${WORKSPACE}/.coherence/server.pid"
-workspace_had_state_db=0
-if [ -f "${WORKSPACE}/.coherence/state.db" ]; then
-  workspace_had_state_db=1
-fi
 
 # Stage 1: lazy `npm install`, keyed on BOTH signals that can invalidate the
 # provisioned tree:
@@ -408,7 +419,13 @@ fi
 # entry point. Before this check, a dist-less package produced an infinite
 # MODULE_NOT_FOUND crash loop behind a false "spawned" message.
 if [ ! -f "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" ]; then
-  echo "agent-coherence: ${CLAUDE_PLUGIN_DATA}/dist/coordinator.js missing after provisioning; coordinator will not start this session. Next session retries. (Workaround: echo python > <workspace>/.coherence/coordinator_backend to select the Python backend.)" >&2
+  # The Python-backend workaround only on a virgin store (see the
+  # workspace_had_state_db note up top).
+  workaround=""
+  if [ "$workspace_had_state_db" = "0" ]; then
+    workaround=" (Workaround: echo python > <workspace>/.coherence/coordinator_backend to select the Python backend.)"
+  fi
+  echo "agent-coherence: ${CLAUDE_PLUGIN_DATA}/dist/coordinator.js missing after provisioning; coordinator will not start this session. Next session retries.${workaround}" >&2
   exit 1
 fi
 
