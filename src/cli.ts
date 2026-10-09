@@ -16,7 +16,6 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import {
   CoordinatorUnavailable,
   findCoordinatorRoot,
-  requestJson,
   requestJsonStatus,
   resolveEndpoint,
 } from "./hook_client_transport.js";
@@ -202,21 +201,34 @@ export async function runStatus(argv: string[]): Promise<number> {
     err("agent-coherence-status: not in a git repository");
     return 1;
   }
-  let payload: Record<string, unknown> | null;
+  let answer: { status: number; body: Record<string, unknown> | null };
   try {
     const endpoint = resolveEndpoint(resolve(root));
-    // ?detail=full additionally requires the Coherence-Local-Operator header
-    // server-side; without it the coordinator answers 403 and that surfaces here.
     const path = detail === null ? "/status" : `/status?detail=${encodeURIComponent(detail)}`;
-    payload = await requestJson(endpoint, "GET", path);
+    // The Python coordinator answers ?detail=full with 403 unless the request
+    // carries the Coherence-Local-Operator opt-in, so an operator asking for
+    // the full tier sends it. The other tiers do not need it and go without.
+    const extra = detail === "full" ? { "Coherence-Local-Operator": "true" } : undefined;
+    answer = await requestJsonStatus(endpoint, "GET", path, undefined, extra);
   } catch (exc) {
     err(`agent-coherence-status: ${(exc as Error).message}`);
     return 2;
   }
-  if (payload === null) {
-    err("agent-coherence-status: coordinator rejected the request");
+  // Same `HTTP <status>: <error>` form as track/untrack and the Python CLI:
+  // the Node coordinator's 501 for ?detail=full says why, and so does a 403.
+  if (answer.status < 200 || answer.status >= 300) {
+    const error = answer.body?.error;
+    err(
+      typeof error === "string"
+        ? `agent-coherence-status: HTTP ${answer.status}: ${error}`
+        : `agent-coherence-status: HTTP ${answer.status}`,
+    );
     return 2;
   }
-  out(JSON.stringify(payload, null, 2));
+  if (answer.body === null) {
+    err("agent-coherence-status: coordinator returned a non-JSON response");
+    return 2;
+  }
+  out(JSON.stringify(answer.body, null, 2));
   return 0;
 }
