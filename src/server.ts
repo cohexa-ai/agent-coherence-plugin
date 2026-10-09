@@ -275,7 +275,9 @@ function handleStatus(req: IncomingMessage, res: ServerResponse, options: Server
       tracked_artifacts: artifacts.length,
       sessions: sessions.length,
     },
-    policy_summary: options.policy.summary(),
+    // The summary carries the absolute workspace root. This is the default
+    // tier, so it gets the "." the Python default tier reports instead.
+    policy_summary: { ...options.policy.summary(), coordinator_root: "." },
   };
   writeJson(res, 200, body);
 }

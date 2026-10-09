@@ -423,3 +423,38 @@ test("--detail full against the Node coordinator surfaces its 501, exit 2", asyn
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("the Node coordinator's default tier publishes the workspace root nowhere", async () => {
+  // policy_summary carried the absolute root, so the default tier, which the
+  // status command prints verbatim, put $HOME and the directory layout in the
+  // transcript. It now carries the "." the Python default tier reports.
+  const root = mkdtempSync(join(tmpdir(), "cli-status-root-"));
+  const secret = "s".repeat(32);
+  const registry = new ArtifactRegistry(join(root, ".coherence", "state.db"));
+  const server = createServer({
+    secret,
+    startedAtMs: Date.now(),
+    version: "test",
+    registry,
+    policy: PolicyRef.load(root),
+    sessions: new SessionRegistry(),
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
+
+    for (const tier of [[], ["--detail", "minimal"]]) {
+      const run = await runCli("cli_status.js", [...tier, "--root", root], root);
+      assert.equal(run.status, 0, run.stderr);
+      const body = JSON.parse(run.stdout) as { policy_summary: Record<string, unknown> };
+      assert.equal(body.policy_summary.coordinator_root, ".");
+      assert.ok(!run.stdout.includes(root), `root leaked at ${JSON.stringify(tier)}: ${run.stdout}`);
+    }
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
