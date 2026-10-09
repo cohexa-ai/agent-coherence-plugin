@@ -308,25 +308,41 @@ test("--detail full sends Coherence-Local-Operator: true and prints the operator
   }
 });
 
-test("the default and metrics tiers do not send the operator header", async () => {
+test("the default, minimal and metrics tiers do not send the operator header", async () => {
   const stub = await startPythonStatusStub();
   try {
     const plain = await runCli("cli_status.js", ["--root", stub.root], stub.root);
+    const minimal = await runCli(
+      "cli_status.js",
+      ["--detail", "minimal", "--root", stub.root],
+      stub.root,
+    );
     const metrics = await runCli(
       "cli_status.js",
       ["--detail", "metrics", "--root", stub.root],
       stub.root,
     );
     assert.equal(plain.status, 0, plain.stderr);
+    assert.equal(minimal.status, 0, minimal.stderr);
     assert.equal(metrics.status, 0, metrics.stderr);
     assert.deepEqual(
       stub.requests.map((r) => r.url),
-      ["/status", "/status?detail=metrics"],
+      ["/status", "/status?detail=minimal", "/status?detail=metrics"],
     );
     for (const r of stub.requests) assert.equal(r.headers["coherence-local-operator"], undefined);
   } finally {
     await stub.close();
   }
+});
+
+test("/agent-coherence:status runs the status CLI at --detail minimal", () => {
+  // The shim runs the Python console script when it finds no Node CLI, and
+  // that script's own default was the operator tier (session names, the
+  // absolute root) printed into the transcript. Both CLIs accept `minimal`,
+  // and every Python release the plugin supports does.
+  const command = readFileSync(join(DIST, "..", "commands", "status.md"), "utf-8");
+  const invocations = [...command.matchAll(/\bRun `([^`]*)`/g)].map((m) => m[1]);
+  assert.deepEqual(invocations, ["agent-coherence-status --detail minimal"]);
 });
 
 test("a refused status request prints HTTP <status>: <error>, exit 2; non-JSON 2xx says so", async () => {
@@ -512,6 +528,41 @@ test("the CLIs wait for a coordinator answer that takes 5.5 s; a hook still give
     assert.equal(hook.stdout, "{}\n");
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the Node coordinator's default tier publishes the workspace root nowhere", async () => {
+  // policy_summary carried the absolute root, so the default tier, which the
+  // status command prints verbatim, put $HOME and the directory layout in the
+  // transcript. It now carries the "." the Python default tier reports.
+  const root = mkdtempSync(join(tmpdir(), "cli-status-root-"));
+  const secret = "s".repeat(32);
+  const registry = new ArtifactRegistry(join(root, ".coherence", "state.db"));
+  const server = createServer({
+    secret,
+    startedAtMs: Date.now(),
+    version: "test",
+    registry,
+    policy: PolicyRef.load(root),
+    sessions: new SessionRegistry(),
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
+
+    for (const tier of [[], ["--detail", "minimal"]]) {
+      const run = await runCli("cli_status.js", [...tier, "--root", root], root);
+      assert.equal(run.status, 0, run.stderr);
+      const body = JSON.parse(run.stdout) as { policy_summary: Record<string, unknown> };
+      assert.equal(body.policy_summary.coordinator_root, ".");
+      assert.ok(!run.stdout.includes(root), `root leaked at ${JSON.stringify(tier)}: ${run.stdout}`);
+    }
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    registry.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
