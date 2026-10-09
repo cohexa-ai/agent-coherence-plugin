@@ -130,6 +130,11 @@ test("#55: a Python-v2 db is rejected and NOT migrated (the load-bearing case)",
       (err: unknown) => {
         assert.ok(err instanceof CrossRuntimeSchemaError, "must be CrossRuntimeSchemaError");
         assert.equal((err as CrossRuntimeSchemaError).reason, CROSS_RUNTIME_SCHEMA_REASON);
+        // No tool converts a store between the two ledgers, so the message
+        // must not point at a migration path that does not exist.
+        const message = (err as Error).message;
+        assert.match(message, /no supported path converts it to the Node backend/);
+        assert.doesNotMatch(message, /migration path|prepare-for-migration/);
         return true;
       },
     );

@@ -170,11 +170,11 @@ function raiseCrossRuntime(detail: string): never {
     `The state.db ${detail}. The likely writer is the sibling Python coordinator ` +
       `(agent-coherence), which shares this path but keeps its own migration ledger — ` +
       `the two ledgers assign different meanings to the same user_version numbers. ` +
-      `This Node coordinator will not read or migrate a foreign-ledger db. To keep ` +
-      `using the runtime that owns this store, set coherence.coordinator_backend = ` +
-      `"python"; to switch the store to the Node backend, use the supported migration ` +
-      `path. Do NOT delete state.db — it holds the sibling runtime's live coordination ` +
-      `state and retained version content, which a delete destroys.`,
+      `This Node coordinator will not read or migrate a foreign-ledger db, and no ` +
+      `supported path converts it to the Node backend. To keep using the runtime that ` +
+      `owns this store, set coherence.coordinator_backend = "python". Do NOT delete ` +
+      `state.db — it holds the sibling runtime's live coordination state and retained ` +
+      `version content, which a delete destroys.`,
   );
 }
 
