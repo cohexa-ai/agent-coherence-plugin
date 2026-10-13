@@ -6,7 +6,11 @@ Alpha — APIs and the `hooks.json` wire shape may change before `v1.0`.
 
 The canonical release-notes surface is [GitHub Releases](https://github.com/Cohexa-ai/agent-coherence-plugin/releases); this file mirrors that history in a structured format for operators who prefer a single browsable timeline.
 
-## [Unreleased]
+## [0.6.0] — 2026-10-13
+
+**Strict mode no longer lets a session write a file it was just refused a read of; `/status` and hook messages stop publishing raw session ids and your absolute workspace path; tracking a `*` glob can no longer empty a policy file; the status, track and untrack commands escape what the coordinator sends and report refusals by exit code; and the hook client is ready for the caller principal that `agent-coherence` releases after 0.14.1 issue.**
+
+**Upgrade note:** on the Node backend, `GET /status` now reports every session's `agent_name` as `null`; key on `agent_id` instead. `agent-coherence-untrack` now exits 3 when a Python coordinator from a release after 0.14.1 refuses to untrack a strict path, and `agent-coherence-status` exits 2 when the coordinator's registry is busy; scripts that read these exit codes may need updating. Track and untrack now refuse, with `HTTP 400` and exit 2, a policy file that an earlier unquoted write broke or that is not a plain list. Releases 0.3.0 to 0.5.0 wrote a pattern that starts with `*` unquoted, which makes the whole file load as no entries: after upgrading, check `.coherence/tracked.yaml` and `ignored.yaml` and quote any such entry (`- "*.md"`).
 
 ### Added
 
