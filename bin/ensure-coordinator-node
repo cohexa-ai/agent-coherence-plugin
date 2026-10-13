@@ -39,6 +39,32 @@ set -uo pipefail
 
 mkdir -p "${CLAUDE_PLUGIN_DATA}"
 
+# Workspace resolution (per-workspace state per KTD-C) + a virgin-store
+# marker for the post-spawn backend stamp. The marker MUST be read before
+# Stage 4 — the coordinator's own first boot creates state.db within
+# milliseconds, which would make every workspace look established. Read
+# before Stage 0 too, which keys its Python-backend hint on it.
+WORKSPACE="${AGENT_COHERENCE_WORKSPACE:-$PWD}"
+PIDFILE="${WORKSPACE}/.coherence/server.pid"
+workspace_had_state_db=0
+if [ -f "${WORKSPACE}/.coherence/state.db" ]; then
+  workspace_had_state_db=1
+fi
+
+# The Python backend is a fallback only while the workspace has no store: the
+# Python coordinator creates its own, but fails closed on a state.db the Node
+# coordinator created, and no tool converts a store between backends. With a
+# store present this script runs only on an explicit `node` choice, so the
+# store is most likely the Node coordinator's — the hint must not prescribe
+# the switch there, or following it leaves the workspace with no coordinator.
+python_backend_hint() {
+  if [ "$workspace_had_state_db" = "0" ]; then
+    echo "agent-coherence: alternatively, select the Python backend: mkdir -p '${WORKSPACE}/.coherence' && echo python > '${WORKSPACE}/.coherence/coordinator_backend'"
+  else
+    echo "agent-coherence: ${WORKSPACE}/.coherence/state.db exists, so select the Python backend only if the Python coordinator created it: it refuses a store the Node coordinator created, and no tool converts one."
+  fi
+}
+
 # Stage 0: Node-ABI preflight. The zero-Python guarantee (decision B) holds
 # only where better-sqlite3 ships a prebuilt binary for this Node ABI; on any
 # other major, Stage 1's `npm install` falls back to node-gyp — which needs
@@ -57,8 +83,8 @@ case "$NODE_MAJOR" in
       echo "agent-coherence: Node ${NODE_VERSION_RAW} is not supported by the Node coordinator."
       echo "agent-coherence: better-sqlite3 ships prebuilt binaries only for Node 22, 24, and 25;"
       echo "agent-coherence: other majors fall back to node-gyp (Python + C++ toolchain), which the"
-      echo "agent-coherence: zero-Python install guarantee forbids. Install Node 22 or 24 (LTS), or"
-      echo "agent-coherence: select the Python backend: echo python > .coherence/coordinator_backend"
+      echo "agent-coherence: zero-Python install guarantee forbids. Install Node 22 or 24 (LTS)."
+      python_backend_hint
     } >&2
     exit 1
     ;;
@@ -94,17 +120,6 @@ native_module_loads() {
     '
   ) >/dev/null 2>&1
 }
-
-# Workspace resolution (per-workspace state per KTD-C) + a virgin-store
-# marker for the post-spawn backend stamp. The marker MUST be read before
-# Stage 4 — the coordinator's own first boot creates state.db within
-# milliseconds, which would make every workspace look established.
-WORKSPACE="${AGENT_COHERENCE_WORKSPACE:-$PWD}"
-PIDFILE="${WORKSPACE}/.coherence/server.pid"
-workspace_had_state_db=0
-if [ -f "${WORKSPACE}/.coherence/state.db" ]; then
-  workspace_had_state_db=1
-fi
 
 # Stage 1: lazy `npm install`, keyed on BOTH signals that can invalidate the
 # provisioned tree:
@@ -183,16 +198,148 @@ if [ "$deps_changed" = "1" ] || [ "$native_stale" = "1" ]; then
   # --engine-strict turns the engines.node range into a hard install-time
   # gate (npm only warns by default), so the Stage-0 list above can never
   # silently drift past package.json.
-  if ! (cd "${CLAUDE_PLUGIN_DATA}" && npm install --engine-strict --no-audit --no-fund --no-progress 2>&1); then
+  # Capture as well as show, so the failure below can be CLASSIFIED rather
+  # than guessed at. PIPESTATUS[0] is npm's status; $? would be tee's.
+  npm_log="$(mktemp "${TMPDIR:-/tmp}/agent-coherence-npm.XXXXXX" 2>/dev/null || echo "")"
+  # The in-line `rm`s below cover the ordinary exits; this covers the ones
+  # that skip them. A cold `npm install` regularly outruns the SessionStart
+  # hook's time box, and without the trap every timed-out provision leaves a
+  # full npm log behind in TMPDIR.
+  trap 'rm -f "$npm_log"' EXIT
+  if [ -n "$npm_log" ]; then
+    # --loglevel=http is what makes the failure below CLASSIFIABLE: npm passes
+    # it down as npm_config_loglevel, and prebuild-install gates its own
+    # `log.http(res.statusCode, url)` on exactly that (its log.js defaults to
+    # 'notice', above which http is dropped). Without it the HTTP status of a
+    # failed asset fetch is never printed by anyone and cannot be recovered
+    # afterwards -- not even from npm's debug log, which can only capture what
+    # the child chose to emit.
+    #
+    # The `grep -v` filters the DISPLAY, never the captured log. At http level
+    # npm logs one `cache`/`fetch GET 200` line per package: measured 148
+    # lines / 16KB warm and 298 / 31KB cold on this repo's own tree. This
+    # script's stdout is a SessionStart hook's stdout, so that lands in the
+    # model's context, where 31KB of registry chatter is several times the
+    # 10,000-byte ceiling and would evict the very diagnostic it came for.
+    # Filtered, the visible output matches an unflagged run except for npm's
+    # own "added N packages in Xs" duration line, which differs between any
+    # two runs regardless of this flag -- measured, not assumed.
+    # prebuild-install's own lines survive because npm prefixes them
+    # `npm error `, not `npm http `.
+    #
+    # tee BEFORE grep is deliberate, and is defensive rather than currently
+    # load-bearing: no classifier input is filter-shaped today, so swapping
+    # the two would change nothing observable. It matters the moment either
+    # side moves -- a broader filter, or an npm that stops prefixing a
+    # script's output -- at which point capturing first is what keeps the
+    # classifier reading everything npm said while the operator reads less.
+    # The two alternatives below are a snapshot of npm's http vocabulary;
+    # a third shape would leak noise to the display, never hide a diagnostic.
+    (cd "${CLAUDE_PLUGIN_DATA}" && npm install --engine-strict --no-audit --no-fund --no-progress --loglevel=http 2>&1) \
+      | tee "$npm_log" | grep -v '^npm http \(cache\|fetch GET 200\)'
+    # Must stay on the line immediately after the pipeline: PIPESTATUS is
+    # clobbered by the next command. Still index 0 through three stages.
+    npm_status=${PIPESTATUS[0]}
+  else
+    (cd "${CLAUDE_PLUGIN_DATA}" && npm install --engine-strict --no-audit --no-fund --no-progress 2>&1)
+    npm_status=$?
+  fi
+  if [ "$npm_status" -ne 0 ]; then
     rm -f "${CLAUDE_PLUGIN_DATA}/package.json"
     echo "agent-coherence: npm install failed; coordinator will not start this session. Next session retries." >&2
-    echo "agent-coherence: (a 'No prebuilt binaries found' / node-gyp trace above means this Node major" >&2
-    echo "agent-coherence: lacks a better-sqlite3 prebuilt — supported majors: 22 / 24 / 25.)" >&2
-    echo "agent-coherence: (an ESTRICTALLOWSCRIPTS error means npm 11 blocked an install script; the" >&2
-    echo "agent-coherence: allowScripts entry in package.json covers better-sqlite3's prebuilt fetch," >&2
-    echo "agent-coherence: so a NEW package there needs adding to it.)" >&2
+    # WHY CLASSIFY, and why the order below is load-bearing. Every failure
+    # here ends in the same node-gyp "find Python" trace, because
+    # better-sqlite3 falls back to compiling whenever it cannot place a
+    # prebuilt binary -- for ANY reason. This block used to assert the first
+    # explanation unconditionally, which sent the reader to check their Node
+    # version even when the real cause was a dropped connection.
+    #
+    # ESTRICTALLOWSCRIPTS is tested FIRST because it is a terminal npm error
+    # code rather than a warning: a log carrying it is that failure whatever
+    # prebuild-install managed to log on the way, and with more than one
+    # native dependency both can appear.
+    if [ -z "$npm_log" ]; then
+      # Say what happened, not what we guess. mktemp failed, so npm's output
+      # was never captured and nothing was examined.
+      echo "agent-coherence: (npm's output could not be captured — mktemp failed — so no" >&2
+      echo "agent-coherence: cause was classified. The usual three are a missing prebuilt for" >&2
+      echo "agent-coherence: this platform, a failed prebuilt download, and an" >&2
+      echo "agent-coherence: ESTRICTALLOWSCRIPTS block on the install script.)" >&2
+    elif grep -q 'ESTRICTALLOWSCRIPTS' "$npm_log"; then
+      echo "agent-coherence: cause: npm 11 blocked an install script. The allowScripts entry in" >&2
+      echo "agent-coherence: package.json covers better-sqlite3's prebuilt fetch, so a NEW package" >&2
+      echo "agent-coherence: there needs adding to it." >&2
+    elif grep -qiE 'prebuild-install.+warn.+install.+No prebuilt binaries found' "$npm_log"; then
+      # "No prebuilt binaries found" does NOT mean the ABI is unsupported. It
+      # is also what prebuild-install reports for any non-200 response:
+      # download.js does `if (res.statusCode !== 200) return onerror()` with
+      # no argument, and onerror falls through to `error.noPrebuilts(opts)`.
+      # The message's own `target=` field is the discriminator, and Stage 0
+      # has already refused to get here on an unsupported major -- so when
+      # they agree, the major is fine and the prebuilt simply could not be
+      # placed. The HTTP status separates a missing asset from a transient
+      # 5xx, and the install above now asks for it (--loglevel=http). It is
+      # absent only when the capture itself failed, and that case says so
+      # instead of guessing.
+      target_major="$(sed -n 's/.*No prebuilt binaries found (target=v\{0,1\}\([0-9][0-9]*\)\..*/\1/p' "$npm_log" | head -n 1)"
+      # simple-get follows 3xx before the callback, so exactly one numeric
+      # line is logged per download and it carries the FINAL status;
+      # `http request GET …` has a non-numeric second token and cannot match.
+      #
+      # `tail -n 1` is unambiguous because better-sqlite3 is the ONLY
+      # prebuild-install consumer in this tree (one install script:
+      # `prebuild-install || node-gyp rebuild --release`). Add a second
+      # prebuilt-using native dependency and that stops holding: a sibling's
+      # `http 200` could be read as the status for better-sqlite3's own 404,
+      # printing "the server said 200 ... transient: RETRY". If that day comes,
+      # scope the match to the failing package rather than taking the last line.
+      http_status="$(sed -n 's/.*prebuild-install http \([0-9][0-9][0-9]\) .*/\1/p' "$npm_log" | tail -n 1)"
+      if [ -n "$target_major" ] && [ "$target_major" != "$NODE_MAJOR" ]; then
+        echo "agent-coherence: cause: no better-sqlite3 prebuilt for Node ${target_major}." >&2
+        echo "agent-coherence: supported majors are 22 / 24 / 25; running ${NODE_VERSION_RAW}." >&2
+        echo "agent-coherence: retrying will not help — switch Node majors." >&2
+      elif [ "$http_status" = "404" ]; then
+        # Deliberately not called permanent: a release can 404 mid-publish, an
+        # unsynced binary-host mirror 404s, and blocking proxies 404 the hosts
+        # they disallow.
+        echo "agent-coherence: cause: no prebuilt is published for this platform (asset 404)." >&2
+        echo "agent-coherence: Node ${NODE_VERSION_RAW} is supported, so this is NOT your Node version —" >&2
+        echo "agent-coherence: it is this platform/arch/libc. A retry is unlikely to help. Two things" >&2
+        echo "agent-coherence: also produce a 404 here: a binary-host mirror that has not synced, and a" >&2
+        echo "agent-coherence: proxy or firewall that 404s the release host rather than refusing it." >&2
+      elif [ "$http_status" = "429" ] || case "$http_status" in 5??) true ;; *) false ;; esac; then
+        echo "agent-coherence: cause: the prebuilt download failed — the server said ${http_status}." >&2
+        echo "agent-coherence: Node ${NODE_VERSION_RAW} is supported and the asset exists; the node-gyp" >&2
+        echo "agent-coherence: trace after it is the fallback failing, not the cause." >&2
+        echo "agent-coherence: This is transient: RETRY." >&2
+      elif [ -n "$http_status" ]; then
+        # Everything else -- 401, 403, 451 -- is a refusal, not a wobble.
+        # Saying "transient: RETRY" here sends an operator behind a blocking
+        # proxy round a loop that can never succeed.
+        echo "agent-coherence: cause: the prebuilt download was refused — the server said ${http_status}." >&2
+        echo "agent-coherence: Node ${NODE_VERSION_RAW} is supported and this is not a wobble: a proxy," >&2
+        echo "agent-coherence: firewall or auth token blocking the release host produces this." >&2
+        echo "agent-coherence: Retrying unchanged will not help." >&2
+      else
+        echo "agent-coherence: cause: a better-sqlite3 prebuilt could not be placed for this platform." >&2
+        echo "agent-coherence: Node ${NODE_VERSION_RAW} is supported, so this is NOT your Node version." >&2
+        echo "agent-coherence: No HTTP status was captured, so a missing asset and a transient failure" >&2
+        echo "agent-coherence: cannot be told apart here — try ONE retry before concluding either." >&2
+      fi
+    elif grep -qiE 'prebuild-install.+warn.+install' "$npm_log"; then
+      echo "agent-coherence: cause: the prebuilt binary could not be DOWNLOADED (see the" >&2
+      echo "agent-coherence: 'prebuild-install warn install' line above — e.g. ECONNRESET). The" >&2
+      echo "agent-coherence: node-gyp trace after it is the fallback failing, not the cause, and" >&2
+      echo "agent-coherence: your Node major is fine. This is transient: RETRY." >&2
+    else
+      echo "agent-coherence: (no recognised cause in the npm output above. The usual three are a" >&2
+      echo "agent-coherence: missing prebuilt for this platform, a failed prebuilt download, and" >&2
+      echo "agent-coherence: an ESTRICTALLOWSCRIPTS block on the install script.)" >&2
+    fi
+    rm -f "$npm_log"
     exit 1
   fi
+  rm -f "$npm_log"
   # Install-time verification. npm exiting 0 does NOT prove the native addon
   # arrived: better-sqlite3's install script IS the prebuilt download, so an
   # `ignore-scripts=true` in any npmrc suppresses it silently and yields a
@@ -276,7 +423,8 @@ fi
 # entry point. Before this check, a dist-less package produced an infinite
 # MODULE_NOT_FOUND crash loop behind a false "spawned" message.
 if [ ! -f "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" ]; then
-  echo "agent-coherence: ${CLAUDE_PLUGIN_DATA}/dist/coordinator.js missing after provisioning; coordinator will not start this session. Next session retries. (Workaround: echo python > <workspace>/.coherence/coordinator_backend to select the Python backend.)" >&2
+  echo "agent-coherence: ${CLAUDE_PLUGIN_DATA}/dist/coordinator.js missing after provisioning; coordinator will not start this session. Next session retries." >&2
+  python_backend_hint >&2
   exit 1
 fi
 

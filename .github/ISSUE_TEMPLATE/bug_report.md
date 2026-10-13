@@ -36,7 +36,7 @@ Please paste the output of:
 agent-coherence-status --detail metrics
 ```
 
-This is the `?detail=metrics` tier of `/status` — safe to paste (no absolute paths, no PIDs, no session identifiers). If you'd rather not share counters, the `--detail minimal` tier is even more conservative.
+This is the `?detail=metrics` tier of `/status`. It is safe to paste: it has no paths, no process id and no session identifiers, on either backend. If you'd rather not share counters, leave this section out. `--detail minimal` is not more conservative: it is the default tier, which adds your tracked files' paths and a row per session, plus the coordinator's process id on the Python backend. With `agent-coherence` 0.14.1 or earlier it also carries the absolute workspace root and raw session ids.
 
 If the bug involves a stale-read warning, paste the output of:
 
@@ -44,7 +44,7 @@ If the bug involves a stale-read warning, paste the output of:
 claude --include-hook-events --output-format stream-json "<your prompt>"
 ```
 
-…and redact any user content. Hook events are otherwise safe to share — the plugin's `additionalContext` payloads carry only path/session-id/timestamp metadata.
+…and redact any user content. Hook events are otherwise safe to share — the plugin's `additionalContext` payloads carry only coordination metadata, such as paths, versions, grant states, timestamps and agent ids (and short session ids, on the Python backend with `agent-coherence` 0.14.1 or earlier).
 
 **Environment**
 

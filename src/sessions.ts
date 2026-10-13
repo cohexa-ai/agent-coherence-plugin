@@ -46,9 +46,10 @@ export class SessionRegistry {
    * subagent identity (SB-25 composite derivation — see agent_id.ts).
    * Returns the deterministic agent_id (UUID hex). Idempotent.
    *
-   * R2 attribution: for a subagent identity the REVERSE lookup returns the
-   * SUBAGENT id (not the parent session), so warn/deny prose `[:8]` names
-   * the actual writer — mirrors Python `_agent_id_to_session`.
+   * R2 attribution: a subagent gets an agent id DISTINCT from its parent's,
+   * so the `[:8]` short form in warn/deny prose names the actual writer. The
+   * parent linkage stays in `nameByAgentId`; /status does not render it (R6:
+   * this coordinator serves no operator tier).
    */
   registerSession(sessionId: string, subagentId?: string | null): string {
     const cacheKey =
@@ -70,13 +71,15 @@ export class SessionRegistry {
     return agentId;
   }
 
-  /**
-   * Reverse lookup: agent_id (UUID hex) → the ATTRIBUTION id — the
-   * session_id for a parent, the subagent id for a subagent. Null if unknown.
+  /*
+   * R7: `agentIdToSessionId` used to live here. It reversed the derivation so
+   * the four hooks could print a session id in prose; every one of them now
+   * prints the agent id the registry already holds, and the accessor is
+   * DELETED rather than left unused -- kept around, the next renderer that
+   * wants a friendlier label reaches for it and re-introduces the mapping.
+   * `byAgentId` stays because `knownAgentIds` is built from its keys. Mirrors
+   * the removal of Python's `_agent_id_to_session`.
    */
-  agentIdToSessionId(agentId: string): string | null {
-    return this.byAgentId.get(agentId) ?? null;
-  }
 
   /** Human-readable agent name; mirrors Python `session_to_agent_name`. */
   agentIdToName(agentId: string): string | null {

@@ -26,6 +26,7 @@ import { ArtifactRegistry } from "../registry.js";
 import { PolicyRef } from "../policy.js";
 import { SessionRegistry } from "../sessions.js";
 import { createServer } from "../server.js";
+import { sessionToAgentId } from "../agent_id.js";
 
 const HOOK_CLIENT_JS = join(dirname(fileURLToPath(import.meta.url)), "..", "hook_client.js");
 const SID_A = "44444444-4444-4444-8444-444444444444";
@@ -206,7 +207,12 @@ test("ZERO-PYTHON SMOKE: four-step warn sequence + strict deny, no Python (or an
     assert.equal(hso5.permissionDecision, "deny");
     assert.match(
       hso5.permissionDecisionReason as string,
-      /^Stale read denied: CLAUDE\.md was updated by session 55555555 at .+\. Re-read CLAUDE\.md via the Read tool before proceeding\. This denial is structural \(v0\.2 strict mode\); retrying the same operation will produce the same denial\.$/,
+      // R7: the deny names the writer's AGENT id, not the session id it was
+      // derived from. Derived here rather than pasted so the pin stays an
+      // attribution check -- a bare `[0-9a-f]{8}` would pass for any writer.
+      new RegExp(
+        `^Stale read denied: CLAUDE\\.md was updated by agent ${sessionToAgentId(SID_B).slice(0, 8)} at .+\\. Re-read CLAUDE\\.md via the Read tool before proceeding\\. This denial is structural \\(v0\\.2 strict mode\\); retrying the same operation will produce the same denial\\.$`,
+      ),
     );
     assert.equal("additionalContext" in hso5, false);
 

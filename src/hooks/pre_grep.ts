@@ -10,16 +10,18 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { MESIState } from "../states.js";
 import { emitStrictDeny, nowUnix, type StaleSummary } from "../hook_payloads.js";
-import { drainNoticeText } from "./pre_bash.js";
 import {
-  type HookDeps,
-  writeJson,
-  writeError,
-  readJsonBody,
-  isValidSessionId,
+  applyRegrants,
+  drainNoticeText,
   isValidPath,
+  isValidSessionId,
   nowTick as nowTickFn,
+  readJsonBody,
   readSubagentId,
+  type HookDeps,
+  type Regrant,
+  writeError,
+  writeJson,
 } from "./_common.js";
 import { deliverPendingReground, writeFastAdmit } from "./reground.js";
 
@@ -66,6 +68,7 @@ export async function handlePreGrep(
 
   const staleSummaries: Array<{ path: string; current_version: number }> = [];
   let strictStaleFirst: StaleSummary | null = null;
+  const regrants: Regrant[] = [];
   for (const path of trackedPaths) {
     const existing = deps.registry.getArtifactByName(path);
     if (existing === null) continue; // no seeding on the grep path
@@ -73,23 +76,33 @@ export async function handlePreGrep(
     if (agentState !== null && agentState !== MESIState.INVALID) continue;
     staleSummaries.push({ path, current_version: existing.version });
     if (strictStaleFirst === null && deps.policy.isStrictMode(path)) {
-      const lastWriterSession =
-        existing.last_writer_id !== null
-          ? deps.sessions.agentIdToSessionId(existing.last_writer_id)
-          : null;
+      // R7: the registry's handle for the writer, not a recovered session id.
+      const lastWriterAgent = existing.last_writer_id;
       strictStaleFirst = {
         path,
         current_version: existing.version,
+        // R8: the observed version, not the inferred one -- see pre_read.ts.
         prior_version_seen_by_session:
-          agentState === MESIState.INVALID ? existing.version - 1 : null,
-        last_writer_session_id: lastWriterSession ?? "<unknown>",
+          agentState === MESIState.INVALID
+            ? (deps.registry.lastObservedVersionFor(existing.id, agentId) ??
+              (existing.version > 0 ? existing.version - 1 : 0))
+            : null,
+        last_writer_session_id: lastWriterAgent ?? "<unknown>",
         last_writer_at_unix_ts: existing.updated_at,
         warning_generated_at_unix_ts: nowUnix(),
         hash_differs: false,
       };
     }
-    deps.registry.grantShared(existing.id, agentId, now, "post_stale_grep");
+    regrants.push({ artifactId: existing.id, trigger: "post_stale_grep" });
   }
+
+  // No held paths: a Grep over a root does not read every file under it --
+  // see applyRegrants.
+  applyRegrants(deps, agentId, regrants, {
+    commandRuns: strictStaleFirst === null,
+    nowTick: now,
+    held: [],
+  });
 
   // v0.2 KTD-Q strict short-circuit — same shape as pre-bash (Unit 6).
   if (strictStaleFirst !== null) {

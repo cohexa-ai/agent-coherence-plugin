@@ -7,6 +7,10 @@
  *  - not a list of strings → 400 `{"error":"paths must be a list of strings"}`
  *  - > 20 paths → 400 `{"error":"max 20 paths per request"}`
  *  - YAML byte cap → 400 `{"error": <writer message>}`
+ *  - policy file unreadable, not loadable as a list, or in a layout an
+ *    appended line would break → 400 `{"error": <writer message>}`, nothing
+ *    written (Python still appends to a file it can read, and answers 500
+ *    for one it cannot; see `appendPolicyYaml`)
  *  - track   → `{ok:true, added:[…], rejected:[{path,reason},…]}`
  *  - untrack → `{ok:true, removed:[…], rejected:[…]}` (key is `removed`)
  *

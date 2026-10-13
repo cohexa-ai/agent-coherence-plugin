@@ -202,6 +202,107 @@ test("re-grant after invalidation re-records the (newer) current version", () =>
   }
 });
 
+test("grantShared(observed=false) grants but keeps the prior value; the default still records", () => {
+  // Both directions on the very same transition: asserting only the preserve
+  // side cannot tell a working flag from a registry that stopped recording.
+  const { registry, cleanup } = makeRegistry();
+  try {
+    const id = registry.resolveOrRegisterArtifact("plan.md", HASH_1);
+    registry.grantShared(id, AGENT_A, 10);
+    registry.acquireExclusive(id, AGENT_B, 20);
+    registry.commit(id, AGENT_B, HASH_2, 30); // v2; A INVALID, observed 1
+    assert.equal(registry.getAgentState(id, AGENT_A), MESIState.INVALID);
+
+    registry.grantShared(id, AGENT_A, 40, "post_stale_bash", false);
+    assert.equal(registry.getAgentState(id, AGENT_A), MESIState.SHARED);
+    assert.equal(registry.lastObservedVersionFor(id, AGENT_A), 1);
+
+    registry.acquireExclusive(id, AGENT_B, 50); // A INVALID again, still at 1
+    registry.grantShared(id, AGENT_A, 60, "post_stale_bash");
+    assert.equal(registry.lastObservedVersionFor(id, AGENT_A), 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("grantShared(observed=false) on a never-observed pair records nothing", () => {
+  const { registry, cleanup } = makeRegistry();
+  try {
+    const id = registry.resolveOrRegisterArtifact("plan.md", HASH_1);
+    registry.grantShared(id, AGENT_A, 10, "first_bash_read", false);
+    assert.equal(registry.getAgentState(id, AGENT_A), MESIState.SHARED);
+    assert.equal(registry.lastObservedVersionFor(id, AGENT_A), null);
+  } finally {
+    cleanup();
+  }
+});
+
+test("recordObservation credits a SHARED row the deny left behind, and moves nothing else", () => {
+  // The row a denied bash leaves: SHARED on v2 with the baseline still at 1.
+  // grantShared is a no-op on SHARED, so the retry's read lands only here.
+  const { registry, cleanup } = makeRegistry();
+  try {
+    const id = registry.resolveOrRegisterArtifact("plan.md", HASH_1);
+    registry.grantShared(id, AGENT_A, 10);
+    registry.acquireExclusive(id, AGENT_B, 20);
+    registry.commit(id, AGENT_B, HASH_2, 30); // v2; A INVALID, observed 1
+    registry.grantShared(id, AGENT_A, 40, "post_stale_bash", false);
+
+    registry.grantShared(id, AGENT_A, 50, "post_stale_bash");
+    assert.equal(registry.lastObservedVersionFor(id, AGENT_A), 1, "grantShared is a no-op on SHARED");
+
+    assert.equal(registry.recordObservation(id, AGENT_A), true);
+    assert.equal(registry.lastObservedVersionFor(id, AGENT_A), 2);
+    assert.equal(registry.getAgentState(id, AGENT_A), MESIState.SHARED);
+    assert.equal(registry.recordObservation(id, AGENT_A), false, "already current: no write");
+  } finally {
+    cleanup();
+  }
+});
+
+test("recordObservation credits a never-observed SHARED row with the current version", () => {
+  const { registry, cleanup } = makeRegistry();
+  try {
+    const id = registry.resolveOrRegisterArtifact("plan.md", HASH_1);
+    registry.grantShared(id, AGENT_A, 10, "first_bash_read", false);
+    assert.equal(registry.recordObservation(id, AGENT_A), true);
+    assert.equal(registry.lastObservedVersionFor(id, AGENT_A), 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("recordObservation leaves INVALID, EXCLUSIVE and absent rows alone", () => {
+  // INVALID: crediting it would restore a grant a peer revoked and clear the
+  // stale flag the session has not seen. EXCLUSIVE: a write grant is never
+  // rewritten by a read. Absent: there is no grant to credit.
+  const { registry, cleanup } = makeRegistry();
+  try {
+    const id = registry.resolveOrRegisterArtifact("plan.md", HASH_1);
+    registry.grantShared(id, AGENT_A, 10);
+    registry.acquireExclusive(id, AGENT_B, 20);
+    registry.commit(id, AGENT_B, HASH_2, 30); // v2; A INVALID at 1, B MODIFIED
+    registry.grantShared(id, AGENT_A, 40, "post_stale_bash", false);
+    registry.acquireExclusive(id, AGENT_B, 50); // A INVALID again, still at 1
+
+    assert.equal(registry.recordObservation(id, AGENT_A), false);
+    assert.equal(registry.getAgentState(id, AGENT_A), MESIState.INVALID);
+    assert.equal(registry.lastObservedVersionFor(id, AGENT_A), 1);
+
+    const other = registry.resolveOrRegisterArtifact("notes.md", HASH_1);
+    registry.acquireExclusive(other, AGENT_A, 60);
+    registry.acquireExclusive(id, AGENT_A, 70);
+    assert.equal(registry.getAgentState(other, AGENT_A), MESIState.EXCLUSIVE);
+    assert.equal(registry.recordObservation(other, AGENT_A), false);
+    assert.equal(registry.getAgentState(other, AGENT_A), MESIState.EXCLUSIVE);
+
+    assert.equal(registry.recordObservation(other, AGENT_B), false);
+    assert.equal(registry.getAgentState(other, AGENT_B), null);
+  } finally {
+    cleanup();
+  }
+});
+
 // ------------------------------------------------------------------
 // Commit paths advance the committer (R6)
 // ------------------------------------------------------------------

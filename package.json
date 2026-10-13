@@ -1,6 +1,6 @@
 {
   "name": "agent-coherence-plugin-coordinator",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Node coordinator for the agent-coherence Claude Code plugin \u2014 MESI-subset port of the Python coordinator for one-click marketplace install. Coexists with the Python coordinator per coherence.coordinator_backend setting.",
   "private": true,
   "type": "module",
@@ -32,12 +32,12 @@
   "devDependencies": {
     "@eslint/js": "^9.39.4",
     "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^26.6.4",
+    "@types/node": "^26.6.5",
     "@typescript-eslint/eslint-plugin": "^8.71.0",
-    "@typescript-eslint/parser": "^8.70.1",
-    "eslint": "^10.11.0",
+    "@typescript-eslint/parser": "^8.71.1",
+    "eslint": "^10.12.0",
     "globals": "^17.13.0",
-    "prettier": "^3.9.9",
+    "prettier": "^3.9.10",
     "typescript": "^6.0.3"
   },
   "homepage": "https://github.com/Cohexa-ai/agent-coherence-plugin",

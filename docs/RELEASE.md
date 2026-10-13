@@ -33,7 +33,7 @@ git checkout -b dev && git push -u origin dev
 
 ### Configure branch protection on `main`
 
-Require PR review + the CI status check contexts. Strict mode means the PR branch must be up to date with `main` before merging.
+Require the CI status check contexts. Strict mode means the PR branch must be up to date with `main` before merging.
 
 The context names below MUST match the job display names in `.github/workflows/ci.yml` verbatim — GitHub matches on the `name:` field of each job (and per-matrix variant). Update this list if the workflow's job names change. `node tools/check_release_readiness.js` verifies the live required contexts against ci.yml and fails on drift (a stale context blocks every PR merge behind an admin override), so run it after any matrix or job-name change and re-apply these PUT commands with the new names.
 
@@ -46,16 +46,13 @@ gh api -X PUT repos/Cohexa-ai/agent-coherence-plugin/branches/main/protection \
     "contexts": ["Typecheck", "Tests (Node 22)", "Tests (Node 24)", "Tests (Node 25)", "Zero-Python install (Node 22)", "Zero-Python install (Node 24)", "Zero-Python install (Node 25)", "Marketplace-shaped provision (dist-less package)", "Build Package"]
   },
   "enforce_admins": false,
-  "required_pull_request_reviews": {
-    "required_approving_review_count": 1,
-    "dismiss_stale_reviews": true
-  },
+  "required_pull_request_reviews": null,
   "restrictions": null
 }
 JSON
 ```
 
-`required_approving_review_count: 1` is kept deliberately even though it cannot be satisfied today. The repository has a single collaborator, who is therefore the author of every `dev → main` PR, and GitHub refuses self-approval — no review can ever land on a release PR. Keeping the rule means the gate is already in place the day a second maintainer joins, and it is precisely why `enforce_admins` is `false`: releases merge past it with `--admin` (see §2). `tools/check_release_readiness.js` does not assert this field, so changing it will not trip preflight — which also means nothing keeps the doc and the live branch in sync automatically. If you drop the requirement, drop it from this payload and from the live branch in the same change.
+`main`'s one-approval review requirement lives in the `protect-main` ruleset (below), not in classic protection. It cannot be met today, because the single collaborator authors every release PR and GitHub refuses self-approval. Releases merge past it through the ruleset's admin bypass with `--admin` (see §2). Keeping the rule means the gate is already in place the day a second maintainer joins. `tools/check_release_readiness.js` does not assert the review count, so nothing keeps this doc and the live configuration in sync automatically; change both in the same change.
 
 ### Configure branch protection on `dev`
 
@@ -85,7 +82,7 @@ JSON
 | Classic branch protection | `/branches/main/protection` (above) | via `enforce_admins: false` |
 | `protect-main` ruleset | `/rulesets` (below) | via the ruleset's own bypass list |
 
-**A ruleset bypass actor does not exempt you from classic branch protection, and vice versa.** They are evaluated separately. A PR showing "Review required" while you hold ruleset bypass is being blocked by the *classic* layer.
+**A ruleset bypass actor does not exempt you from classic branch protection, and vice versa.** They are evaluated separately. Today the review requirement exists only in the ruleset, so a "Review required" block on a release PR is cleared by the ruleset's admin bypass (`gh pr merge --admin`).
 
 The ruleset's bypass list must contain **Repository admin** (`bypass_mode: always`); without it, no release can merge, because the review requirement above is unsatisfiable. Bypass actors are not settable through this endpoint's payload — add them in **Settings → Rules → protect-main → Bypass list**, and verify with:
 
@@ -124,11 +121,11 @@ gh api -X PUT repos/Cohexa-ai/agent-coherence-plugin/rulesets/$(gh api repos/Coh
 JSON
 ```
 
-Nothing verifies this automatically — `tools/check_release_readiness.js` checks the *tag* ruleset (below), not this one. If a release merge is ever rejected on merge method, this is the cause.
+`tools/check_release_readiness.js` verifies this ruleset as its `branch ruleset` line. It fails if `required_linear_history` is present, if `merge` is missing from `allowed_merge_methods`, or if a visible bypass list has no admin actor. The release workflow's `GITHUB_TOKEN` cannot see `bypass_actors`, so in the `preflight` job that sub-check degrades to a warning. Run the tool locally as an admin before you push a tag.
 
 ### Configure tag protection ruleset for `refs/tags/v*`
 
-Only admins can push release tags. Deletion and non-fast-forward updates are blocked.
+Only admins can push release tags. Deletion, updates and non-fast-forward updates are blocked. The `creation` rule is what restricts pushing a new tag to the bypass list.
 
 ```bash
 gh api -X POST repos/Cohexa-ai/agent-coherence-plugin/rulesets \
@@ -145,11 +142,46 @@ gh api -X POST repos/Cohexa-ai/agent-coherence-plugin/rulesets \
   },
   "rules": [
     {"type": "deletion"},
+    {"type": "creation"},
+    {"type": "update"},
     {"type": "non_fast_forward"}
   ]
 }
 JSON
 ```
+
+### Create the forward-merge GitHub App
+
+`.github/workflows/forward-merge-main.yml` merges `main` into `dev` whenever `main` holds commits `dev` lacks: Dependabot security updates (they always target the default branch), the release merge and bump (§2), and hot-fixes (§3). It needs a GitHub App token rather than `GITHUB_TOKEN`, because `GITHUB_TOKEN` cannot push changes to `.github/workflows/`, its PRs get their checks held for manual approval, and its merges fire no push workflows. The workflow header has the detail.
+
+The App's private key goes in an **environment** that only `main` may use, not in a repository secret. The App can push workflows and approve PRs, and an approval from it would count toward `main`'s one required review. A repository secret is readable by a workflow running from any branch, including `dev`, which takes merges with no review.
+
+1. Create the App at <https://github.com/organizations/Cohexa-ai/settings/apps/new>. Any unique name. Untick **Webhook → Active**. Repository permissions: **Contents**, **Pull requests** and **Workflows**, each *Read and write* (Metadata read-only is added automatically). Where can it be installed: *Only on this account*.
+2. **Install App** → *Only select repositories* → `agent-coherence-plugin`.
+3. On the App's settings page, copy the **Client ID**, then **Generate a private key** (a `.pem` downloads).
+4. Create the `forward-merge` environment and limit it to `main`:
+
+   ```bash
+   gh api -X PUT repos/Cohexa-ai/agent-coherence-plugin/environments/forward-merge --input - <<'JSON'
+   {"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+   JSON
+   gh api -X POST repos/Cohexa-ai/agent-coherence-plugin/environments/forward-merge/deployment-branch-policies \
+     -f name=main -f type=branch
+   ```
+
+   `protected_branches: true` would not do: it admits every protected branch, and `dev` is protected. Run these even if the environment already exists: GitHub creates a referenced environment with no branch policy, and so does the web UI by default. The workflow refuses to use the environment unless it admits exactly `main`. Never store the key as a repository or organization secret; any workflow on any branch can read one. The workflow checks for such a copy on every run and fails red if it finds one: delete it, then rotate the App's private key, since it has been readable.
+5. Store the Client ID as a repository variable and the key as an environment secret, then delete the `.pem`:
+
+   ```bash
+   gh variable set FORWARD_MERGE_APP_CLIENT_ID -R Cohexa-ai/agent-coherence-plugin --body '<client id>'
+   gh secret set FORWARD_MERGE_APP_PRIVATE_KEY -R Cohexa-ai/agent-coherence-plugin --env forward-merge < path/to/key.pem
+   ```
+
+6. Verify, once the workflow file is on `main`: `gh workflow run forward-merge-main.yml -R Cohexa-ai/agent-coherence-plugin --ref main` and expect a green run. A manual run always mints the App token, so green means the App and the environment work even when `dev` has nothing to take. A dispatch with `--ref dev` fails at the environment's branch policy; that is the protection working.
+
+Do not add the App to any bypass list. Its PR merges only once `dev`'s required checks pass, which is the point. Until the App exists, the workflow stays green while `dev` contains `main`, and fails red, naming this section, only when `dev` is behind.
+
+Keeping the key on `main` stops the App from being used to approve PRs, but it is not the only approval source. While **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests** is on, any workflow that declares `pull-requests: write` can approve a PR with `GITHUB_TOKEN`, and that approval counts toward `main`'s one required review. Since Dependabot version updates target `dev`, the setting serves only `dependabot-automerge.yml`'s best-effort approval of devDependency security PRs on `main`, and those can wait for a human.
 
 ### Verify
 
@@ -157,7 +189,7 @@ JSON
 node tools/check_release_readiness.js
 ```
 
-Expect: six `✓` lines and exit 0 (`0 failure(s), 0 warning(s)`).
+Expect seven `✓` lines and exit 0 (`0 failure(s), 0 warning(s)`). In the release workflow's `preflight` job, five of them degrade to `⚠` because the endpoints are admin-scoped, and the job still exits 0.
 
 ---
 
@@ -165,19 +197,42 @@ Expect: six `✓` lines and exit 0 (`0 failure(s), 0 warning(s)`).
 
 Replace `X.Y.Z` with the target version (e.g. `0.3.2`) throughout.
 
-**Read this before you start: the release merge requires `--admin`.** `main` requires one approving review (§1), and that requirement is structurally unsatisfiable in this repository — the single collaborator authors every release PR, and GitHub refuses self-approval. `enforce_admins: false` is set deliberately so an admin can merge past it. Be aware of what that costs: `--admin` bypasses *all* of `main`'s protection, not just the review gate — required status checks and the strict up-to-date rule are skipped too. Step 1's "verify CI is green" is therefore a hard gate rather than a courtesy; it is the only thing checking CI on the release merge.
+**Read this before you start: the release merge requires `--admin`.** `main` requires one approving review (the `protect-main` ruleset, §1), and that requirement is structurally unsatisfiable in this repository — the single collaborator authors every release PR, and GitHub refuses self-approval. The ruleset's admin bypass (and `enforce_admins: false` on classic protection) lets an admin merge past it. Be aware of what that costs: `--admin` bypasses *all* of `main`'s protection, not just the review gate — required status checks and the strict up-to-date rule are skipped too. Step 1's "verify CI is green" is therefore a hard gate rather than a courtesy; it is the only thing checking CI on the release merge.
 
-1. **Open the `dev → main` PR.** Title is `release: vX.Y.Z` so it's easy to find in the PR history.
+1. **Cut the release branch, bump, and open the PR.** The version bump and the changelog ride in the release PR, so CI runs on the bumped tree and `main` never holds the release's code under the previous version number.
 
    ```bash
-   gh pr create --base main --head dev --title "release: vX.Y.Z"
+   git fetch origin && git switch -c chore/release-vX.Y.Z origin/dev
+   ```
+
+   Bump the version in three places. All three must stay in sync — verify with `node tools/check_versions_synced.js`, which exits 1 with a diff on drift.
+
+   - `package.json` → `"version": "X.Y.Z"`
+   - `.claude-plugin/plugin.json` → `"version": "X.Y.Z"`
+   - `.claude-plugin/marketplace.json` → `plugins[0].version` (note the array path: it's nested inside the first entry of the `plugins` array, not at the manifest root)
+
+   Regenerate the lockfile so `package-lock.json`'s own `"version"` field matches:
+
+   ```bash
+   npm install --package-lock-only
+   ```
+
+   Promote the changelog: rename `## [Unreleased]` in `CHANGELOG.md` to `## [X.Y.Z] — YYYY-MM-DD` and put a bold one-line summary under it. Do not add an empty `## [Unreleased]` above it; the next change that needs an entry adds one.
+
+   Commit, push, and open the PR. Title is `release: vX.Y.Z` so it's easy to find in the PR history.
+
+   ```bash
+   git add package.json .claude-plugin/plugin.json .claude-plugin/marketplace.json package-lock.json CHANGELOG.md
+   git commit -m "chore(release): bump to vX.Y.Z"
+   git push -u origin chore/release-vX.Y.Z
+   gh pr create --base main --head chore/release-vX.Y.Z --title "release: vX.Y.Z"
    ```
 
    Note the PR number it prints — `<N>` in step 2.
 
    Verify CI is green on every required job (the contexts list in §1) before continuing. Nothing enforces this for you: the `--admin` merge in step 2 skips the required status checks.
 
-2. **Merge with a merge commit, as an admin.** The tag in step 7 points at `main`'s merge commit, whose tree is identical to `dev`'s tip. The tag does *not* point at a SHA that already existed on `dev`, and cannot be made to — see below.
+2. **Merge with a merge commit, as an admin.** The tag in step 4 points at `main`'s merge commit, whose tree is identical to the release branch's tip. The tag does *not* point at a SHA that already existed on `dev`, and cannot be made to — see below.
 
    ```bash
    gh pr merge <N> --admin --merge
@@ -195,74 +250,64 @@ Replace `X.Y.Z` with the target version (e.g. `0.3.2`) throughout.
 
    **If the merge is rejected on merge method**, the `protect-main` ruleset is squash-only — fix it per §1 before continuing. That is the state v0.4.0 shipped in.
 
-3. **Sync local `main`.**
+   The merge starts `forward-merge-main.yml`, which opens a PR merging `main` into `dev` and merges it once `dev`'s checks pass. Confirm it lands before the next release. If it fails on a conflict, merge by hand per §3 step 5.
+
+3. **Sync local `main` and confirm the version.** The tag in step 4 must point at a commit where all three manifests read `X.Y.Z`; otherwise `preflight` and `build` both fail, and a pushed release tag cannot be moved or deleted without the tag rulesets' admin bypass.
 
    ```bash
    git checkout main && git pull --ff-only origin main
+   node tools/check_versions_synced.js
    ```
 
-4. **Bump the version in three places.** All three must stay in sync — verify with `node tools/check_versions_synced.js`, which exits 1 with a diff on drift.
-
-   - `package.json` → `"version": "X.Y.Z"`
-   - `.claude-plugin/plugin.json` → `"version": "X.Y.Z"`
-   - `.claude-plugin/marketplace.json` → `plugins[0].version` (note the array path: it's nested inside the first entry of the `plugins` array, not at the manifest root)
-
-5. **Regenerate the lockfile (recommended).** Keeps `package-lock.json`'s own `"version"` field aligned with the bump.
-
-   ```bash
-   npm install --package-lock-only
-   ```
-
-6. **Commit and push.**
-
-   ```bash
-   git add package.json .claude-plugin/plugin.json .claude-plugin/marketplace.json package-lock.json
-   git commit -m "chore(release): bump to vX.Y.Z"
-   git push origin main
-   ```
-
-7. **Create the annotated tag.** Use `-a` so the tag carries metadata (tagger, date, message) — lightweight tags are harder to audit.
+4. **Create the annotated tag.** Use `-a` so the tag carries metadata (tagger, date, message) — lightweight tags are harder to audit.
 
    ```bash
    git tag -a vX.Y.Z -m "vX.Y.Z: <one-line summary>"
    ```
 
-8. **Push the tag.**
+5. **Push the tag.**
 
    ```bash
    git push origin vX.Y.Z
    ```
 
-9. **Watch the Actions tab.** The tag push triggers `release.yml`, which runs three jobs:
+6. **Watch the Actions tab.** The tag push triggers `release.yml`, which runs three jobs:
 
    - **preflight** — verifies the tag format and runs `tools/check_release_readiness.js` against the §1 GitHub configuration
-   - **build** — `npm ci`, typecheck, test, build, SBOM generation
+   - **build** — checks that the tag equals `v` + `package.json`'s version, then runs `npm ci`, build and SBOM generation. It does not run typecheck or test; those run in CI on the release PR, which is why step 1's green-CI check matters.
    - **github-release** — creates the GitHub Release with the build artifacts attached
 
    Common failure modes:
 
    - **Preflight fails:** usually means the tag name doesn't match `vX.Y.Z`, or the §1 branch/tag protection drifted (re-run the §1 commands).
-   - **Build fails on version check:** the tag's version doesn't match `package.json`'s `"version"` field. Re-check step 4.
+   - **Build fails on version check:** the tag's version doesn't match `package.json`'s `"version"` field. Re-check step 1.
 
-10. **Smoke check from a fresh install.** From a clean `claude` install (no prior marketplace state):
+7. **Set the release notes.** `release.yml` fills the GitHub Release body with generated PR titles. Replace it with the version's CHANGELOG section, which is the curated record:
 
-    ```bash
-    claude
-    # inside Claude Code — un-pinned (canonical) form; resolves to the
-    # latest published tag:
-    /plugin marketplace add Cohexa-ai/agent-coherence-plugin
-    /plugin install agent-coherence@agent-coherence
-    ```
+   ```bash
+   awk '/^## \[X\.Y\.Z\]/{f=1; next} /^## \[/{f=0} f' CHANGELOG.md > /tmp/notes-vX.Y.Z.md
+   gh release edit vX.Y.Z --notes-file /tmp/notes-vX.Y.Z.md
+   ```
 
-    For operators who need to pin a specific version (CI / reproducibility), use:
+8. **Smoke check from a fresh install.** From a clean `claude` install (no prior marketplace state):
 
-    ```bash
-    /plugin marketplace add Cohexa-ai/agent-coherence-plugin@vX.Y.Z
-    ```
+   ```bash
+   claude
+   # inside Claude Code — un-pinned (canonical) form; resolves to the
+   # latest published tag:
+   /plugin marketplace add Cohexa-ai/agent-coherence-plugin
+   /plugin install agent-coherence@agent-coherence
+   ```
 
-    Confirm the plugin loads (no errors on `SessionStart`, hooks visible in `/hooks`).
+   For operators who need to pin a specific version (CI / reproducibility), use:
 
-11. **Broad-beta gates (any tag introducing a new public surface).** Walk through the BB1–BB8 rubric in the broad-beta playbook (`docs/BROAD_BETA.md`, maintainer-local — kept out of public tracking) before pushing the tag. That playbook also covers the 14-day post-launch monitoring window and the rollback runbook. Skip this step for patch tags that only fix regressions in already-shipped behavior.
+   ```bash
+   /plugin marketplace add Cohexa-ai/agent-coherence-plugin@vX.Y.Z
+   ```
+
+   Confirm the plugin loads (no errors on `SessionStart`, hooks visible in `/hooks`).
+
+9. **Broad-beta gates (any tag introducing a new public surface).** Walk through the BB1–BB8 rubric in the broad-beta playbook (`docs/BROAD_BETA.md`, maintainer-local — kept out of public tracking) before pushing the tag. That playbook also covers the 14-day post-launch monitoring window and the rollback runbook. Skip this step for patch tags that only fix regressions in already-shipped behavior.
 
 ---
 
@@ -286,9 +331,11 @@ Use this when a critical security or correctness fix must land on `main` immedia
 
 3. **Merge after CI green + review.** Same protection rules as a normal release PR — the merge cannot bypass required status checks.
 
-4. **Tag if a release is warranted.** Follow section 2 steps 4–10 (version bump, commit, tag, push tag, smoke check).
+4. **Tag if a release is warranted.** Cut `chore/release-vX.Y.Z` from `main` instead of `dev`, bump and promote the changelog as in section 2 step 1, and open its PR against `main`. Then follow section 2 steps 2–8 (merge, sync, tag, push tag, release notes, smoke check).
 
 5. **Forward-merge into `dev`.** Critical — otherwise the next `dev → main` PR will look like it's re-introducing the hot-fix as a divergence (or worse, revert it during a rebase).
+
+   `forward-merge-main.yml` does this automatically once the hot-fix merges: it opens a PR merging `main` into `dev` and merges it after `dev`'s checks pass. Run the commands below only when that workflow fails on a conflict. If you resolve through a PR instead, use any branch except `chore/auto-forward-merge-main`, which the workflow rebuilds from scratch:
 
    ```bash
    git checkout dev && git pull --ff-only origin dev

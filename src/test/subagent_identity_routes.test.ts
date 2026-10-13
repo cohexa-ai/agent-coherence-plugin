@@ -19,6 +19,7 @@ import { ArtifactRegistry } from "../registry.js";
 import { PolicyRef } from "../policy.js";
 import { SessionRegistry } from "../sessions.js";
 import { createServer } from "../server.js";
+import { sessionToAgentId } from "../agent_id.js";
 
 const SECRET = "s".repeat(32);
 const SID = "44444444-4444-4444-8444-444444444444";
@@ -84,8 +85,17 @@ test("sibling subagents of ONE session collide on pre-edit (previously silent)",
     assert.equal(b.ok, true);
     const hso = b.hookSpecificOutput as Record<string, unknown>;
     assert.ok(hso, "sibling must receive a collision warning");
-    // Attribution: the named holder is subagent A's id, not the parent session.
-    assert.match(hso.additionalContext as string, new RegExp(SUB_A.slice(0, 8)));
+    // Attribution: the named holder is subagent A's COMPOSITE agent id --
+    // distinct from the parent's and from sibling B's. R7 moved this from the
+    // bare subagent id to the agent id; what it has to prove is unchanged.
+    assert.match(
+      hso.additionalContext as string,
+      new RegExp(sessionToAgentId(SID, SUB_A).slice(0, 8)),
+    );
+    assert.doesNotMatch(
+      hso.additionalContext as string,
+      new RegExp(sessionToAgentId(SID).slice(0, 8)),
+    );
 
     // And WITHOUT agent_id (the pre-SB-25 shape), the same session is one
     // identity: a re-edit by the parent after A+B were invalidated is just
@@ -119,9 +129,19 @@ test("attribution: a subagent's commit is credited to the subagent in the parent
     const stale = await post("/hooks/pre-read", { session_id: SID, path: "CLAUDE.md" });
     assert.equal(stale.status, "stale");
     const summary = stale.summary as Record<string, unknown>;
-    assert.equal(summary.last_writer_session_id, SUB_A);
+    // R7: the composite agent id, which both backends derive identically --
+    // the corpus pins the same value at warn_mode/14.
+    assert.equal(summary.last_writer_session_id, sessionToAgentId(SID, SUB_A));
     const hso = stale.hookSpecificOutput as Record<string, unknown>;
-    assert.match(hso.additionalContext as string, new RegExp(`session ${SUB_A.slice(0, 8)}`));
+    assert.match(
+      hso.additionalContext as string,
+      new RegExp(`agent ${sessionToAgentId(SID, SUB_A).slice(0, 8)}`),
+    );
+    // The parent is not the writer, so it must not be the one named.
+    assert.doesNotMatch(
+      hso.additionalContext as string,
+      new RegExp(`agent ${sessionToAgentId(SID).slice(0, 8)}`),
+    );
   } finally {
     await cleanup();
   }

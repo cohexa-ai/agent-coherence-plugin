@@ -356,8 +356,10 @@ export class ArtifactRegistry {
    * (per KTD-10 MESI subset: no transient states, no event bus).
    *
    * Side effects (all in one BEGIN IMMEDIATE):
-   * - For each peer in {M, E, S}: UPSERT agent_states to INVALID; UPSERT a
-   *   pending_notice with `agentId` as preempter and `nowUnixTs`.
+   * - For each peer in {M, E, S}: UPSERT agent_states to INVALID. A peer that
+   *   was M or E lost a write grant, so it also gets a pending_notice with
+   *   `agentId` as preempter and `nowUnixTs`; an S peer gets none (as Python's
+   *   pre-edit queues notices only for `_peers_in_me_excluding`).
    * - UPSERT agent_states[agentId] to EXCLUSIVE; stamp granted_at_tick.
    * - checkSingleWriter on the post-mutation state map → rollback if
    *   violated.
@@ -385,7 +387,10 @@ export class ArtifactRegistry {
           );
         }
         this.setAgentStateInternal(artifactId, peerId, peerState, MESIState.INVALID, nowTick, "write");
-        this.upsertPendingNotice(peerId, artifactId, agentId, nowTick);
+        // A reader lost no write grant; its next read is warned stale instead.
+        if (isWriter(peerState)) {
+          this.upsertPendingNotice(peerId, artifactId, agentId, nowTick);
+        }
         invalidatedPeers.push(peerId);
       }
 
@@ -433,8 +438,9 @@ export class ArtifactRegistry {
    * - Verify agent_states[agentId] ∈ {EXCLUSIVE, MODIFIED}; raise otherwise
    * - Bump artifacts.version (monotonicity invariant check)
    * - Update artifacts.content_hash, last_writer_id, updated_at
-   * - For each peer ≠ agentId in {S}: UPSERT agent_states to INVALID + pending_notice
-   *   (any M/E peers would already be INVALID via acquireExclusive — they don't recur)
+   * - For each peer ≠ agentId in {S}: UPSERT agent_states to INVALID, with no
+   *   pending_notice: a reader held no write grant to lose (any M/E peers
+   *   would already be INVALID via acquireExclusive — they don't recur)
    * - UPSERT agent_states[agentId] to MODIFIED
    * - checkSingleWriter
    *
@@ -479,10 +485,11 @@ export class ArtifactRegistry {
         )
         .run(nextVersion, newContentHash, sizeTokens, agentId, updatedAt, artifactId);
 
-      // Invalidate any SHARED peers. M/E peers should already be INVALID per
-      // single-writer + the acquireExclusive call that preceded this commit;
-      // if any are still M/E that's a single-writer violation that the
-      // post-commit checkSingleWriter will catch.
+      // Invalidate every peer. Each is a reader: the caller holds the write
+      // grant (checked above), and every transition that grants one runs
+      // checkSingleWriter, so no other M/E peer can exist here. That is why
+      // none is queued a preemption notice. (A stray writer would NOT be
+      // caught by the post-commit check below: this loop invalidates it first.)
       const stateMap = this.getStateMap(artifactId);
       const invalidatedPeers: string[] = [];
       for (const [peerId, peerState] of stateMap) {
@@ -494,7 +501,6 @@ export class ArtifactRegistry {
           );
         }
         this.setAgentStateInternal(artifactId, peerId, peerState, MESIState.INVALID, nowTick, "commit");
-        this.upsertPendingNotice(peerId, artifactId, agentId, nowTick);
         invalidatedPeers.push(peerId);
       }
 
@@ -559,8 +565,8 @@ export class ArtifactRegistry {
    * 6. WIN: version+1, content_hash/last_writer_id/updated_at updated
    *    (size_tokens preserved on null), committer S/I → SHARED (an OCC writer
    *    never acquired a grant, so SHARED is the honest end-state and keeps a
-   *    repeat commit_cas eligible), every non-INVALID peer → INVALID + a
-   *    pending notice, single-writer re-checked.
+   *    repeat commit_cas eligible), every non-INVALID peer → INVALID with no
+   *    pending notice (each is a reader), single-writer re-checked.
    *
    * Parity notes (plan §Review corrections, decision A):
    * - `caller_in_transient_state` is STRUCTURALLY UNREACHABLE on Node: the
@@ -637,7 +643,7 @@ export class ArtifactRegistry {
         .run(nextVersion, newContentHash, sizeTokens, agentId, Date.now() / 1000, artifactId);
 
       // Invalidate every non-INVALID peer (SHARED readers; M/E was excluded
-      // above) + queue a preemption notice — same shape as commit().
+      // above). No preemption notice — same shape as commit().
       const stateMap = this.getStateMap(artifactId);
       const invalidatedPeers: string[] = [];
       for (const [peerId, peerState] of stateMap) {
@@ -647,7 +653,6 @@ export class ArtifactRegistry {
           throw new Error(`commitCas: peer ${peerId} in ${peerState} cannot transition to INVALID`);
         }
         this.setAgentStateInternal(artifactId, peerId, peerState, MESIState.INVALID, nowTick, "commit_cas");
-        this.upsertPendingNotice(peerId, artifactId, agentId, nowTick);
         invalidatedPeers.push(peerId);
       }
 
@@ -746,8 +751,21 @@ export class ArtifactRegistry {
    * Idempotent on already-SHARED state. Transitions from MODIFIED or
    * EXCLUSIVE to SHARED are valid per MESI semantics (writer downgrades
    * to reader). Throws on a non-valid transition.
+   *
+   * `observed` (default true) says whether this grant certifies that the
+   * agent now holds the artifact's current bytes. `false` is the pre-bash /
+   * pre-grep re-grant issued alongside a DENIED command, which never ran: the
+   * recorded `last_observed_version` is left as it was — the prior value
+   * kept, a never-observed row still NULL — exactly as on a transition to
+   * INVALID. Mirrors Python `set_agent_state(..., observed=False)`.
    */
-  grantShared(artifactId: string, agentId: string, nowTick: number, _trigger = "grant_shared"): void {
+  grantShared(
+    artifactId: string,
+    agentId: string,
+    nowTick: number,
+    _trigger = "grant_shared",
+    observed = true,
+  ): void {
     if (!this.hasArtifact(artifactId)) {
       throw new Error(`grantShared: artifact ${artifactId} not registered`);
     }
@@ -763,7 +781,15 @@ export class ArtifactRegistry {
           `grantShared: ${agentId} transition ${priorState}→SHARED not allowed`,
         );
       }
-      this.setAgentStateInternal(artifactId, agentId, priorState, MESIState.SHARED, nowTick, _trigger);
+      this.setAgentStateInternal(
+        artifactId,
+        agentId,
+        priorState,
+        MESIState.SHARED,
+        nowTick,
+        _trigger,
+        observed ? undefined : null,
+      );
       this.db.exec("COMMIT");
     } catch (err) {
       try {
@@ -773,6 +799,35 @@ export class ArtifactRegistry {
       }
       throw err;
     }
+  }
+
+  /**
+   * Record that an agent already holding SHARED has read the artifact's
+   * current bytes: advance its `last_observed_version` to the current version
+   * when the recorded value is NULL or below it. Nothing else moves -- not the
+   * state and not the grant tick -- and a row that is not SHARED is left
+   * alone, so an E/M grant is never touched and a revoked (INVALID) one is
+   * never restored.
+   *
+   * A denied pre-bash / pre-grep re-grants SHARED without an observation
+   * (`grantShared(..., observed=false)`), and `grantShared` is a no-op on a
+   * SHARED row. So a retried Bash command, or the Read the session takes
+   * instead, answers fresh and is its first read at this version -- recorded
+   * here, or never. One guarded UPDATE, so the check and the write are a
+   * single statement. Mirrors Python `_record_held_read`
+   * (coordinator_server.py). Returns whether the baseline advanced.
+   */
+  recordObservation(artifactId: string, agentId: string): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE agent_states
+            SET last_observed_version = (SELECT version FROM artifacts WHERE id = ?)
+          WHERE artifact_id = ? AND agent_id = ? AND state = ?
+            AND (last_observed_version IS NULL
+                 OR last_observed_version < (SELECT version FROM artifacts WHERE id = ?))`,
+      )
+      .run(artifactId, artifactId, agentId, MESIState.SHARED, artifactId);
+    return info.changes === 1;
   }
 
   /**
@@ -856,6 +911,9 @@ export class ArtifactRegistry {
    * A transition TO INVALID preserves the prior recorded value (CASE guard
    * on the UPDATEs; NULL on the INSERT) and a never-observed row keeps NULL
    * (never a 0-sentinel). Mirrors Python sqlite_registry.set_agent_state.
+   *
+   * `observedVersion === null` is a grant that certifies no read (Python's
+   * `observed=False`): it takes the same preserving branch as INVALID.
    */
   private setAgentStateInternal(
     artifactId: string,
@@ -864,12 +922,12 @@ export class ArtifactRegistry {
     newState: MESIState,
     nowTick: number,
     _trigger: string,
-    observedVersion?: number,
+    observedVersion?: number | null,
   ): void {
     const newInMe = isWriter(newState);
     const prevInMe = isWriter(priorState);
 
-    const observe = newState !== MESIState.INVALID;
+    const observe = newState !== MESIState.INVALID && observedVersion !== null;
     let observedValue: number | null = null;
     if (observe) {
       if (observedVersion !== undefined) {
@@ -959,8 +1017,21 @@ export class ArtifactRegistry {
   /**
    * UPSERT a preemption notice. PRIMARY KEY (agent_id, artifact_id) means a
    * second preemption on the same (victim, artifact) replaces the prior
-   * notice — latest preempter wins (matches Python sqlite_registry.py:937
-   * `INSERT … ON CONFLICT DO UPDATE WHERE excluded.preempted_at_unix_ts > …`).
+   * notice — latest preempter wins (matches Python's `pop_pending_notices`
+   * sibling in `sqlite_registry.record_preemption_notice`).
+   *
+   * The guard is `>=`, not `>`. Timestamps here are WHOLE SECONDS, so two
+   * preemptions of the same pair inside one second are indistinguishable by
+   * time, and a strict `>` declines the second — leaving the row naming a
+   * session that no longer holds the grant, which is the opposite of the
+   * "latest preempter wins" contract above. `>=` makes it last-write-wins
+   * within a second while still refusing a strictly OLDER timestamp, which
+   * is the only thing the comparison was ever load-bearing for.
+   *
+   * Only a write-grant holder is queued a notice, so this takes a victim that
+   * re-acquires a write grant between two preemptions without draining. A
+   * reader re-grant (the strict-mode `pre_bash`/`pre_grep` re-arm) is queued
+   * nothing and cannot reach it.
    */
   private upsertPendingNotice(
     victimAgentId: string,
@@ -975,7 +1046,7 @@ export class ArtifactRegistry {
          ON CONFLICT(agent_id, artifact_id) DO UPDATE
            SET preempter_agent_id = excluded.preempter_agent_id,
                preempted_at_unix_ts = excluded.preempted_at_unix_ts
-           WHERE excluded.preempted_at_unix_ts > pending_notices.preempted_at_unix_ts`,
+           WHERE excluded.preempted_at_unix_ts >= pending_notices.preempted_at_unix_ts`,
       )
       .run(victimAgentId, artifactId, preempterAgentId, nowUnixTs);
   }
@@ -988,8 +1059,15 @@ export class ArtifactRegistry {
   }> {
     const rows = this.db
       .prepare(
+        // Newest-first. Every capped renderer sorts by this key before
+        // slicing, and Python's `pop_pending_notices` pins the identical
+        // order; without it the SELECT returns `artifact_id` ASCII order,
+        // which is random-UUID order and uncorrelated with preemption time.
+        // Harmless only while callers drain the whole queue -- a bounded
+        // consume would delete a different set than it rendered.
         `SELECT artifact_id, preempter_agent_id, preempted_at_unix_ts
-           FROM pending_notices WHERE agent_id = ?`,
+           FROM pending_notices WHERE agent_id = ?
+           ORDER BY preempted_at_unix_ts DESC, artifact_id DESC`,
       )
       .all(agentId) as {
       artifact_id: string;
@@ -1020,8 +1098,39 @@ export class ArtifactRegistry {
     return this.selectPendingNoticesForAgent(agentId);
   }
 
-  /** Return + drain pending notices for one agent. Used by pre-read/pre-edit hooks. */
-  popPendingNoticesForAgent(agentId: string): Array<{
+  /**
+   * Return pending notices for one agent, newest-first, and DELETE the ones
+   * the caller commits to rendering.
+   *
+   * `consumeLimit` is how many the caller can actually deliver, and it bounds
+   * the DELETE only — the SELECT and the return value stay whole. That
+   * asymmetry is the whole design, and it is Python's
+   * (`sqlite_registry.pop_pending_notices`):
+   *
+   *   - The caller gets the TRUE pending count from data it still holds, so
+   *     its overflow line is arithmetic rather than a guess. A method that
+   *     returned only the consumed slice would make "Plus K more" unknowable
+   *     without a second query.
+   *   - The rows it declines to render stay in the table and surface on that
+   *     agent's next admit hook. Deleting rows a response never showed
+   *     destroys the operator's only record of who preempted them, which is
+   *     exactly how a render-only cap (PR #150) turned DEFERRED into
+   *     DESTROYED.
+   *
+   * Because the returned list is ordered newest-first and the caller's own
+   * cap slices the same list from the front, the set rendered is by
+   * construction the set deleted. Node is the safer side of this than Python
+   * here: Python's renderer re-sorts internally and depends on sort stability
+   * to reproduce the tiebreak, while the Node admit callers never re-sort.
+   *
+   * Omitting `consumeLimit` drains everything, which is the unchanged default
+   * and keeps the bulk DELETE — an IN-list over a large pending set would
+   * bind one variable per row and can exceed SQLITE_LIMIT_VARIABLE_NUMBER.
+   */
+  popPendingNoticesForAgent(
+    agentId: string,
+    consumeLimit?: number,
+  ): Array<{
     artifactId: string;
     preempterAgentId: string;
     preemptedAtUnixTs: number;
@@ -1033,7 +1142,17 @@ export class ArtifactRegistry {
         this.db.exec("COMMIT");
         return [];
       }
-      this.db.prepare(`DELETE FROM pending_notices WHERE agent_id = ?`).run(agentId);
+      const consumed = consumeLimit === undefined ? notices : notices.slice(0, consumeLimit);
+      if (consumeLimit === undefined) {
+        this.db.prepare(`DELETE FROM pending_notices WHERE agent_id = ?`).run(agentId);
+      } else if (consumed.length > 0) {
+        const placeholders = consumed.map(() => "?").join(", ");
+        this.db
+          .prepare(
+            `DELETE FROM pending_notices WHERE agent_id = ? AND artifact_id IN (${placeholders})`,
+          )
+          .run(agentId, ...consumed.map((n) => n.artifactId));
+      }
       this.db.exec("COMMIT");
       return notices;
     } catch (err) {

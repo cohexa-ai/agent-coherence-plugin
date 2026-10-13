@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -56,7 +56,7 @@ async function makeServer() {
         r();
       });
     });
-  return { registry, sessions, post, cleanup };
+  return { registry, sessions, post, cleanup, root: tmp };
 }
 
 // ---------------------------------------------------------------- pre-bash
@@ -277,6 +277,50 @@ test("policy/untrack: response key is `removed`; ignore wins over tracked", asyn
       expected_version: 1,
     });
     assert.deepEqual(cas.body, { ok: true });
+  } finally {
+    await cleanup();
+  }
+});
+
+test("policy/untrack: a policy file that loads as no entries is refused with 400 and left as it was", async () => {
+  // What an earlier unquoted write left behind. An append cannot make it load,
+  // so answering success would report an entry that never takes effect.
+  const { post, cleanup, root } = await makeServer();
+  try {
+    const broken = "- notes.md\n- *.log\n";
+    const yamlPath = join(root, ".coherence", "ignored.yaml");
+    writeFileSync(yamlPath, broken, "utf8");
+    const r = await post("/policy/untrack", { paths: ["secrets.md"] });
+    assert.equal(r.status, 400);
+    assert.match(String(r.body.error), /^\.coherence\/ignored\.yaml is not valid YAML/);
+    assert.equal(readFileSync(yamlPath, "utf8"), broken);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("policy/untrack and /track: a '*'-led glob keeps every earlier entry in force (#178)", async () => {
+  // A plain `- *.log` is a YAML alias, which stops the file parsing and
+  // leaves the loader with no entries while the route still answers success.
+  const { post, cleanup } = await makeServer();
+  const casOnNotes = () =>
+    post("/hooks/post-edit-cas", {
+      session_id: SID_A,
+      path: "notes.md",
+      content_hash: HASH_1,
+      expected_version: 1,
+    });
+  try {
+    await post("/policy/track", { paths: ["notes.md"] });
+    await post("/policy/track", { paths: ["*.txt"] });
+    // Still tracked: unknown-at-commit, not the untracked fast path.
+    assert.deepEqual((await casOnNotes()).body, { ok: true, note: "untracked-at-commit" });
+
+    await post("/policy/untrack", { paths: ["notes.md"] });
+    const r = await post("/policy/untrack", { paths: ["*.log"] });
+    assert.deepEqual(r.body, { ok: true, removed: ["*.log"], rejected: [] });
+    // Still ignored: the earlier untrack of notes.md survives the '*' entry.
+    assert.deepEqual((await casOnNotes()).body, { ok: true });
   } finally {
     await cleanup();
   }

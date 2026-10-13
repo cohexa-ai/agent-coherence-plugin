@@ -33,15 +33,33 @@
  * composite `(session_id, agent_id)` identity from it so subagents are
  * first-class coherence peers; an absent/malformed `agent_id` resolves to the
  * parent identity (except on subagent-stop, which requires a valid one).
+ *
+ * Caller principal (library caller-principal plan, U5): every request presents
+ * the session's principal in the `Coherence-Caller-Principal` header, obtained
+ * once per session and stored under `.coherence/` (see caller_principal.ts).
+ * The Python coordinator requires it on its require-class routes for a
+ * session a client has claimed. A refusal of it (HTTP 400 with a typed
+ * `reason`) is recovered by re-claiming with the SAME stored mint nonce and
+ * retrying the refused request once; if that cannot help, the hook degrades to
+ * `{}` and says why on stderr. This Node coordinator issues none; its pid file
+ * says `backend=node`, so the client does not claim and the request is exactly
+ * what it was before.
  */
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { isValidSubagentId } from "./agent_id.js";
 import {
+  obtainStoredPrincipal,
+  principalHeaders,
+  principalRefusalReason,
+  recoverFromPrincipalRefusal,
+} from "./caller_principal.js";
+import {
+  type CoordinatorEndpoint,
   CoordinatorUnavailable,
   findCoordinatorRoot,
   hashFile,
-  requestJson,
+  requestJsonStatus,
   resolveEndpoint,
 } from "./hook_client_transport.js";
 
@@ -248,6 +266,47 @@ function emitEmpty(): void {
   process.stdout.write("{}\n");
 }
 
+/** One diagnostic line on stderr; stdout and the exit code are unaffected. */
+function report(message: string): void {
+  process.stderr.write(`agent-coherence-hook-client: ${message}\n`);
+}
+
+/**
+ * POST the hook's payload presenting the session's caller principal, and
+ * recover a principal refusal: re-claim with the stored mint nonce (see
+ * recoverFromPrincipalRefusal) and retry ONCE — safe because a refused request
+ * changed nothing. Resolves to the body of a 2xx answer, else null; any other
+ * non-2xx degrades to `{}` exactly as before. Rejects on a transport failure.
+ */
+async function postPresentingPrincipal(
+  endpoint: CoordinatorEndpoint,
+  root: string,
+  route: string,
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown> | null> {
+  const sessionId = String(payload.session_id);
+  const post = (principal: string | null) =>
+    requestJsonStatus(endpoint, "POST", route, payload, principalHeaders(principal));
+  const presented = await obtainStoredPrincipal(endpoint, root, sessionId, report);
+  let answer = await post(presented);
+  const reason = principalRefusalReason(answer);
+  if (reason !== null) {
+    const context = { endpoint, root, sessionId, report };
+    const retry = await recoverFromPrincipalRefusal(context, presented, reason);
+    if (retry !== null) {
+      answer = await post(retry.principal);
+      const again = principalRefusalReason(answer);
+      if (again !== null) {
+        report(
+          `coordinator refused this hook's caller principal again after the re-claim (${again}); ` +
+            "not retrying again",
+        );
+      }
+    }
+  }
+  return answer.status >= 200 && answer.status < 300 ? answer.body : null;
+}
+
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
@@ -314,7 +373,8 @@ export async function runMain(argv: string[]): Promise<number> {
     let response: Record<string, unknown> | null;
     try {
       const payload = buildPayload(sub, cc, rootResolved);
-      response = await requestJson(endpoint, "POST", ENDPOINT_BY_SUBCOMMAND[sub], payload);
+      const route = ENDPOINT_BY_SUBCOMMAND[sub];
+      response = await postPresentingPrincipal(endpoint, rootResolved, route, payload);
     } catch {
       // SkipHook, network error, builder bug — degrade silently.
       emitEmpty();

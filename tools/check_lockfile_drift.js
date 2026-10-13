@@ -28,8 +28,9 @@
  * would block a good release for an unrelated condition at the one moment it
  * cannot be retried — the `refs/tags/v*` ruleset forbids deletion and
  * non-fast-forward, so a failure there spends the version number. It would
- * also enforce a step `docs/RELEASE.md` §2 does not contain and §3 sequences
- * after the tag push. The comparison itself lives in `tools/lockfile_drift.js`
+ * also gate the tag on a forward-merge that §2 and §3 both sequence after the
+ * push to `main` (`forward-merge-main.yml` makes it, once `main` has moved).
+ * The comparison itself lives in `tools/lockfile_drift.js`
  * and imports nothing; `check_release_readiness.js` contributes only the
  * gh-fetching wrapper, because that is where `ghApi` lives.
  *

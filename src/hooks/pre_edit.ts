@@ -22,17 +22,17 @@ import {
   buildCollisionResponse,
   emitStrictDeny,
   nowUnix,
-  preemptionNoticeText,
   type StaleSummary,
 } from "../hook_payloads.js";
 import {
-  type HookDeps,
-  writeJson,
-  writeError,
-  readJsonBody,
-  isValidSessionId,
+  drainNoticeText,
   isValidPath,
+  isValidSessionId,
+  readJsonBody,
   readSubagentId,
+  type HookDeps,
+  writeError,
+  writeJson,
 } from "./_common.js";
 import { deliverPendingReground, writeFastAdmit } from "./reground.js";
 
@@ -88,18 +88,31 @@ export async function handlePreEdit(
   // hash_differs disambiguation is unavailable; a first-time editor (state
   // None) falls through to the normal acquire flow. Fires only after this
   // session has been explicitly preempted.
+  //
+  // A preempted session can also hold SHARED without having read the current
+  // version: a strict Bash / Grep deny re-arms SHARED so the retry it invites
+  // goes through, and records no observation because the command never ran
+  // (applyRegrants in _common.ts). Admitting that grant lets a whole-file
+  // write from the copy read before the peer's commit overwrite the commit
+  // (Cohexa-ai/agent-coherence#275), so it is stale too until a retried
+  // Bash command or a Read records the current version (a retried Grep
+  // records none: it never showed the file). A SHARED holder with no
+  // observation at all has acted on no version and is admitted like a
+  // first-time editor. Mirrors Python pre-edit.
   if (existing !== null && deps.policy.isStrictMode(path)) {
     const editorState = deps.registry.getAgentState(artifactId, agentId);
-    if (existing.version > 0 && editorState === MESIState.INVALID) {
-      const lastWriterSession =
-        existing.last_writer_id !== null
-          ? deps.sessions.agentIdToSessionId(existing.last_writer_id)
-          : null;
+    const observed = deps.registry.lastObservedVersionFor(artifactId, agentId);
+    const unobservedShared =
+      editorState === MESIState.SHARED && observed !== null && observed < existing.version;
+    if (existing.version > 0 && (editorState === MESIState.INVALID || unobservedShared)) {
       const summary: StaleSummary = {
         path,
         current_version: existing.version,
-        prior_version_seen_by_session: existing.version - 1,
-        last_writer_session_id: lastWriterSession ?? "<unknown>",
+        // R8: the observed version, not the inferred one -- see pre_read.ts.
+        prior_version_seen_by_session:
+          observed ?? (existing.version > 0 ? existing.version - 1 : 0),
+        // R7: the registry's handle for the writer, not a recovered session id.
+        last_writer_session_id: existing.last_writer_id ?? "<unknown>",
         last_writer_at_unix_ts: existing.updated_at,
         warning_generated_at_unix_ts: nowUnix(),
         hash_differs: false, // pre-edit doesn't carry content_hash
@@ -117,7 +130,8 @@ export async function handlePreEdit(
   // Collision detection: snapshot exclusive holder BEFORE acquireExclusive
   // (the acquire silently revokes their grant).
   const holder = deps.registry.exclusiveHolder(artifactId, agentId);
-  const holderSessionId = holder !== null ? deps.sessions.agentIdToSessionId(holder.agentId) : null;
+  // R7: name the incumbent by its agent id.
+  const holderSessionId = holder !== null ? holder.agentId : null;
   const holderAcquiredAt = holder?.grantedAtTick ?? null;
 
   // Acquire EXCLUSIVE — invalidates any peers in M/E/S + writes pending
@@ -133,23 +147,9 @@ export async function handlePreEdit(
   }
 
   // Pop any pending notices for THIS session — they accumulated from prior
-  // preemptions before this pre-edit. Merge into the response.
-  const popped = deps.registry.popPendingNoticesForAgent(agentId);
-  const noticeText =
-    popped.length === 0
-      ? null
-      : preemptionNoticeText(
-          popped.map((n) => {
-            const art = deps.registry.getArtifactById(n.artifactId);
-            const preempterSession =
-              deps.sessions.agentIdToSessionId(n.preempterAgentId) ?? "<unknown>";
-            return {
-              artifactPath: art?.name ?? "<unknown-artifact>",
-              preempterSessionShort: preempterSession.slice(0, 8),
-              preemptedAtUnixTs: n.preemptedAtUnixTs,
-            };
-          }),
-        );
+  // preemptions before this pre-edit. Bounded and rendered by the one shared
+  // drain in _common.ts, which deletes only what it renders.
+  const noticeText = drainNoticeText(deps, agentId);
 
   // If we silently preempted someone in M/E, surface a collision warning.
   // Per Python convention: permissionDecision stays "allow" in v0.1.1 warn-only;

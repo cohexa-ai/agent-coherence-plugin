@@ -69,7 +69,9 @@ function claimRegroundContext(
   if (hasSubagentIdField(body)) return null;
   if (!deps.sessions.consumeCompactPending(sessionId)) return null;
   try {
-    return buildSessionStartContext(deps, sessionId).text;
+    // includeNotices=false: this rides an ADMIT response that already drained
+    // and rendered its own notice block. See the parameter's doc.
+    return buildSessionStartContext(deps, sessionId, false).text;
   } catch (err) {
     // Advisory delivery must never break the admit it rides.
     process.stderr.write(

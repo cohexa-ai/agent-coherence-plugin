@@ -50,7 +50,7 @@ test("commitCas WIN: matching version, no peer holder → version+1, committer S
   }
 });
 
-test("commitCas WIN invalidates SHARED peers + queues notices", () => {
+test("commitCas WIN invalidates SHARED peers and queues them no notice", () => {
   const { registry, cleanup } = makeRegistry();
   try {
     const id = registry.resolveOrRegisterArtifact("plan.md", HASH_1);
@@ -60,9 +60,9 @@ test("commitCas WIN invalidates SHARED peers + queues notices", () => {
     if (out.kind !== "win") return;
     assert.deepEqual(out.invalidatedPeers, [AGENT_B]);
     assert.equal(registry.getAgentState(id, AGENT_B), MESIState.INVALID);
-    const notices = registry.popPendingNoticesForAgent(AGENT_B);
-    assert.equal(notices.length, 1);
-    assert.equal(notices[0]!.preempterAgentId, AGENT_A);
+    // A reader held no write grant to lose, so it gets no revoked-grant
+    // notice; its next read is warned stale instead (#163, as in Python).
+    assert.deepEqual(registry.popPendingNoticesForAgent(AGENT_B), []);
   } finally {
     cleanup();
   }

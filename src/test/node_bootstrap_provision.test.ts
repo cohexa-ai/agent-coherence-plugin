@@ -24,6 +24,7 @@ import {
   symlinkSync,
   existsSync,
   readFileSync,
+  renameSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -522,5 +523,404 @@ test('CLI shim resolves the PLUGIN_DATA-provisioned Node CLI on a dist-less pack
   } finally {
     rmSync(root, { recursive: true, force: true });
     cleanup();
+  }
+});
+
+// ------------------------------------------------- npm-failure classification
+
+/**
+ * Drive the bootstrap with a stub `npm` earlier on PATH that fails with a
+ * canned log. The script invokes npm exactly once, so this reaches the
+ * install-failure branch and nothing else.
+ */
+/**
+ * A stub `npm` that models prebuild-install's ACTUAL gating: its
+ * `log.http(status, url)` line is emitted only when the caller raised the log
+ * level (`log.js:14` reads `npm_config_loglevel`, which npm sets from
+ * `--loglevel`). A stub that printed it unconditionally would let the real
+ * script drop `--loglevel=http` and leave every status test green -- which is
+ * exactly the hole this shape closes, since asking for the status is the only
+ * thing the flag buys.
+ */
+function stubNpmScript(npmOutput: string, exitCode = 1): string {
+  return (
+    `#!/usr/bin/env bash\n` +
+    `emit() { cat <<'AC_STUB_LOG'\n${npmOutput}\nAC_STUB_LOG\n}\n` +
+    `case " $* " in\n` +
+    `  *" --loglevel=http "*) emit ;;\n` +
+    `  *) emit | grep -v 'prebuild-install http ' ;;\n` +
+    `esac\n` +
+    `exit ${exitCode}\n`
+  );
+}
+
+function runBootstrapWithFailingNpm(root: string, data: string, ws: string, npmOutput: string) {
+  const stubBin = mkdtempSync(join(tmpdir(), 'provision-npmstub-'));
+  writeFileSync(join(stubBin, 'npm'), stubNpmScript(npmOutput));
+  chmodSync(join(stubBin, 'npm'), 0o755);
+  try {
+    return spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
+      cwd: ws,
+      encoding: 'utf8',
+      timeout: 120000,
+      env: {
+        ...process.env,
+        PATH: `${stubBin}:${process.env.PATH ?? ''}`,
+        CLAUDE_PLUGIN_ROOT: root,
+        CLAUDE_PLUGIN_DATA: data,
+      } as NodeJS.ProcessEnv,
+    });
+  } finally {
+    rmSync(stubBin, { recursive: true, force: true });
+  }
+}
+
+const GYP_TAIL = [
+  'npm error gyp ERR! find Python checking Python explicitly set from NODE_GYP_FORCE_PYTHON',
+  'npm error gyp ERR! find Python - process.env.NODE_GYP_FORCE_PYTHON is "/nonexistent"',
+  'npm error gyp ERR! not ok',
+].join('\n');
+
+test('a successful install is not reported as failed when the filter eats every line', () => {
+  // The pipeline's exit-status contract, isolated. npm exits 0 while `grep -v`
+  // matches nothing and exits 1 -- so under `set -o pipefail` the PIPELINE's
+  // status is 1, and reading `$?` instead of `PIPESTATUS[0]` would turn a
+  // clean install into "npm install failed". Every other stub in this file
+  // exits non-zero, so this inversion is otherwise only covered by accident.
+  //
+  // The script still exits non-zero afterwards, because the stub installs no
+  // real addon and the install-time verification catches that. What this
+  // pins is the reason: the npm step must not be blamed.
+  const root = makeStubRoot({});
+  const { data, ws, cleanup } = makeDirs();
+  const stubBin = mkdtempSync(join(tmpdir(), 'provision-npmstub-'));
+  const onlyFilteredLines = [
+    'npm http cache a@https://registry.npmjs.org/a 3ms (cache hit)',
+    'npm http fetch GET 200 https://registry.npmjs.org/b 7ms',
+  ].join('\n');
+  writeFileSync(join(stubBin, 'npm'), stubNpmScript(onlyFilteredLines, 0));
+  chmodSync(join(stubBin, 'npm'), 0o755);
+  try {
+    const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
+      cwd: ws,
+      encoding: 'utf8',
+      timeout: 120000,
+      env: {
+        ...process.env,
+        PATH: `${stubBin}:${process.env.PATH ?? ''}`,
+        CLAUDE_PLUGIN_ROOT: root,
+        CLAUDE_PLUGIN_DATA: data,
+      } as NodeJS.ProcessEnv,
+    });
+    const err = r.stderr ?? '';
+    assert.doesNotMatch(
+      err,
+      /npm install failed/,
+      'npm exited 0; the filter exiting 1 must not be read as the install failing'
+    );
+    // And no cause line, since there was no npm failure to classify.
+    assert.doesNotMatch(err, /agent-coherence: cause:/);
+  } finally {
+    rmSync(stubBin, { recursive: true, force: true });
+    cleanup();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('registry chatter is filtered from the display but kept for classification', () => {
+  // --loglevel=http is what surfaces the asset fetch's status, and it also
+  // makes npm log one line per package: 148 lines / 16KB warm and 298 / 31KB
+  // cold on this repo's own tree. This script's stdout is a SessionStart
+  // hook's stdout, so unfiltered that lands in the model's context at several
+  // times the 10,000-byte ceiling and would evict the diagnostic it came for.
+  // The filter is on the DISPLAY only; the captured log keeps everything,
+  // which is why the classifier below still sees the 503.
+  const root = makeStubRoot({});
+  const { data, ws, cleanup } = makeDirs();
+  const stubBin = mkdtempSync(join(tmpdir(), 'provision-npmstub-'));
+  const chatter = Array.from(
+    { length: 40 },
+    (_, i) => `npm http cache pkg${i}@https://registry.npmjs.org/pkg${i} 3ms (cache hit)`
+  ).join('\n');
+  writeFileSync(
+    join(stubBin, 'npm'),
+    stubNpmScript(
+      `${chatter}\n` +
+        `npm http fetch GET 200 https://registry.npmjs.org/other 12ms\n` +
+        `npm error prebuild-install http 503 https://github.com/x/a.tar.gz\n` +
+        `npm error prebuild-install warn install No prebuilt binaries found (target=${process.versions.node} runtime=node arch=x64 libc= platform=linux)`
+    )
+  );
+  chmodSync(join(stubBin, 'npm'), 0o755);
+  try {
+    const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
+      cwd: ws,
+      encoding: 'utf8',
+      timeout: 120000,
+      env: {
+        ...process.env,
+        PATH: `${stubBin}:${process.env.PATH ?? ''}`,
+        CLAUDE_PLUGIN_ROOT: root,
+        CLAUDE_PLUGIN_DATA: data,
+      } as NodeJS.ProcessEnv,
+    });
+    const shown = (r.stdout ?? '') + (r.stderr ?? '');
+    assert.doesNotMatch(shown, /npm http cache pkg0@/, 'registry chatter must not reach the display');
+    assert.doesNotMatch(shown, /npm http fetch GET 200/, 'successful registry fetches must not either');
+    // Kept: npm prefixes prebuild-install's lines `npm error `, not `npm http `.
+    assert.match(shown, /prebuild-install http 503/, "prebuild-install's own lines must survive the filter");
+    // And the classifier read the status out of the captured log.
+    assert.match(shown, /server said 503/);
+  } finally {
+    rmSync(stubBin, { recursive: true, force: true });
+    cleanup();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('npm-failure hint says so when it could not capture the output at all', () => {
+  // With TMPDIR pointing at a nonexistent directory, mktemp fails, the log is
+  // never written and every classifier branch is skipped. The message must
+  // say that rather than reporting "no recognised cause in the npm output
+  // above" -- which claims an examination that never happened, the same class
+  // of misdirection the classifier exists to remove.
+  const root = makeStubRoot({});
+  const { data, ws, cleanup } = makeDirs();
+  const stubBin = mkdtempSync(join(tmpdir(), 'provision-npmstub-'));
+  writeFileSync(join(stubBin, 'npm'), `#!/usr/bin/env bash\necho "npm error boom"\nexit 1\n`);
+  chmodSync(join(stubBin, 'npm'), 0o755);
+  try {
+    const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
+      cwd: ws,
+      encoding: 'utf8',
+      timeout: 120000,
+      env: {
+        ...process.env,
+        PATH: `${stubBin}:${process.env.PATH ?? ''}`,
+        TMPDIR: join(ws, 'no', 'such', 'dir'),
+        CLAUDE_PLUGIN_ROOT: root,
+        CLAUDE_PLUGIN_DATA: data,
+      } as NodeJS.ProcessEnv,
+    });
+    assert.equal(r.status, 1, 'a failed install must still exit 1 without a capture');
+    assert.match(r.stderr ?? '', /could not be captured/);
+    assert.doesNotMatch(r.stderr ?? '', /no recognised cause in the npm output above/);
+  } finally {
+    rmSync(stubBin, { recursive: true, force: true });
+    cleanup();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('npm-failure hint DISCRIMINATES a fetch flake from a missing prebuilt', () => {
+  // Both failures end in the SAME node-gyp trace, because better-sqlite3
+  // compiles from source whenever it cannot place a prebuilt binary for any
+  // reason. The old hint asserted the first explanation unconditionally, so
+  // a dropped connection read as "your Node version is unsupported" and sent
+  // the reader to change Node. Observed for real on 2026-09-20 (CI job
+  // "Zero-Python install (Node 24)"), where the only discriminating line was
+  // `prebuild-install warn install read ECONNRESET` and a rerun went green.
+  const cases: Array<{ name: string; npm: string; expect: RegExp; reject: RegExp }> = [
+    {
+      // DEFENSIVE branch: `target=` disagrees with the running major. Stage 0
+      // rejects an unsupported major before the install runs, so this should
+      // be unreachable; the branch exists so a future Stage-0 change cannot
+      // silently turn it into the case below.
+      name: 'target disagrees with the running major (defensive)',
+      npm: `npm error prebuild-install warn install No prebuilt binaries found (target=23.0.0 runtime=node arch=x64 libc= platform=linux)\n${GYP_TAIL}`,
+      expect: /switch Node majors/,
+      reject: /transient: RETRY/,
+    },
+    {
+      // A non-200 that IS worth retrying. prebuild-install collapses every
+      // non-200 into "No prebuilt binaries found" (download.js:56 calls
+      // onerror() with no argument), so without the status this reads as a
+      // possibly-permanent platform gap -- the exact over-claim the status
+      // line exists to remove.
+      name: 'transient 503 on the asset fetch',
+      npm:
+        `npm error prebuild-install http 503 https://github.com/x/releases/download/v1/a.tar.gz\n` +
+        `npm error prebuild-install warn install No prebuilt binaries found ` +
+        `(target=${process.versions.node} runtime=node arch=x64 libc= platform=linux)\n${GYP_TAIL}`,
+      expect: /server said 503\.[\s\S]*transient: RETRY/,
+      reject: /no prebuilt is published/,
+    },
+    {
+      // Not every non-200 is retryable. A corporate proxy or firewall refusing
+      // the release host returns 403, and telling that operator "transient:
+      // RETRY" sends them round a loop that can never succeed. Only 5xx and
+      // 429 are worth retrying.
+      name: '403 — refused, not transient',
+      npm:
+        `npm error prebuild-install http 403 https://github.com/x/releases/download/v1/a.tar.gz\n` +
+        `npm error prebuild-install warn install No prebuilt binaries found ` +
+        `(target=${process.versions.node} runtime=node arch=x64 libc= platform=linux)\n${GYP_TAIL}`,
+      expect: /refused — the server said 403/,
+      reject: /transient: RETRY/,
+    },
+    {
+      // 404 means the asset is not there. NOT stated as permanent: a release
+      // rollout can 404 mid-publish, an unsynced binary-host mirror 404s, and
+      // blocking proxies 404 disallowed hosts.
+      name: '404 — asset not published for this platform',
+      npm:
+        `npm error prebuild-install http 404 https://github.com/x/releases/download/v1/a.tar.gz\n` +
+        `npm error prebuild-install warn install No prebuilt binaries found ` +
+        `(target=${process.versions.node} runtime=node arch=x64 libc= platform=linux)\n${GYP_TAIL}`,
+      expect: /no prebuilt is published for this platform/,
+      reject: /transient: RETRY/,
+    },
+    {
+      // THE REACHABLE ONE, and the reason this whole block was wrong.
+      // `prebuild-install` emits "No prebuilt binaries found" for ANY non-200
+      // response, not just a missing ABI: download.js does
+      // `if (res.statusCode !== 200) return onerror()` with no argument, and
+      // `onerror` falls through to `error.noPrebuilts(opts)`. So a 404 or a
+      // 503 from the release CDN lands here with `target=` equal to the
+      // running major -- which Stage 0 has already guaranteed is supported.
+      // Telling that operator to switch Node majors is impossible advice.
+      name: 'supported major, prebuilt could not be placed',
+      npm:
+        `npm error prebuild-install warn install No prebuilt binaries found ` +
+        `(target=${process.versions.node} runtime=node arch=x64 libc= platform=linux)\n${GYP_TAIL}`,
+      expect: /could not be placed for this platform/,
+      reject: /switch Node majors/,
+    },
+    {
+      // ESTRICTALLOWSCRIPTS is a terminal npm error code, not a warning, so a
+      // log carrying it is that failure whatever prebuild-install logged on
+      // the way. Reachable with more than one native dependency.
+      name: 'allowScripts block wins over a transport warn',
+      npm:
+        `npm error prebuild-install warn install read ECONNRESET\n` +
+        `npm error code ESTRICTALLOWSCRIPTS\nnpm error Cannot run script`,
+      expect: /allowScripts entry/,
+      reject: /transient: RETRY/,
+    },
+    {
+      name: 'transient fetch failure',
+      npm: `npm error prebuild-install warn install read ECONNRESET\n${GYP_TAIL}`,
+      expect: /transient: RETRY/,
+      reject: /retrying will not help/,
+    },
+    {
+      name: 'npm 11 blocked the install script',
+      npm: 'npm error code ESTRICTALLOWSCRIPTS\nnpm error Cannot run script',
+      expect: /allowScripts entry/,
+      reject: /prebuilt binary could not be DOWNLOADED/,
+    },
+    {
+      name: 'unrecognised',
+      npm: 'npm error ENOSPC no space left on device',
+      expect: /no recognised cause/,
+      reject: /cause: /,
+    },
+  ];
+
+  for (const c of cases) {
+    const root = makeStubRoot({});
+    const { data, ws, cleanup } = makeDirs();
+    try {
+      const r = runBootstrapWithFailingNpm(root, data, ws, c.npm);
+      assert.equal(r.status, 1, `${c.name}: a failed install must exit 1`);
+      const err = r.stderr ?? '';
+      assert.match(err, c.expect, `${c.name}: wrong or missing cause line`);
+      assert.doesNotMatch(err, c.reject, `${c.name}: emitted a cause that contradicts the log`);
+      // The remedy is the point of the hint: a reader who acts on the wrong
+      // one either changes Node for nothing or retries forever.
+      assert.match(err, /npm install failed/, `${c.name}: kept the headline`);
+    } finally {
+      cleanup();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+// --- Python-backend hint: offered only while the workspace has no store -----
+//
+// Both refusals used to print `echo python > .coherence/coordinator_backend`
+// unconditionally. On a store the Node coordinator created, the dispatcher
+// honors that file verbatim and the Python coordinator fails closed on the
+// Node ledger, so following the hint left the workspace with no coordinator.
+
+const STORE_PRESENT_HINT =
+  /state\.db exists, so select the Python backend only if the Python coordinator created it: it refuses a store the Node coordinator created, and no tool converts one\./;
+
+/** Runs the bootstrap with the workspace pinned, so printed paths are exact. */
+function runBootstrapIn(root: string, data: string, ws: string, pathPrefix?: string) {
+  return spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
+    cwd: ws,
+    encoding: 'utf8',
+    timeout: 120000,
+    env: {
+      ...process.env,
+      PATH: pathPrefix ? `${pathPrefix}:${process.env.PATH ?? ''}` : process.env.PATH,
+      AGENT_COHERENCE_WORKSPACE: ws,
+      CLAUDE_PLUGIN_ROOT: root,
+      CLAUDE_PLUGIN_DATA: data,
+    } as NodeJS.ProcessEnv,
+  });
+}
+
+function assertPythonBackendHint(stderr: string, ws: string, hadStore: boolean): void {
+  const label = `hadStore=${hadStore}`;
+  if (hadStore) {
+    assert.match(stderr, STORE_PRESENT_HINT, label);
+    assert.doesNotMatch(stderr, /echo python >/, label);
+  } else {
+    assert.ok(
+      stderr.includes(
+        `select the Python backend: mkdir -p '${ws}/.coherence' && echo python > '${ws}/.coherence/coordinator_backend'`,
+      ),
+      `${label}: missing the no-store hint:\n${stderr}`,
+    );
+    assert.doesNotMatch(stderr, STORE_PRESENT_HINT, label);
+  }
+}
+
+test('STAGE 0: an unsupported Node major offers the Python backend only when the workspace has no store', () => {
+  for (const hadStore of [false, true]) {
+    const root = makeStubRoot({});
+    const { data, ws, cleanup } = makeDirs();
+    const stubBin = mkdtempSync(join(tmpdir(), 'provision-nodestub-'));
+    writeFileSync(join(stubBin, 'node'), '#!/usr/bin/env bash\necho v23.11.0\n');
+    chmodSync(join(stubBin, 'node'), 0o755);
+    try {
+      if (hadStore) {
+        mkdirSync(join(ws, '.coherence'), { recursive: true });
+        writeFileSync(join(ws, '.coherence', 'state.db'), '');
+      }
+      const r = runBootstrapIn(root, data, ws, stubBin);
+      assert.equal(r.status, 1, `expected the stage-0 refusal:\n${r.stderr}`);
+      assert.match(r.stderr, /Node v23\.11\.0 is not supported by the Node coordinator/);
+      assertPythonBackendHint(r.stderr, ws, hadStore);
+    } finally {
+      rmSync(stubBin, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+      cleanup();
+    }
+  }
+});
+
+test('a build that emits no coordinator.js offers the Python backend only when the workspace has no store', () => {
+  for (const hadStore of [false, true]) {
+    const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
+    // tsc succeeds but emits dist/not_the_entry.js, so the entry point is missing.
+    renameSync(join(root, 'src', 'coordinator.ts'), join(root, 'src', 'not_the_entry.ts'));
+    const { data, ws, cleanup } = makeDirs();
+    try {
+      if (hadStore) {
+        mkdirSync(join(ws, '.coherence'), { recursive: true });
+        writeFileSync(join(ws, '.coherence', 'state.db'), '');
+      }
+      const r = runBootstrapIn(root, data, ws);
+      assert.equal(r.status, 1, `expected the missing-entry refusal:\n${r.stderr}`);
+      assert.match(r.stderr, /dist\/coordinator\.js missing after provisioning/);
+      assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
+      assertPythonBackendHint(r.stderr, ws, hadStore);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      cleanup();
+    }
   }
 });

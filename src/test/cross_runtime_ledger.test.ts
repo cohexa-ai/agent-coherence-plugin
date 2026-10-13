@@ -130,6 +130,13 @@ test("#55: a Python-v2 db is rejected and NOT migrated (the load-bearing case)",
       (err: unknown) => {
         assert.ok(err instanceof CrossRuntimeSchemaError, "must be CrossRuntimeSchemaError");
         assert.equal((err as CrossRuntimeSchemaError).reason, CROSS_RUNTIME_SCHEMA_REASON);
+        // No conversion exists in either direction, so the text must not send
+        // the operator looking for one; it still forbids deleting the store.
+        const msg = (err as Error).message;
+        assert.match(msg, /set coherence\.coordinator_backend = "python"\. No tool converts a store between backends/);
+        assert.match(msg, /--prepare-for-migration` only drains and stops a running Python coordinator/);
+        assert.doesNotMatch(msg, /supported migration path/);
+        assert.match(msg, /Do NOT delete state\.db/);
         return true;
       },
     );
