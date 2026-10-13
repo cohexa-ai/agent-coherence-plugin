@@ -262,13 +262,17 @@ async function startPythonStatusStub(): Promise<StatusStub> {
       const url = req.url ?? "";
       requests.push({ url, headers: req.headers });
       let answer: [number, string];
+      // Shaped like the real answers: every tier but metrics carries the
+      // artifact and session lists, which the CLI requires.
       if (stub.answer !== null) answer = stub.answer;
-      else if (!url.includes("detail=full")) answer = [200, JSON.stringify({ backend: "python" })];
-      else if (req.headers["coherence-local-operator"] !== "true") {
+      else if (url.includes("detail=metrics")) answer = [200, JSON.stringify({ detail: "metrics" })];
+      else if (!url.includes("detail=full")) {
+        answer = [200, JSON.stringify({ backend: "python", tracked_artifacts: [], sessions: [] })];
+      } else if (req.headers["coherence-local-operator"] !== "true") {
         answer = [403, JSON.stringify({ error: DETAIL_FULL_REFUSAL })];
       } else {
         const session = { agent_name: "claude-session-a", reclaimed: RECLAIMED };
-        answer = [200, JSON.stringify({ backend: "python", sessions: [session] })];
+        answer = [200, JSON.stringify({ backend: "python", tracked_artifacts: [], sessions: [session] })];
       }
       res.writeHead(answer[0], { "Content-Type": "application/json" });
       res.end(answer[1]);
@@ -489,7 +493,8 @@ test("the CLIs wait for a coordinator answer that takes 5.5 s; a hook still give
     req.on("end", () => {
       const url = req.url ?? "";
       requests.push(url);
-      const body = url === "/policy/track" ? { added: ["notes.md"] } : { answered: url };
+      const body =
+        url === "/policy/track" ? { added: ["notes.md"] } : { answered: url, tracked_artifacts: [], sessions: [] };
       const timer = setTimeout(() => {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(body));
@@ -518,7 +523,7 @@ test("the CLIs wait for a coordinator answer that takes 5.5 s; a hook still give
     ]);
 
     assert.equal(status.status, 0, status.stderr);
-    assert.deepEqual(JSON.parse(status.stdout), { answered: "/status" });
+    assert.deepEqual(JSON.parse(status.stdout), { answered: "/status", tracked_artifacts: [], sessions: [] });
     assert.equal(track.status, 0, track.stderr);
     assert.match(track.stdout, /^agent-coherence-track: tracked notes\.md$/m);
     // The hook's request reached the coordinator, so its `{}` is the fail-open
@@ -566,3 +571,276 @@ test("the Node coordinator's default tier publishes the workspace root nowhere",
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+
+// --- 0.6.0: escaped output, strict untrack refusal (#177), degraded /status ---
+
+/** The library's own hostile vector (agent-coherence tests, #245). */
+const HOSTILE = "a\u001b[31m\r\n\u0000\u009b\u202e\u2066\ud800\u3000z";
+/** What Python's escape_nonprintable prints for HOSTILE. */
+const HOSTILE_PRINTED = "a\\x1b[31m\\r\\n\\x00\\x9b\\u202e\\u2066\\ud800\\u3000z";
+/**
+ * True when `text` carries a character the escaping must keep off a terminal:
+ * a control, format, surrogate or separator character, or a space other than
+ * U+0020. The newlines that end each printed line are the CLI's own.
+ */
+function hasRaw(text: string): boolean {
+  return /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}]|[^\P{Zs} ]/u.test(text.replace(/\n/g, ""));
+}
+
+/** The Python coordinator's strict untrack refusal, as library dev sends it. */
+const STRICT_REFUSAL = {
+  ok: false,
+  error:
+    "refusing to untrack paths the coordinator enforces in strict mode: data/a.txt (strict: data/**); " +
+    "remove them from .coherence/strict_mode.yaml and restart the coordinator (untrack_strict_path)",
+  reason: "untrack_strict_path",
+  refused: [{ path: "data/a.txt", strict_patterns: ["data/**"] }],
+  rejected: [],
+};
+const STRICT_RESTART_LINE =
+  "agent-coherence-untrack: nothing was untracked. A strict path stays enforced while the coordinator " +
+  "runs; remove its entry from .coherence/strict_mode.yaml and restart the coordinator to untrack it.";
+
+/** Ported from the library's _UNREADABLE_STRICT_REFUSALS: each reads as a plain HTTP error. */
+const UNREADABLE_STRICT_REFUSALS: ReadonlyArray<[string, Record<string, unknown>]> = [
+  ["refused-absent", {}],
+  ["refused-a-string", {"refused": "data/a.txt"}],
+  ["refused-empty", {"refused": []}],
+  ["entry-a-string", {"refused": ["data/a.txt"]}],
+  ["bare-string-beside-a-good-entry", {"refused": ["data/a.txt", {"path": "data/b.txt", "strict_patterns": ["data/**"]}]}],
+  ["path-a-number", {"refused": [{"path": 5, "strict_patterns": ["data/**"]}]}],
+  ["path-absent", {"refused": [{"strict_patterns": ["data/**"]}]}],
+  ["patterns-a-number", {"refused": [{"path": "data/b.txt", "strict_patterns": 5}]}],
+  ["patterns-a-string", {"refused": [{"path": "data/b.txt", "strict_patterns": "data/**"}]}],
+  ["patterns-empty", {"refused": [{"path": "data/b.txt", "strict_patterns": []}]}],
+  ["patterns-absent", {"refused": [{"path": "data/b.txt"}]}],
+  ["pattern-an-object", {"refused": [{"path": "data/b.txt", "strict_patterns": [{"p": "data/**"}]}]}],
+];
+
+interface CannedCoordinator {
+  root: string;
+  /** [status, body] for each request, by path; JSON-encoded with JSON.stringify. */
+  answers: Map<string, [number, unknown]>;
+  close(): Promise<void>;
+}
+
+/** A coordinator that answers each path with whatever the test sets. */
+async function startCannedCoordinator(): Promise<CannedCoordinator> {
+  const root = mkdtempSync(join(tmpdir(), "cli-canned-"));
+  const answers: CannedCoordinator["answers"] = new Map();
+  const server = createHttpServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      const path = (req.url ?? "").split("?")[0]!;
+      const [status, body] = answers.get(path) ?? [404, { error: `no canned answer for ${path}` }];
+      res.writeHead(status, { "Content-Type": "application/json" });
+      // JSON.stringify writes a lone surrogate as \ud800, as Python does.
+      res.end(JSON.stringify(body));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const port = (server.address() as AddressInfo).port;
+  mkdirSync(join(root, ".coherence"), { recursive: true });
+  writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+  writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
+  return {
+    root,
+    answers,
+    close: async () => {
+      await new Promise<void>((r) => server.close(() => r()));
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+test("untrack: a strict-path refusal exits 3 with one line per refused path, like the Python CLI", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    coord.answers.set("/policy/untrack", [409, STRICT_REFUSAL]);
+    const run = await runCli("cli_untrack.js", ["data/a.txt", "notes.md", "--root", coord.root], coord.root);
+    assert.equal(run.status, 3, run.stderr);
+    assert.equal(run.stdout, "");
+    assert.equal(
+      run.stderr,
+      "agent-coherence-untrack: refused 'data/a.txt': enforced in strict mode by data/**\n" + STRICT_RESTART_LINE + "\n",
+    );
+  } finally {
+    await coord.close();
+  }
+});
+
+test("untrack: the strict refusal is read on any error status, and never by track", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    // Python classifies every HTTP error by the typed reason, not only a 409.
+    coord.answers.set("/policy/untrack", [400, STRICT_REFUSAL]);
+    const untrack = await runCli("cli_untrack.js", ["data/a.txt", "--root", coord.root], coord.root);
+    assert.equal(untrack.status, 3, untrack.stderr);
+
+    // Only untrack refuses a strict path; track reads the same body as an error.
+    coord.answers.set("/policy/track", [409, STRICT_REFUSAL]);
+    const track = await runCli("cli_track.js", ["data/a.txt", "--root", coord.root], coord.root);
+    assert.equal(track.status, 2);
+    assert.match(track.stderr, /^agent-coherence-track: HTTP 409: refusing to untrack paths/m);
+    assert.doesNotMatch(track.stderr, /enforced in strict mode by/);
+  } finally {
+    await coord.close();
+  }
+});
+
+test("untrack: a hostile strict refusal prints its path quoted and every field escaped", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    coord.answers.set("/policy/untrack", [
+      409,
+      { ...STRICT_REFUSAL, refused: [{ path: "p" + HOSTILE, strict_patterns: ["g" + HOSTILE, "data/**"] }] },
+    ]);
+    const run = await runCli("cli_untrack.js", ["data/a.txt", "--root", coord.root], coord.root);
+    assert.equal(run.status, 3, run.stderr);
+    assert.equal(run.stderr.split("\n")[0], "agent-coherence-untrack: refused 'pa\\x1b[31m\\r\\n\\x00\\x9b\\u202e\\u2066\\ud800\\u3000z': enforced in strict mode by ga\\x1b[31m\\r\\n\\x00\\x9b\\u202e\\u2066\\ud800\\u3000z, data/**");
+    assert.equal(hasRaw(run.stderr), false);
+  } finally {
+    await coord.close();
+  }
+});
+
+test("untrack: a strict refusal of the wrong shape is an escaped HTTP error, exit 2", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    for (const [name, shape] of UNREADABLE_STRICT_REFUSALS) {
+      coord.answers.set("/policy/untrack", [
+        409,
+        { ok: false, error: "refusing" + HOSTILE, reason: "untrack_strict_path", rejected: [], ...shape },
+      ]);
+      const run = await runCli("cli_untrack.js", ["data/a.txt", "--root", coord.root], coord.root);
+      assert.equal(run.status, 2, name);
+      assert.equal(run.stdout, "", name);
+      assert.equal(run.stderr, `agent-coherence-untrack: HTTP 409: refusing${HOSTILE_PRINTED}\n`, name);
+    }
+    coord.answers.set("/policy/untrack", [409, { ...STRICT_REFUSAL, reason: "something_else", error: "nope" }]);
+    const other = await runCli("cli_untrack.js", ["data/a.txt", "--root", coord.root], coord.root);
+    assert.equal(other.status, 2);
+    assert.equal(other.stderr, "agent-coherence-untrack: HTTP 409: nope\n");
+  } finally {
+    await coord.close();
+  }
+});
+
+test("every CLI prints a hostile HTTP error on one escaped line", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    const hostile: [number, unknown] = [500, { error: "boom" + HOSTILE }];
+    for (const path of ["/policy/track", "/policy/untrack", "/status"]) coord.answers.set(path, hostile);
+    const runs = {
+      "agent-coherence-track": await runCli("cli_track.js", ["a.md", "--root", coord.root], coord.root),
+      "agent-coherence-untrack": await runCli("cli_untrack.js", ["a.md", "--root", coord.root], coord.root),
+      "agent-coherence-status": await runCli("cli_status.js", ["--root", coord.root], coord.root),
+    };
+    for (const [prog, run] of Object.entries(runs)) {
+      assert.equal(run.status, 2, prog);
+      assert.equal(run.stderr, `${prog}: HTTP 500: boom${HOSTILE_PRINTED}\n`, prog);
+    }
+  } finally {
+    await coord.close();
+  }
+});
+
+test("track and untrack escape every path and reason a coordinator answers with", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    writeFileSync(join(coord.root, "on-disk.md"), "x");
+    coord.answers.set("/policy/track", [
+      200,
+      { ok: true, added: ["on-disk.md", "t" + HOSTILE], rejected: [{ path: "r" + HOSTILE, reason: "why" + HOSTILE }] },
+    ]);
+    const track = await runCli("cli_track.js", ["on-disk.md", "--root", coord.root], coord.root);
+    assert.equal(track.status, 0, track.stderr);
+    assert.equal(
+      track.stdout,
+      `agent-coherence-track: tracked on-disk.md\nagent-coherence-track: tracked t${HOSTILE_PRINTED}\n`,
+    );
+    assert.match(track.stderr, new RegExp(`^agent-coherence-track: rejected 'r${escapeRegExp(HOSTILE_PRINTED)}': why`, "m"));
+    assert.equal(hasRaw(track.stdout + track.stderr), false);
+
+    coord.answers.set("/policy/untrack", [200, { ok: true, removed: ["u" + HOSTILE], rejected: [] }]);
+    const untrack = await runCli("cli_untrack.js", ["a.md", "--root", coord.root], coord.root);
+    assert.equal(untrack.status, 0, untrack.stderr);
+    assert.equal(untrack.stdout, `agent-coherence-untrack: untracked u${HOSTILE_PRINTED}\n`);
+  } finally {
+    await coord.close();
+  }
+});
+
+test("track warns, as the Python CLI does, when a tracked path does not exist on disk yet", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    writeFileSync(join(coord.root, "present.md"), "x");
+    coord.answers.set("/policy/track", [200, { ok: true, added: ["present.md", "later.md"], rejected: [] }]);
+    const run = await runCli("cli_track.js", ["present.md", "later.md", "--root", coord.root], coord.root);
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.stderr, "agent-coherence-track: warning: later.md does not exist on disk yet\n");
+  } finally {
+    await coord.close();
+  }
+});
+
+test("an answer of the wrong shape prints nothing on stdout and exits 2", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    const shapes: Array<[string, Record<string, unknown>]> = [
+      ["added a string", { added: "abc" }],
+      ["added holds an object", { added: [{ x: 1 }] }],
+      ["rejected holds null", { added: [], rejected: [null] }],
+      ["rejected a string", { added: [], rejected: "x" }],
+    ];
+    for (const [name, body] of shapes) {
+      coord.answers.set("/policy/track", [200, body]);
+      const run = await runCli("cli_track.js", ["a.md", "--root", coord.root], coord.root);
+      assert.equal(run.status, 2, name);
+      assert.equal(run.stdout, "", name);
+      assert.equal(run.stderr, "agent-coherence-track: unexpected /policy/track answer shape\n", name);
+    }
+    coord.answers.set("/policy/untrack", [200, { removed: [5] }]);
+    const untrack = await runCli("cli_untrack.js", ["a.md", "--root", coord.root], coord.root);
+    assert.equal(untrack.status, 2);
+    assert.equal(untrack.stderr, "agent-coherence-untrack: unexpected /policy/untrack answer shape\n");
+  } finally {
+    await coord.close();
+  }
+});
+
+test("status: a degraded answer exits 2 and says the registry is busy; the body still prints", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    const degraded = { detail: "minimal", tracked_artifacts: null, sessions: null, degraded: true, policy_summary: {} };
+    coord.answers.set("/status", [200, degraded]);
+    for (const args of [[], ["--detail", "minimal"], ["--detail", "full"]]) {
+      const run = await runCli("cli_status.js", [...args, "--root", coord.root], coord.root);
+      assert.equal(run.status, 2, args.join(" "));
+      assert.equal(
+        run.stderr,
+        "agent-coherence-status: the coordinator's registry is busy (lock contention), so tracked " +
+          "artifacts and sessions are unavailable; try again shortly\n",
+      );
+      assert.equal((JSON.parse(run.stdout) as { degraded: unknown }).degraded, true);
+    }
+
+    // Missing lists without the degraded mark: the shape is wrong, not busy.
+    coord.answers.set("/status", [200, { status: "ok", tracked_artifacts: "x", sessions: [] }]);
+    const shape = await runCli("cli_status.js", ["--root", coord.root], coord.root);
+    assert.equal(shape.status, 2);
+    assert.equal(shape.stderr, "agent-coherence-status: unexpected /status shape\n");
+
+    // The metrics tier carries no lists on either backend, and that is fine.
+    coord.answers.set("/status", [200, { detail: "metrics" }]);
+    const metrics = await runCli("cli_status.js", ["--detail", "metrics", "--root", coord.root], coord.root);
+    assert.equal(metrics.status, 0, metrics.stderr);
+  } finally {
+    await coord.close();
+  }
+});
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

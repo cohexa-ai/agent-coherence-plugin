@@ -15,5 +15,5 @@ server-side rejections).
 If no paths were given, ask the user which workspace-relative path(s) they
 want to track. Don't invoke the CLI without arguments — argparse will error.
 
-Don't second-guess the user's path choices; the policy validator (Unit 3)
-rejects path traversal and absolute paths server-side.
+Don't second-guess the user's path choices; the coordinator's policy
+validator rejects path traversal and absolute paths.

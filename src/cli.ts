@@ -4,18 +4,25 @@
  * (`ccs/cli/coherence_track.py`, `coherence_untrack.py`, `coherence_status.py`).
  *
  * Exit codes (Python parity): 0 success · 1 not-in-git / nothing valid to
- * send · 2 coordinator unavailable or HTTP error. Unlike the hook-client
- * (fail-open, always 0), the CLIs are operator-facing and DO signal failure.
+ * send · 2 coordinator unavailable, HTTP error, or an answer of the wrong
+ * shape (including a /status that carries no artifact or session list, such
+ * as a degraded one) · 3 untrack refused because a path is enforced in strict
+ * mode. Unlike the hook-client (fail-open, always 0), the CLIs are
+ * operator-facing and DO signal failure.
+ *
+ * Every string taken from a coordinator answer is escaped before it is
+ * printed (see cli_output.ts): an answer is not trusted terminal text.
  *
  * Path normalization ($ARGUMENTS-verbatim learning, 2026-05-26): operators
  * paste absolute paths from their shell/IDE; absolute-inside-root is
  * auto-stripped to workspace-relative, absolute-outside-root is rejected —
  * absolute paths must NEVER leak into tracked.yaml / ignored.yaml.
  */
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { existsSync } from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { escapeNonprintable, httpErrorLine, pyRepr } from "./cli_output.js";
 import {
   CLI_REQUEST_TIMEOUT_MS,
-  CoordinatorUnavailable,
   findCoordinatorRoot,
   requestJsonStatus,
   resolveEndpoint,
@@ -119,8 +126,121 @@ function flagValue(argv: string[], flag: string): string | null {
   return idx !== -1 ? (argv[idx + 1] ?? null) : null;
 }
 
+type PolicyProg = "agent-coherence-track" | "agent-coherence-untrack";
+type Answer = { status: number; body: Record<string, unknown> | null };
+
+/** The reason a coordinator gives when it refuses to untrack a strict path. */
+const UNTRACK_STRICT_PATH_REASON = "untrack_strict_path";
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRefusedEntry(entry: unknown): entry is { path: string; strict_patterns: string[] } {
+  if (!isPlainObject(entry) || typeof entry.path !== "string") return false;
+  const patterns = entry.strict_patterns;
+  return Array.isArray(patterns) && patterns.length > 0 && patterns.every((p) => typeof p === "string");
+}
+
+/**
+ * The refused entries of a strict untrack refusal, or null for any other
+ * body. Mirrors the Python CLI: classified by the typed reason, never by the
+ * error text, and only when every entry names its path and its strict
+ * patterns. Anything else reads as the HTTP error it is.
+ */
+function strictRefusalEntries(
+  body: Record<string, unknown> | null,
+): Array<{ path: string; strict_patterns: string[] }> | null {
+  if (body === null || body.reason !== UNTRACK_STRICT_PATH_REASON) return null;
+  const refused = body.refused;
+  if (!Array.isArray(refused) || refused.length === 0 || !refused.every(isRefusedEntry)) return null;
+  return refused;
+}
+
+function reportStrictRefusal(entries: Array<{ path: string; strict_patterns: string[] }>): void {
+  for (const entry of entries) {
+    const named = entry.strict_patterns.map(escapeNonprintable).join(", ");
+    err(`agent-coherence-untrack: refused ${pyRepr(entry.path)}: enforced in strict mode by ${named}`);
+  }
+  err(
+    "agent-coherence-untrack: nothing was untracked. A strict path stays enforced while the " +
+      "coordinator runs; remove its entry from .coherence/strict_mode.yaml and restart the " +
+      "coordinator to untrack it.",
+  );
+}
+
+/** The paths an answer applied and the entries it rejected, or null when either has the wrong type. */
+function readPolicyAnswer(
+  payload: Record<string, unknown>,
+  resultKey: "added" | "removed",
+): { applied: string[]; rejected: Array<Record<string, unknown>> } | null {
+  // Checked before anything prints: a string iterates as its characters and
+  // an object as its keys, each of which would print as a path.
+  const applied = payload[resultKey] ?? [];
+  const rejected = payload.rejected ?? [];
+  if (!Array.isArray(applied) || !applied.every((p) => typeof p === "string")) return null;
+  if (!Array.isArray(rejected) || !rejected.every(isPlainObject)) return null;
+  return { applied, rejected };
+}
+
+function rejectedPath(entry: Record<string, unknown>): string {
+  const path = entry.path ?? "";
+  return typeof path === "string" ? pyRepr(path) : escapeNonprintable(path);
+}
+
+async function postPolicy(
+  prog: PolicyProg,
+  endpointPath: "/policy/track" | "/policy/untrack",
+  root: string,
+  paths: string[],
+): Promise<Answer | null> {
+  try {
+    const endpoint = resolveEndpoint(resolve(root));
+    return await requestJsonStatus(endpoint, "POST", endpointPath, { paths }, undefined, CLI_REQUEST_TIMEOUT_MS);
+  } catch (exc) {
+    err(`${prog}: ${escapeNonprintable((exc as Error).message)}`);
+    return null;
+  }
+}
+
+/**
+ * Exit code for a non-2xx answer. A refusal's `error` says what is wrong and
+ * how to fix it (a policy file that will not load, the byte cap), so it is
+ * printed in the Python CLI's `HTTP <status>: <error>` form. An untrack that
+ * a coordinator refused because a path is enforced in strict mode exits 3,
+ * classified on any error status, as the Python CLI does.
+ */
+function reportRefusal(prog: PolicyProg, answer: Answer): number {
+  const refused = prog === "agent-coherence-untrack" && answer.status >= 400 ? strictRefusalEntries(answer.body) : null;
+  if (refused !== null) {
+    reportStrictRefusal(refused);
+    return 3;
+  }
+  err(`${prog}: ${httpErrorLine(answer.status, answer.body)}`);
+  return 2;
+}
+
+function printApplied(prog: PolicyProg, verb: "tracked" | "untracked", root: string, applied: string[]): void {
+  for (const p of applied) {
+    out(`${prog}: ${verb} ${escapeNonprintable(p)}`);
+    // Operationally fine (the path is seeded on its first Read), but worth
+    // surfacing, as the Python CLI does. A lookup that fails reads as present.
+    if (verb === "tracked" && !existsQuietly(join(root, p))) {
+      err(`${prog}: warning: ${escapeNonprintable(p)} does not exist on disk yet`);
+    }
+  }
+}
+
+function existsQuietly(path: string): boolean {
+  try {
+    return existsSync(path);
+  } catch {
+    return true;
+  }
+}
+
 async function runPolicyMutation(
-  prog: "agent-coherence-track" | "agent-coherence-untrack",
+  prog: PolicyProg,
   endpointPath: "/policy/track" | "/policy/untrack",
   resultKey: "added" | "removed",
   verb: "tracked" | "untracked",
@@ -146,52 +266,28 @@ async function runPolicyMutation(
     else valid.push(normalized);
   }
   if (valid.length === 0) {
-    for (const [p, reason] of invalid) err(`${prog}: rejected '${p}': ${reason}`);
+    for (const [p, reason] of invalid) err(`${prog}: rejected ${pyRepr(p)}: ${reason}`);
     return 1;
   }
 
-  let answer: { status: number; body: Record<string, unknown> | null };
-  try {
-    const endpoint = resolveEndpoint(resolve(root));
-    answer = await requestJsonStatus(
-      endpoint,
-      "POST",
-      endpointPath,
-      { paths: valid },
-      undefined,
-      CLI_REQUEST_TIMEOUT_MS,
-    );
-  } catch (exc) {
-    if (exc instanceof CoordinatorUnavailable) {
-      err(`${prog}: ${exc.message}`);
-      return 2;
-    }
-    err(`${prog}: ${(exc as Error).message}`);
-    return 2;
-  }
-  // A refusal's `error` says what is wrong and how to fix it (a policy file
-  // that will not load, the byte cap); print it in the Python CLI's
-  // `HTTP <status>: <error>` form. Without a string `error`, print the status.
-  if (answer.status < 200 || answer.status >= 300) {
-    const error = answer.body?.error;
-    err(typeof error === "string" ? `${prog}: HTTP ${answer.status}: ${error}` : `${prog}: HTTP ${answer.status}`);
-    return 2;
-  }
-  const payload = answer.body;
-  if (payload === null) {
+  const answer = await postPolicy(prog, endpointPath, root, valid);
+  if (answer === null) return 2;
+  if (answer.status < 200 || answer.status >= 300) return reportRefusal(prog, answer);
+  if (answer.body === null) {
     err(`${prog}: coordinator returned a non-JSON response`);
     return 2;
   }
-
-  const applied = Array.isArray(payload[resultKey]) ? (payload[resultKey] as string[]) : [];
-  const rejected = Array.isArray(payload.rejected)
-    ? (payload.rejected as Array<Record<string, unknown>>)
-    : [];
-  for (const p of applied) out(`${prog}: ${verb} ${p}`);
-  for (const entry of rejected) {
-    err(`${prog}: rejected ${String(entry.path ?? "")}: ${String(entry.reason ?? "")}`);
+  const result = readPolicyAnswer(answer.body, resultKey);
+  if (result === null) {
+    err(`${prog}: unexpected ${endpointPath} answer shape`);
+    return 2;
   }
-  for (const [p, reason] of invalid) err(`${prog}: rejected '${p}': ${reason}`);
+
+  printApplied(prog, verb, root, result.applied);
+  for (const entry of result.rejected) {
+    err(`${prog}: rejected ${rejectedPath(entry)}: ${escapeNonprintable(entry.reason ?? "")}`);
+  }
+  for (const [p, reason] of invalid) err(`${prog}: rejected ${pyRepr(p)}: ${reason}`);
   return 0;
 }
 
@@ -233,18 +329,13 @@ export async function runStatus(argv: string[]): Promise<number> {
     const extra = detail === "full" ? { "Coherence-Local-Operator": "true" } : undefined;
     answer = await requestJsonStatus(endpoint, "GET", path, undefined, extra, CLI_REQUEST_TIMEOUT_MS);
   } catch (exc) {
-    err(`agent-coherence-status: ${(exc as Error).message}`);
+    err(`agent-coherence-status: ${escapeNonprintable((exc as Error).message)}`);
     return 2;
   }
   // Same `HTTP <status>: <error>` form as track/untrack and the Python CLI:
   // the Node coordinator's 501 for ?detail=full says why, and so does a 403.
   if (answer.status < 200 || answer.status >= 300) {
-    const error = answer.body?.error;
-    err(
-      typeof error === "string"
-        ? `agent-coherence-status: HTTP ${answer.status}: ${error}`
-        : `agent-coherence-status: HTTP ${answer.status}`,
-    );
+    err(`agent-coherence-status: ${httpErrorLine(answer.status, answer.body)}`);
     return 2;
   }
   if (answer.body === null) {
@@ -252,5 +343,22 @@ export async function runStatus(argv: string[]): Promise<number> {
     return 2;
   }
   out(JSON.stringify(answer.body, null, 2));
+  // The metrics tier carries no lists. Any other tier without them cannot say
+  // what is tracked, which is never "nothing tracked": a coordinator that could
+  // not read its registry in time answers with both set to null and
+  // `degraded: true`. The body still prints, for the operator who asked for it.
+  if (detail !== "metrics" && listsUnavailable(answer.body)) {
+    err(answer.body.degraded === true ? DEGRADED_LINE : SHAPE_LINE);
+    return 2;
+  }
   return 0;
+}
+
+const SHAPE_LINE = "agent-coherence-status: unexpected /status shape";
+const DEGRADED_LINE =
+  "agent-coherence-status: the coordinator's registry is busy (lock contention), " +
+  "so tracked artifacts and sessions are unavailable; try again shortly";
+
+function listsUnavailable(body: Record<string, unknown>): boolean {
+  return !Array.isArray(body.tracked_artifacts) || !Array.isArray(body.sessions);
 }
