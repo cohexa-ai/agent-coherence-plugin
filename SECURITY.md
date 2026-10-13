@@ -55,8 +55,8 @@ machine.
   loopback namespace. v0.1.1 does not address this; tracked for v0.2.
 - **Cross-host coordination.** The plugin coordinates state across parallel
   Claude Code sessions on the **same** workstation. Cross-machine and cross-
-  vendor (e.g. Cursor + Claude Code) coverage is the hosted MCP roadmap
-  (Path B), not this plugin.
+  vendor (e.g. Cursor + Claude Code) coordination is out of scope for this
+  plugin.
 - **Compromise of the underlying Claude Code binary.** The plugin layers on
   top of `claude` v2.1.131+; if the binary itself is malicious, no plugin
   layer recovers the trust boundary.
@@ -66,12 +66,12 @@ machine.
 | Property | Value |
 |---|---|
 | Bind address | `127.0.0.1` (loopback only; locked invariant per `src/auth.ts`) |
-| Outbound destinations | **None.** The plugin makes zero outbound HTTP requests in v0.1.1. |
+| Outbound destinations | The coordinator, hooks and CLIs make none. The one exception is installing dependencies. On the first session, and again after an upgrade that changes the Node backend's dependencies, `bin/ensure-coordinator-node` runs `npm install` from the plugin's lockfile. That fetches the locked packages from your configured npm registry (registry.npmjs.org by default) and `better-sqlite3`'s prebuilt binary from GitHub. Those requests carry what any `npm install` sends, and nothing about your workspace or files. |
 | Listener exposure | Loopback only; no external listener; no port forwarding |
 | IPv6 | Not supported in v0.1.1 (`bind_host` is `127.0.0.1`; tracked for v0.2) |
 
-If you observe any outbound network request originating from the plugin or
-the spawned coordinator in v0.1.1, that's a bug — please report it via the
+Apart from that install, if you observe any outbound network request
+originating from the plugin or the spawned coordinator, that's a bug — please report it via the
 channel below.
 
 ## Auth
@@ -82,7 +82,7 @@ channel below.
 | Token comparison | Constant-time via `crypto.timingSafeEqual` (Node) and `hmac.compare_digest` (Python coordinator) — never `===` (which short-circuits and leaks token prefix via response timing) | `src/auth.ts:verifyBearer` |
 | Host-header allowlist | Only `localhost` and `127.0.0.1` accepted; defeats DNS rebinding from non-loopback origins | `src/auth.ts:verifyHost` |
 | Token rotation | Stop all coordinator processes, `rm <repo>/.coherence/hook.secret`, next hook re-spawn regenerates. Hot rotation deferred to v0.2. | README "Troubleshooting" |
-| Empty-file recovery | If `hook.secret` exists but is empty/malformed (previous instance crashed mid-write), bounded `O_EXCL` retry rather than `O_TRUNC` re-write (avoids clobbering a concurrent racer's valid secret); fail-closed after N attempts | `src/auth.ts:ensureSecret`, KTD-K |
+| Empty-file recovery | If `hook.secret` exists but is empty/malformed (previous instance crashed mid-write), bounded `O_EXCL` retry rather than `O_TRUNC` re-write (avoids clobbering a concurrent racer's valid secret); fail-closed after N attempts | `src/auth.ts:ensureSecret` |
 
 Both Python and Node coordinator backends read the same `hook.secret` file;
 switching `coherence.coordinator_backend` does **not** rotate the secret.
@@ -99,7 +99,7 @@ The coordinator's state directory is `<repo>/.coherence/`. Contents:
 | `tracked.yaml` | User-committed opt-in patterns | default | Gitignore-style globs |
 | `ignored.yaml` | User-committed opt-out patterns | default | Gitignore-style globs |
 
-**Content-hash-only invariant (KTD-13)**: `state.db` stores SHA-256 content
+**Content-hash-only invariant**: `state.db` stores SHA-256 content
 hashes, never file bytes. A read attacker who exfiltrates `state.db` learns
 *which* tracked artifacts changed at which timestamps, but not the contents
 of those artifacts. This is by design — coordination state is metadata, not
@@ -121,7 +121,7 @@ apply across team checkouts).
 - **Runtime dependencies** (per `package.json` v0.1.1):
   - `better-sqlite3` — SQLite-WAL bindings
   - `js-yaml` — `tracked.yaml` / `ignored.yaml` parser
-  - `uuid` — session ID generation
+  - `uuid` — derives the coordinator's agent id, a one-way uuid v5 hash, from the session id Claude Code supplies (plus the subagent id for a subagent). The plugin never generates session ids.
 - **Dev dependencies**: `typescript`, `@types/node`, `@types/better-sqlite3`,
   `@types/js-yaml`, `@types/uuid`.
 

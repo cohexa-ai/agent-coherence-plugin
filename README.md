@@ -15,7 +15,7 @@ CLAUDE.md is your project's prose contract — what to track, what to escalate, 
 
 `agent-coherence` exists because that failure shape is structural — CLAUDE.md tool restrictions don't propagate to subagents, context compaction weakens rule adherence, and multi-session coordination has no platform-level synchronization primitive. Anthropic has confirmed this twice on the record: the official position is that **[hooks are the deterministic-behavior seam](#how-it-works)**, and CLAUDE.md / `.claudeignore` are guidance, not constraints. This plugin lives in that seam.
 
-The design bias: surface stale state to the agent itself via `additionalContext`, let the agent decide. The agent reads the warning alongside the file and almost always re-reads before acting. The 2026-05-18 launch gate measured **100% re-read-or-acknowledged rate across N=80 trials**, zero ignored.
+The design bias: surface stale state to the agent itself via `additionalContext`, let the agent decide. The agent reads the warning alongside the file and almost always re-reads before acting. A 2026-05-18 pre-launch evaluation measured **100% re-read-or-acknowledged rate across N=80 trials**, zero ignored.
 
 ## What it does
 
@@ -25,9 +25,9 @@ Watches tracked artifacts (CLAUDE.md, AGENTS.md, `DECISIONS.md`, `docs/specs/`, 
 - Multi-terminal (multiple `claude` processes in the same workspace) ✓
 - Task-tool subagents (each subagent is a first-class coherence peer via a composite `(session_id, agent_id)` identity — sibling subagents editing the same artifact collide, and a subagent's write is attributed to the subagent, not the parent; see [Subagents and composite identity](#subagents-and-composite-identity)) ✓
 
-Verified against `claude` v2.1.131 (2026-05-17 via internal Phase E.0 probe). The `claude agents` subcommand on v2.1.131 is a management UI, not a session spawner — out of coverage scope.
+Verified against `claude` v2.1.131 (2026-05-17). The `claude agents` subcommand on v2.1.131 is a management UI, not a session spawner — out of coverage scope.
 
-When one session is about to act on an artifact another session has updated, the plugin injects a warning into the agent's own context via `additionalContext`. The warning's stale-read line looks like this:
+When a session reads an artifact that changed since it last read it (usually because another session committed an edit), the plugin injects a warning into the agent's own context via `additionalContext`. A Read gets the stale-read line. A Bash command that reads the file, or a Grep whose search covers it, gets a similar warning that lists the stale paths. An Edit or Write gets no stale-read line. In warn mode it goes through, with a concurrent-edit warning only while another session is still in the turn in which it edited the same file. In [strict mode](#strict-mode) it is denied. The stale-read line looks like this:
 
 > ⚠ Stale read [warning emitted `2026-05-23T13:42:19.114000+00:00`]: `docs/plans/feature-x.md` was updated by agent `90b1dfd3` at `2026-05-23T13:42:18.402000+00:00`. Current version is v2; you previously saw v1. … Consider re-reading `docs/plans/feature-x.md` before acting on stale assumptions.
 
@@ -54,13 +54,15 @@ claude
 > (B's session commits the edit; coordinator invalidates A's cached view)
 
 # Back to Terminal 1 (session A)
-> Now implement the first step you summarized earlier.
+> Re-open docs/plans/feature-x.md and implement its first step.
 
-# Agent A receives a stale-read warning in its own context:
+# A's Read of the plan carries a stale-read warning in its own context:
 #   ⚠ Stale read [warning emitted <ts>]: docs/plans/feature-x.md was updated by <B> at <ts>. …
 #   Consider re-reading docs/plans/feature-x.md before acting on stale assumptions.
-# Agent A re-reads the file first, sees the new v2 step, and revises its plan.
+# Agent A works from the new v2 step instead of its earlier summary.
 ```
+
+The warning fires on A's next read of the plan, whether through the Read tool or through a Bash or Grep command that reaches the file. If A edits the plan without reading it, warn mode lets the edit through with no stale-read line and strict mode denies it. If A works only from what it remembers and never touches the file, nothing fires.
 
 To watch the warning fire live (it's invisible by default — it goes into the agent's context, not your terminal):
 
@@ -83,7 +85,7 @@ Everything below is a **library console script** installed by `pip install "agen
 | Library console script | What it does | When to use |
 |---|---|---|
 | `agent-coherence-coordinator` | Spawn / inspect the lazy-spawned local HTTP coordinator | Manual recovery; `--prepare-for-migration` drains and stops a running Python coordinator (it does not convert the store to the other backend) |
-| `agent-coherence-status` | CLI form of `/agent-coherence:status`. With no `--detail`, or with `--detail minimal`, which the slash command passes so that the Python console script fallback prints the same view, it prints the default tier: no session names and no absolute paths. `--detail metrics` works on both backends. `--detail full` sends the `Coherence-Local-Operator: true` opt-in header and returns the operator-tier fields, including, with `agent-coherence` releases after 0.14.1, which paths the crash-recovery sweep reclaimed from each session; it works against the Python coordinator only (the plugin's built-in Node coordinator answers 501 for it). **`--self-test` is Python-only** | Dashboard scraping (`--detail metrics`); seeing which grants the sweep reclaimed (`--detail full`, Python backend); post-install validation (`--self-test`, Python backend) |
+| `agent-coherence-status` | CLI form of `/agent-coherence:status`. With `--detail minimal`, which the slash command passes, or with no `--detail`, it prints the default tier. The exception is the library's own script in `agent-coherence` 0.14.1 or earlier, which defaults to `--detail full`. Against the Node coordinator, or a Python coordinator from `agent-coherence` releases after 0.14.1, the default tier has no session names and no absolute paths. The 0.14.1 Python coordinator includes both; see [PRIVACY.md](PRIVACY.md). `--detail metrics` works on both backends. `--detail full` sends the `Coherence-Local-Operator: true` opt-in header and returns the operator-tier fields, including, with `agent-coherence` releases after 0.14.1, which paths the crash-recovery sweep reclaimed from each session; it works against the Python coordinator only (the plugin's built-in Node coordinator answers 501 for it). **`--self-test` is Python-only** | Dashboard scraping (`--detail metrics`); seeing which grants the sweep reclaimed (`--detail full`, Python backend); post-install validation (`--self-test`, Python backend) |
 | `agent-coherence-hook-client` | Subprocess called by the plugin's command-type hooks | Internal — not for direct invocation |
 | `agent-coherence-migrate-rules` | Scan CLAUDE.md for prose tool-class rules; propose + optionally `--apply` `permissions.deny` entries | First-pass migration of `"use rg, not grep"`-style rules to enforceable policy |
 | `agent-coherence-migrate-deny` *(library v0.8.2+)* | Stricter sibling: STDOUT-only, symlink-contained, never invokes an LLM, never writes settings.json | Security-sensitive workspaces; CI-driven migration where auto-apply is not acceptable |
@@ -100,9 +102,15 @@ agent-coherence-status --self-test
 
 Runs a four-step pre-read → pre-edit → post-edit → stale-pre-read sequence against a live coordinator. Exit 0 on pass; non-zero with an actionable diagnostic on fail.
 
-> **`--self-test` requires the Python backend** (it ships in the `agent-coherence` library). The bundled Node CLI does not implement it and, as of v0.3.1, **rejects the flag with exit 2** rather than silently printing ordinary status — before v0.3.1 it exited 0, which looked like a passing self-test that never ran. On a default (Node) workspace, verify the install instead by opening two sessions per [Quick example](#quick-example), or by running `agent-coherence-status` and confirming the coordinator answers.
+> **`--self-test` requires the Python backend** (it ships in the `agent-coherence` library). The bundled Node CLI does not implement it and, as of v0.3.1, **rejects the flag with exit 2** rather than silently printing ordinary status — before v0.3.1 it exited 0, which looked like a passing self-test that never ran. On a default (Node) workspace, verify the install instead by opening two sessions per [Quick example](#quick-example), or by running `agent-coherence-status` and confirming the coordinator answers. On a Python workspace, run the library's console script by its install path, for example `.venv/bin/agent-coherence-status --self-test`. Inside Claude Code, the plugin's own `agent-coherence-status` shim runs the Node CLI whenever `node` is on PATH.
 
-First-time experience: on your first Read of a tracked file in a workspace, you'll see no behavior change — the coordinator records the artifact in SQLite and grants your session a SHARED MESI state. The plugin only surfaces warnings when a *peer* session commits a change you haven't seen yet. Easiest way to test end-to-end: open two terminals in the same repo (sections [Quick example](#quick-example) above).
+First-time experience: on your first Read of a tracked file in a workspace, you'll see no behavior change — the coordinator records the artifact in SQLite and grants your session a SHARED MESI state. After that, warnings appear in three cases:
+
+- your session reads a tracked file that changed since it last read it, usually because a *peer* session committed a change;
+- you edit a file that another session is still editing in its current turn;
+- your session reads a file it edited itself in an earlier turn. At the end of every turn the plugin releases the session's grant on each file it edited, committed edits included, so the session's first read of such a file in a later turn is reported stale. With `agent-coherence` 0.14.1 or earlier on the Python backend, that warning names your own session as the writer. In strict mode, both that read and an Edit of the file are denied until the session recovers as described in [Strict mode](#strict-mode).
+
+Easiest way to test end-to-end: open two terminals in the same repo (sections [Quick example](#quick-example) above).
 
 ## Install
 
@@ -144,10 +152,38 @@ After install, restart any running `claude` sessions in your workspace so the ne
 > default) works against `>=0.8.0`. Compaction-aware re-grounding on the
 > Python backend requires `agent-coherence>=0.14.0` — on an older library the
 > `SessionStart` hook fails open and the feature is simply absent (every other
-> behavior is unchanged). The bundled Node backend ships it natively. The Python
-> backend's stale-read line and strict-mode deny text match the Node backend's only
-> from `agent-coherence>0.14.1`; 0.14.1 and earlier word them differently, for
-> example naming the writer by session rather than by agent id. Release page:
+> behavior is unchanged). The bundled Node backend ships it natively.
+>
+> A few Python-backend behaviors need an `agent-coherence` release **after 0.14.1**.
+> This plugin works against 0.14.1; with 0.14.1 or earlier, these differ:
+>
+> - **Caller principal.** The plugin's hook client claims a caller principal for
+>   each session (`POST /principal/claim`) and sends it on every hook in the
+>   `Coherence-Caller-Principal` header. Once a session holds one, the coordinator
+>   refuses a request for that session that carries the wrong principal, and one
+>   that carries none on the routes where an unbound caller could do harm (edits,
+>   commits and session stop among them). Only a coordinator from a release after
+>   0.14.1 issues principals. Against 0.14.1 or earlier the claim is answered 404
+>   and each hook goes out without the header, as plugin 0.5.0 sent it: hooks,
+>   strict mode and the CLIs behave as before, at the cost of one extra local
+>   request per hook. The Node backend issues no principals, and the client does
+>   not ask it for one. See [Configuration](#configuration) for the files it
+>   writes and [Known limitations](#known-limitations) for what it does not cover.
+> - **Wording.** The stale-read line and strict-mode deny text match the Node
+>   backend's only after 0.14.1. 0.14.1 and earlier word them differently, for
+>   example naming the writer by session rather than by agent id.
+> - **`/agent-coherence:status`.** After 0.14.1 its default tier carries no
+>   session names and no absolute paths. With 0.14.1 or earlier it still lists
+>   each session as `claude-session-<session id>` and shows the absolute
+>   workspace root.
+> - **Untracking a strict path.** After 0.14.1 the coordinator refuses it and
+>   `agent-coherence-untrack` exits 3. 0.14.1 and earlier untrack it, and the
+>   path leaves strict mode.
+>
+> Upgrading the library later needs no plugin change. Plugin 0.5.0 also keeps
+> working against a later library, but its hook client never claims a
+> principal, so its sessions get no principal protection; use plugin 0.6.0 or
+> later with it. Release page:
 > [Cohexa-ai/agent-coherence](https://github.com/Cohexa-ai/agent-coherence/releases).
 
 ### Other targets (Cursor, Codex, Copilot, etc.)
@@ -157,7 +193,7 @@ After install, restart any running `claude` sessions in your workspace so the ne
 ### Scope
 
 - macOS / Linux / WSL2 — native Windows deferred (`fcntl` constraint, see [Known limitations](#known-limitations) below).
-- Single workspace, single-user, single-host workstation — not for shared developer machines, CI runners with multiple developers, or cross-host coordination. Cross-machine and cross-vendor coverage is the hosted MCP roadmap (Path B), not this plugin.
+- Single workspace, single-user, single-host workstation — not for shared developer machines, CI runners with multiple developers, or cross-host coordination. Cross-machine and cross-vendor coordination is out of scope for this plugin.
 
 ## Strict mode
 
@@ -175,10 +211,10 @@ For operators who want a hard guardrail (typically: CI / multi-developer setups 
 What happens when a strict + tracked artifact is read stale:
 
 - The PreToolUse hook returns `{"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "Stale read denied: ..."}}`.
-- The model receives the deny + a static reason text. Per Phase 0 H1 falsification, the reason is byte-identical across retries (varied text actually *worsens* opus, which reads it as a prompt-injection pattern).
-- The model exits its bounded retry loop (typically 2-5 attempts per Phase 0) and surfaces the deny to the operator.
-- The agent's MESI state stays INVALID — retries see the same deny until the operator intervenes (re-reads via the Read tool to take a fresh SHARED grant).
-- An `Edit` or `Write` of a strict file the session has not read since a peer's commit is denied the same way. That includes a session whose Bash or Grep read of the file was just denied: the deny lets the retry run, but until a retried Bash command or a `Read` reads the current version, the session cannot write the file (a retried Grep does not count, because it lists files rather than showing them).
+- The model receives the deny + a static reason text. The reason is byte-identical across retries: in pre-release testing, varying it made Opus worse, because it read the variation as a prompt-injection pattern.
+- The model exits its bounded retry loop (typically 2-5 attempts in testing) and surfaces the deny to the operator.
+- A Read never clears the deny. Every retried Read is denied again, because a denied Read leaves the session's grant on the file revoked. What clears it is a Bash command that reads the file (for example `cat docs/plans/feature-x.md`), or a Grep whose search covers it. That command is denied once, and the same command run again is allowed; after that, Reads of the file are allowed. This is the same on both backends, including `agent-coherence` 0.14.1. The deny text itself still tells the agent to re-read with the Read tool; see [Known limitations](#known-limitations).
+- An `Edit` or `Write` of a strict file the session has not read since a peer's commit is denied the same way. That includes a session whose Bash or Grep read of the file was just denied: the deny lets the retry run, but until a retried Bash command or a `Read` reads the current version, the session cannot write the file (a retried Grep does not count, because it lists files rather than showing them). With `agent-coherence` 0.14.1 or earlier on the Python backend, the denied Bash or Grep command alone is enough for the session to write the file.
 
 **Strict mode is operator opt-in per artifact. Never global.** A literal `**` in `strict_mode_paths` triggers a startup warning (the coordinator counts matching tracked artifacts; default threshold is 50). The plugin will never silently lock down a workspace.
 
@@ -196,7 +232,7 @@ A Claude Code subagent (spawned via the Task tool) runs under its **parent's** `
 
 - **Sibling collision** — two subagents of the same parent editing the same tracked artifact now collide (previously a silent lost update).
 - **Attribution** — a subagent's commit is credited to the subagent in a peer's stale-read warning. Only the Python backend's `/status` shows the subagent as `claude-session-<sid>:subagent-<aid>`, keeping the parent linkage visible: at the operator tier (`?detail=full` with the `Coherence-Local-Operator: true` header), and with `agent-coherence` 0.13.0 through 0.14.1 at the default tier too (earlier releases have no subagent identity). The Node backend's `/status` reports every session's `agent_name` as `null`.
-- **Scoped release** — the `SubagentStop` hook releases *only* that subagent's uncommitted grants (never the parent's). A stop payload with an absent `agent_id` is a normal parent stop; a present-but-malformed one is refused (no-op), never a parent-scoped release.
+- **Scoped release** — the `SubagentStop` hook releases *only* that subagent's write grants, never the parent's. That means every EXCLUSIVE or MODIFIED grant it holds, including on files it edited and committed, so its next read of such a file is reported stale. A stop payload with an absent `agent_id` is a normal parent stop; a present-but-malformed one is refused (no-op), never a parent-scoped release.
 
 This is **additive and fail-open**: if a hook payload carries no `agent_id`, the identity resolves to the parent exactly as before — nothing regresses for main-thread or single-session work. It is enforced identically on both coordinator backends.
 
@@ -215,12 +251,15 @@ The coordinator creates `.coherence/` at your repo root automatically. Inside it
 | `ignored.yaml` | Your opt-out patterns. Same. | Operator's choice |
 | `strict_mode.yaml` *(library v0.8.2+)* | Per-artifact strict-mode opt-in. Same shape. Same intersection semantics with `tracked_paths`. | Operator's choice |
 | `audit.log` *(library v0.8.2+)* | Append-only JSONL of strict-mode denial events. Mode `0600`. Denials only — no command bodies, no user content. | ✓ |
+| `caller-principal-<id>.nonce`, `caller-principal-<id>.principal` | Written by the plugin's Node hook client on a workspace the Python coordinator serves: one claim nonce per session and, with `agent-coherence` releases after 0.14.1, the caller principal the coordinator bound to that session. Mode `0600`. Not removed automatically. | ✓ |
+
+`/agent-coherence:track` and `/agent-coherence:untrack` add one double-quoted entry per line to `tracked.yaml` or `ignored.yaml`. In some cases they write nothing and print `HTTP 400:` with the file name and how to rewrite it: the file does not load as a plain list, or a new line would change what it loads as (a `[ ... ]` list, an indented list, a `...` end marker). On the Python backend this needs `agent-coherence` releases after 0.14.1. Version 0.14.1 and earlier write entries unquoted, so tracking or untracking a pattern that starts with `*`, such as `*.log`, leaves the whole file loading as no entries. Plugin releases 0.3.0 to 0.5.0 did the same on the Node backend; see [Known limitations](#known-limitations) to check a file they wrote.
 
 **Note on `allowedHttpHookUrls`**: hooks are *command-type* (the `agent-coherence-hook-client` subprocess makes the HTTP call internally), not Claude Code's HTTP-type hooks. The `allowedHttpHookUrls` Claude Code policy does NOT apply to this plugin — no allowlist changes are required to install.
 
 ## How it works
 
-A lazy-spawned local HTTP coordinator at the parent repo root (`<repo>/.coherence/`) wraps a SQLite-WAL state store implementing the MESI cache-coherence protocol. Plugin hooks are **command-type** (not HTTP-type — Claude Code v2.1.131's hooks.json schema validator rejects URLs containing env-var templates at load time, per internal Phase E.0 probe 2A); each hook invokes the `bin/hook-client` shim (Node client preferred, Python `agent-coherence-hook-client` fallback) which reads `.coherence/server.pid` for the port + `.coherence/hook.secret` for the bearer token, then POSTs the hook payload to the coordinator. PreToolUse fires for every `Read`, `Edit`, `Write`, `Bash`, `Grep`; PostToolUse commits writes and triggers peer invalidations; Stop releases any uncommitted EXCLUSIVE grants at end-of-turn; SubagentStop releases a stopped subagent's own grants (see [subagent identity](#subagents-and-composite-identity)). All HTTP traffic is `127.0.0.1`-bound. Coordinator idle-shuts after 15 minutes; SQLite state rehydrates on next spawn.
+A lazy-spawned local HTTP coordinator at the parent repo root (`<repo>/.coherence/`) wraps a SQLite-WAL state store implementing the MESI cache-coherence protocol. Plugin hooks are **command-type** (not HTTP-type — Claude Code v2.1.131's hooks.json schema validator rejects URLs containing env-var templates at load time); each hook invokes the `bin/hook-client` shim (Node client preferred, Python `agent-coherence-hook-client` fallback) which reads `.coherence/server.pid` for the port + `.coherence/hook.secret` for the bearer token, then POSTs the hook payload to the coordinator. On a workspace the Python coordinator serves, the Node hook client also claims a caller principal for the session once, and sends it with every hook. PreToolUse fires for every `Read`, `Edit`, `Write`, `Bash`, `Grep`; PostToolUse commits writes and triggers peer invalidations; At end of turn, Stop releases every EXCLUSIVE or MODIFIED grant the session holds, including the grant on a file it edited and committed during the turn, and leaves its read (SHARED) grants alone; SubagentStop does the same for a stopped subagent's own grants (see [subagent identity](#subagents-and-composite-identity)). All HTTP traffic is `127.0.0.1`-bound. Coordinator idle-shuts after 15 minutes; SQLite state rehydrates on next spawn.
 
 ## Architecture
 
@@ -249,7 +288,7 @@ On a workspace that already has a `state.db`, choose the backend that created it
 
 The env var takes precedence; an unknown value falls back to `python`. (This file — not a Claude Code plugin setting — is the selection mechanism; the Node zero-Python guarantee is scoped to the platforms with a prebuilt `better-sqlite3` for the pinned Node ABI range. That range is **Node 22, 24, or 25** (`engines.node` = `^22.0.0 || ^24.0.0 || ^25.0.0`): `better-sqlite3` 12.10.0 dropped its Node 20 prebuilts — Node 20 reached end-of-life 2026-04-30 — and never ships them for odd pre-25 majors, so on any other major the bootstrap **refuses up front** rather than fall back to node-gyp, which would need Python and a C++ toolchain. On those majors the plugin runs on the Python backend — a fresh workspace falls back to it automatically, with a stderr note saying why.)
 
-Both backends speak the same HTTP wire contract; the [`tests/protocol_corpus/`](https://github.com/Cohexa-ai/agent-coherence/tree/main/tests/protocol_corpus) suite in the library repo catches drift. Neither backend reads the other's `state.db`, so a workspace stays on the backend that created its store. The canonical design lives in the library's `docs/plans/` directory.
+Both backends speak the same HTTP wire contract; the [`tests/protocol_corpus/`](https://github.com/Cohexa-ai/agent-coherence/tree/main/tests/protocol_corpus) suite in the library repo catches drift. Neither backend reads the other's `state.db`, so a workspace stays on the backend that created its store. The library's [guide](https://github.com/Cohexa-ai/agent-coherence/blob/main/docs/guide.md) describes the design.
 
 ## Local development
 
@@ -291,11 +330,11 @@ pytest -m protocol_corpus
 | Agents still hit stale-spec collisions silently | `pip install agent-coherence` step missed, or `agent-coherence-hook-client` not on PATH | Confirm `which agent-coherence-coordinator agent-coherence-hook-client` both resolve. If `pip install` succeeded but binaries aren't found, check that your shell's PATH includes the install prefix's `bin/` (e.g. `~/.local/bin` for user installs). |
 | Plugin load failure / silent no-op | Coordinator backend not installed | Run `claude --include-hook-events --output-format stream-json "echo test"` and look for `plugin_errors` in the init event. If `hook-load-failed` appears, the plugin's hooks.json references commands not on PATH. |
 | Stale-warning shown when worktrees just have different branches checked out | Filesystem-state semantics: divergent content on first observation surfaces as `hash_differs` | Expected behavior. Add the path to `ignored.yaml` if the divergence is intentional. |
-| Frequent acquire/release events in `agent-coherence-status` | Per-turn Stop-hook release of uncommitted grants. Normal end-of-turn behavior. | No action. Telemetry counter `intra_task_acquire_release_total` quantifies. |
+| Frequent acquire/release events in `agent-coherence-status` | Per-turn Stop-hook release of every write grant the session holds: EXCLUSIVE, or MODIFIED after a committed edit. Normal end-of-turn behavior. | No action. On the Python backend, the `intra_task_acquire_release_total` counter in `--detail metrics` counts committed edits. The Node coordinator's metrics tier carries no counters yet. |
 | `state.db` corrupted | Power loss during WAL checkpoint, or SQLite version mismatch | Back up `.coherence/state.db` first — as of the durable-retention schema (issue #55) it holds retained version content, and in a mixed Python/Node workspace the sibling coordinator's live coordination state. Only if the file is genuinely unreadable, remove it to let the next spawn start fresh (this loses retained content); never remove it to "reset" a healthy store. |
 | Coordinator process won't die | Stale `server.pid` after crash | `rm .coherence/server.pid` to clear the lock; next hook fires re-spawn |
 | `hook.secret` compromised | Same-user attack or accidental leak | Stop all sessions, `rm .coherence/hook.secret` (the next spawn re-mints it), restart Claude Code. Remove only the secret — `rm -rf .coherence/` also destroys `state.db`'s retained content + live coordination state. v0.2.x will support hot rotation without restart. |
-| *(v0.2 strict mode)* agent keeps retrying after strict deny | Expected. The model exits the retry loop after 2-5 attempts per Phase 0 finding. | No action — the deny IS the signal. The operator sees the deny in the transcript and can decide how to proceed. |
+| *(v0.2 strict mode)* agent keeps retrying after strict deny | Expected. The model typically stops retrying after 2-5 attempts. | No action — the deny IS the signal. The operator sees the deny in the transcript and can decide how to proceed. |
 | *(v0.2 strict mode)* `agent-coherence-migrate-deny` exits with "NOT a descendant" | Symlink-containment check refused: the CLAUDE.md / AGENTS.md canonical path escapes the workspace root | Verify with `realpath CLAUDE.md`. If the symlink is intentional and points inside the workspace, the canonical-path check still rejects — the helper is intentionally strict. Use `agent-coherence-migrate-rules` for the looser flow. |
 | Bash permission prompt fires every time a plugin slash command runs (e.g., `/agent-coherence:status`) | Claude Code does not currently allow plugins to ship a default `permissions.allow` for their own bundled binaries — only `agent` and `subagentStatusLine` keys are supported in plugin-root `settings.json` per the [plugins-reference](https://code.claude.com/docs/en/plugins-reference). Tracked upstream. | Add the allowlist to your workspace `.claude/settings.local.json` once per workspace — see § Allowlisting the plugin's bundled binaries below. |
 
@@ -321,7 +360,7 @@ If your `.claude/settings.local.json` already exists, merge the `permissions.all
 
 If your team wants the same allowlist committed for everyone, put the block in `.claude/settings.json` (workspace-shared, version-controlled) instead. Same shape, different file.
 
-The plugin-shipped path requires a Claude Code platform change — tracked in [anthropics/claude-code#62616](https://github.com/anthropics/claude-code/issues/62616) (filed 2026-05-26 per the Phase E broad-beta monitoring window).
+The plugin-shipped path requires a Claude Code platform change — tracked in [anthropics/claude-code#62616](https://github.com/anthropics/claude-code/issues/62616) (filed 2026-05-26).
 
 ## Known limitations
 
@@ -333,17 +372,21 @@ The plugin-shipped path requires a Claude Code platform change — tracked in [a
 | Bypass class: interpreters not in detector list | `ruby -e`, `node -e`, `perl -pe < file` can read tracked-strict artifacts | Operator-supplied `permissions.deny` rule per language. The `bash_path_detector` is intentionally curated; obfuscated bypass is documented as out-of-scope. |
 | Bypass class: shell-redirect reads | `tee /dev/null < tracked.md` reads the file but isn't a `cat tracked.md` invocation | **NOT closed by `permissions.deny`** (no platform syntax for shell-redirect file arguments). Terminal limitation. |
 | Bypass class: diff-as-reader | `diff /dev/null tracked.md` reads the file content | Adding `diff`/`cmp` to `bash_path_detector` list is on the v0.2.x backlog. |
-| HTTP-type hooks not viable on v2.1.131 (internal Phase E.0 probe 2A) | hooks.json URL templating fails strict-URL schema validation at load time | v0.2 ships command-type hooks via `agent-coherence-hook-client` — works on v2.1.131. If a future Claude Code version supports URL templating, an HTTP-type variant can be added as a perf optimization. |
+| HTTP-type hooks not viable on v2.1.131 | hooks.json URL templating fails strict-URL schema validation at load time | v0.2 ships command-type hooks via `agent-coherence-hook-client` — works on v2.1.131. If a future Claude Code version supports URL templating, an HTTP-type variant can be added as a perf optimization. |
 | `claude agents` subcommand not in coverage scope | The v2.1.131 subcommand is a management UI, not a session spawner; no PreToolUse hooks to capture | Use Agent View, multi-terminal, or Task-tool subagents (all in scope). |
 | Single-user, single-host workstation only | Trust boundary is the OS user; `hook.secret` mode 0600 is the load-bearing fence | Not suitable for shared developer machines, CI runners with multiple developers, or cross-host coordination. |
+| The caller principal does not separate local processes | Its files sit in `.coherence/`, which any process running as your OS user can read | It lets the Python coordinator refuse a client that never claimed the session or presents the wrong principal; it does not tell two processes of the same user apart. Same trust boundary as `hook.secret`. |
+| Untracking a strict path on the Node backend ends its strict mode | The Node coordinator does not yet refuse an untrack entry that covers a path `.coherence/strict_mode.yaml` enforces: it writes the entry to `ignored.yaml`, and an ignored path is not enforced | To keep a path strict, do not untrack it. A Python coordinator from an `agent-coherence` release after 0.14.1 refuses the untrack, and `agent-coherence-untrack` exits 3. Tracked in [#177](https://github.com/Cohexa-ai/agent-coherence-plugin/issues/177). |
+| A strict-mode deny tells the agent to re-read with the Read tool, which cannot clear it | The deny text says to re-read the file via the Read tool and that retrying the same operation is denied again. A denied Read leaves the grant revoked, so every retried Read is denied, while a retried Bash read is allowed (see [Strict mode](#strict-mode)) | When an agent stops on a strict deny, tell it to read the file with a Bash command such as `cat` and run that command again. Tracked in [Cohexa-ai/agent-coherence#242](https://github.com/Cohexa-ai/agent-coherence/issues/242). |
+| A policy file an earlier release broke loads as no entries | Plugin releases 0.3.0 to 0.5.0, and `agent-coherence` 0.14.1 and earlier, wrote a pattern that starts with `*` unquoted (`- *.md`). That line is not valid YAML, so at start-up the whole file loads as no entries, with no error on `/status`. A strict path whose tracked glob was lost that way is no longer enforced | After upgrading, open `.coherence/tracked.yaml` and `ignored.yaml` and quote any entry that starts with `*` (`- "*.md"`). Track and untrack now refuse such a file with `HTTP 400` and say how to rewrite it. Tracked in [#192](https://github.com/Cohexa-ai/agent-coherence-plugin/issues/192). |
 | Compaction re-grounding: one residual duplicate | A mid-loop deferred delivery is later followed by the platform re-rendering the compaction attachment at the next user turn; the two sightings can differ if state moved between them | The staler rendering is the later one — the payload's closing line ("a more recent read supersedes this notice") and event-anchored wording make the duplicate benign. |
 | Compaction re-grounding: first compaction after upgrade can't flag staleness | The last-observed comparand starts NULL for rows recorded before the upgrade, and never-observed rows are deliberately never flagged | Staleness detection becomes accurate as sessions read/commit after the upgrade. Not a bug — the alternative (flagging never-observed rows) would false-alarm on every untouched artifact. |
 | Compaction re-grounding: fail-open loss on a cold coordinator | If the coordinator is down or still starting at the compact boundary, the SessionStart hook emits `{}` and that compaction's re-grounding is lost on both paths | Rare mid-session (the coordinator is warm); matches the plugin's universal fail-open contract — coordination never blocks the session. |
-| Cross-backend parity is the hook envelope, not every surface | `protocol_corpus` runs 24 of its 31 fixtures against both backends and pins the seven POST hook surfaces — the decision envelope (`permissionDecision`, `permissionDecisionReason`, `status`) and the SessionStart re-grounding prose. Three surfaces sit outside it: `GET /status` and `GET /health` have **no** cross-backend fixture and differ by design (`/health` is Node-only), and preemption-notice prose shares no byte-identical line between the two renderers, although both send a notice to the same sessions (only those that lost an EXCLUSIVE or MODIFIED grant) | Read `/status` as backend-specific — parse it defensively and do not port a consumer between backends without re-checking. Notice prose is model-facing context, not a machine contract, so the wording divergence is cosmetic there. Background in [#138](https://github.com/Cohexa-ai/agent-coherence-plugin/issues/138). |
+| Cross-backend parity is the hook envelope, not every surface | `protocol_corpus` pins the seven POST hook surfaces on both backends — the decision envelope (`permissionDecision`, `permissionDecisionReason`, `status`) and the SessionStart re-grounding prose. Three surfaces sit outside it: `GET /status` and `GET /health` have **no** cross-backend fixture and differ by design (`/health` is Node-only), and preemption-notice prose shares no byte-identical line between the two renderers, although both send a notice to the same sessions (only those that lost an EXCLUSIVE or MODIFIED grant) | Read `/status` as backend-specific — parse it defensively and do not port a consumer between backends without re-checking. Notice prose is model-facing context, not a machine contract, so the wording divergence is cosmetic there. Background in [#138](https://github.com/Cohexa-ai/agent-coherence-plugin/issues/138). |
 
 ### Resolved in v0.2–v0.3
 
-- **Strict mode** (`permissionDecision: "deny"`) per Phase 0 H4 routing-confirmation. Per-artifact opt-in via `.coherence/strict_mode.yaml`. Multi-tool surface (Read / Edit / Write / Bash / Grep) prevents the model from routing around denied Read via `bash cat plan.md`.
+- **Strict mode** (`permissionDecision: "deny"`). Per-artifact opt-in via `.coherence/strict_mode.yaml`. Multi-tool surface (Read / Edit / Write / Bash / Grep) prevents the model from routing around denied Read via `bash cat plan.md`.
 - **`TERMINAL_DENIAL_CLASSES` structural invariant** — code paths emitting `permissionDecision: "allow"` route through a single `emit_allow` helper that refuses to convert strict-mode denials. Parameterized integration test + AST-based meta-test guard against future regression.
 - **`agent-coherence-migrate-deny` CLI** — STDOUT-only, symlink-contained sibling to v0.1.1's `agent-coherence-migrate-rules`.
 - **Strict-mode telemetry** — `strict_mode_denials_total`, `strict_mode_routed_around_via_bash_total`, `audit_log_mode_drift_total` counters in `/status?detail=metrics`. Minimal denial-only `.coherence/audit.log` JSONL surface.
@@ -353,7 +396,7 @@ The plugin-shipped path requires a Claude Code platform change — tracked in [a
 
 ### Do I need to opt every file into strict mode?
 
-No. Strict mode is per-artifact opt-in via `.coherence/strict_mode.yaml`. Most operators leave it empty — warn mode (the default for every tracked artifact) measured 100% re-read-or-acknowledged in the N=80 launch gate. Strict mode is for the small set of artifacts where the cost of a silent stale-edit is unacceptable.
+No. Strict mode is per-artifact opt-in via `.coherence/strict_mode.yaml`. Most operators leave it empty — warn mode (the default for every tracked artifact) measured 100% re-read-or-acknowledged in the N=80 pre-launch evaluation. Strict mode is for the small set of artifacts where the cost of a silent stale-edit is unacceptable.
 
 ### Does it phone home?
 
