@@ -66,7 +66,7 @@ machine.
 | Property | Value |
 |---|---|
 | Bind address | `127.0.0.1` (loopback only; locked invariant per `src/auth.ts`) |
-| Outbound destinations | The coordinator, hooks and CLIs make none. The one exception is installing dependencies. On the first session, and again after an upgrade that changes the Node backend's dependencies, `bin/ensure-coordinator-node` runs `npm install` from the plugin's lockfile. That fetches the locked packages from your configured npm registry (registry.npmjs.org by default) and `better-sqlite3`'s prebuilt binary from GitHub. Those requests carry what any `npm install` sends, and nothing about your workspace or files. |
+| Outbound destinations | The coordinator, hooks and CLIs make none. The one exception is installing dependencies. On the first session, after every plugin upgrade, after you switch to a different Node major version, and whenever the installed native module fails to load (for example on the session after an interrupted install), `bin/ensure-coordinator-node` runs `npm install` from the plugin's lockfile. That fetches the locked packages from your configured npm registry (registry.npmjs.org by default) and `better-sqlite3`'s prebuilt binary from GitHub. Those requests carry what any `npm install` sends, and nothing about your workspace or files. |
 | Listener exposure | Loopback only; no external listener; no port forwarding |
 | IPv6 | Not supported in v0.1.1 (`bind_host` is `127.0.0.1`; tracked for v0.2) |
 
