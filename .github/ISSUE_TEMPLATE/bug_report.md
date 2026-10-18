@@ -36,7 +36,7 @@ Please paste the output of:
 agent-coherence-status --detail metrics
 ```
 
-This is the `?detail=metrics` tier of `/status` — safe to paste (no absolute paths, no PIDs, no session identifiers). If you'd rather not share counters, the `--detail minimal` tier is even more conservative.
+This is the `?detail=metrics` tier of `/status`. It is safe to paste: it has no paths, no process id and no session identifiers, on either backend. If you'd rather not share counters, leave this section out. `--detail minimal` is not more conservative: it is the default tier, which adds your tracked files' paths and a row per session, plus the coordinator's process id on the Python backend. With `agent-coherence` 0.14.1 or earlier it also carries the absolute workspace root and raw session ids.
 
 If the bug involves a stale-read warning, paste the output of:
 

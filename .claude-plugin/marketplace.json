@@ -11,7 +11,7 @@
       "name": "agent-coherence",
       "source": "./",
       "description": "Coherence for the prose subset of project rules that can't be expressed as policy. CLAUDE.md rules about state — 'plan.md is v3 now', 'session B just edited the file you're about to write' — can't be expressed as permissions.deny. This plugin surfaces those state changes across parallel Claude Code sessions sharing the same workspace via warnings injected into the agent's own context. Warn-mode by default; v0.2 adds per-artifact strict-mode opt-in (permissionDecision:deny on stale reads). Single-user single-host workstation; macOS/Linux/WSL2.",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "author": {
         "name": "Vlad Parakhin",
         "email": "vlad@agent-coherence.dev",
