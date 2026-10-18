@@ -21,4 +21,4 @@ coordinator does not refuse yet: on a Node workspace, untracking a strict
 path also takes it out of strict mode.
 
 If no paths were given, ask the user which workspace-relative path(s) they
-want to untrack. Don't invoke the CLI without arguments — argparse will error.
+want to untrack. Don't invoke the CLI without arguments: the bundled Node CLI exits 1 with no output, and the Python console script exits 2 with a usage error.
