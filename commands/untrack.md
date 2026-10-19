@@ -18,8 +18,9 @@ next step the message names (remove the entry from
 `.coherence/strict_mode.yaml`, then restart the coordinator, which the
 README's Strict mode section describes). An entry the coordinator could not
 finish checking is refused the same way, naming strict patterns it may not
-cover: when the request held several long or `*`-heavy entries, retry them in
-smaller requests before suggesting the strict-mode step.
+cover. Before suggesting the strict-mode step for a long or `*`-heavy entry,
+retry such entries in smaller requests and give each a more literal path (for
+example `src/...` rather than `**/...`).
 Do not edit those files, stop the coordinator, or delete
 `.coherence/server.pid` yourself unless the user asks you to. The bundled
 Node coordinator refuses this way, and so does a Python coordinator from an
