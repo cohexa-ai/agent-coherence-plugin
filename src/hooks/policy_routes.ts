@@ -13,16 +13,70 @@
  *    for one it cannot; see `appendPolicyYaml`)
  *  - track   → `{ok:true, added:[…], rejected:[{path,reason},…]}`
  *  - untrack → `{ok:true, removed:[…], rejected:[…]}` (key is `removed`)
+ *  - untrack of an entry (path or glob) covering a path the live policy holds
+ *    in strict mode → 409 `{ok:false, error, reason:"untrack_strict_path",
+ *    refused:[{path, strict_patterns}], rejected}`, and the whole request
+ *    writes nothing (Cohexa-ai/agent-coherence#261). Clients classify by
+ *    `reason`; `error` is prose.
  *
  * After a successful append the policy is atomically swapped via
- * `PolicyRef.reload()` — the Python `coordinator.policy = load(root)`
+ * `PolicyRef.reload()` — the Python `coordinator.policy = policy.reloaded()`
  * equivalent; live handlers see the new policy immediately (Unit 1's
- * stale-by-reference guard).
+ * stale-by-reference guard), and a reload never drops a live strict pattern.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
-import { appendPolicyYaml, MAX_POLICY_PATHS_PER_REQUEST } from "../policy.js";
+import { appendPolicyYaml, MAX_POLICY_PATHS_PER_REQUEST, validatePolicyPath } from "../policy.js";
 import { type HookDeps, writeJson, writeError, readJsonBody } from "./_common.js";
+
+/** The reason `/policy/untrack` answers when it refuses to untrack a strict path. */
+export const UNTRACK_STRICT_PATH_REASON = "untrack_strict_path";
+
+interface RefusedEntry {
+  path: string;
+  strict_patterns: string[];
+}
+
+function untrackStrictError(refused: ReadonlyArray<RefusedEntry>): string {
+  const named = refused.map((r) => `${r.path} (strict: ${r.strict_patterns.join(", ")})`).join("; ");
+  return (
+    `refusing to untrack paths the coordinator enforces in strict mode: ${named}. ` +
+    "A strict path stays enforced while the coordinator runs; to untrack it, " +
+    "remove its entry from .coherence/strict_mode.yaml and restart the " +
+    `coordinator (${UNTRACK_STRICT_PATH_REASON})`
+  );
+}
+
+/**
+ * Answer 409 and return true when an entry covers a strict path (#261).
+ * Untracking a strict path put it on the untracked fast path, where a CAS
+ * commit at any expected version is accepted: a silent lost update. Strict
+ * wins over ignore in the policy anyway, so the refusal is what tells the
+ * operator the entry would not take effect. The check and the append that
+ * follows run in one synchronous handler, so no reload can land between them.
+ */
+function refuseStrictUntrack(paths: ReadonlyArray<string>, res: ServerResponse, deps: HookDeps): boolean {
+  const safe: string[] = [];
+  const rejected: Array<{ path: string; reason: string }> = [];
+  for (const path of paths) {
+    const reason = validatePolicyPath(path);
+    if (reason === null) safe.push(path);
+    else rejected.push({ path, reason });
+  }
+  const coverage = deps.policy.get().strictPatternsCoveringEach(safe);
+  const refused: RefusedEntry[] = safe.flatMap((path, i) =>
+    coverage[i]!.length > 0 ? [{ path, strict_patterns: coverage[i]! }] : [],
+  );
+  if (refused.length === 0) return false;
+  writeJson(res, 409, {
+    ok: false,
+    error: untrackStrictError(refused),
+    reason: UNTRACK_STRICT_PATH_REASON,
+    refused,
+    rejected,
+  });
+  return true;
+}
 
 interface PolicyBody {
   paths?: unknown;
@@ -44,6 +98,7 @@ function handlePolicyMutation(
     writeError(res, 400, `max ${MAX_POLICY_PATHS_PER_REQUEST} paths per request`);
     return;
   }
+  if (yamlFileName === "ignored.yaml" && refuseStrictUntrack(paths, res, deps)) return;
 
   const root = deps.policy.get().coordinatorRoot;
   const yamlPath = join(root, ".coherence", yamlFileName);
@@ -56,7 +111,7 @@ function handlePolicyMutation(
     return;
   }
 
-  // Atomic policy swap — Python's `coordinator.policy = TrackedArtifactPolicy.load(root)`.
+  // Atomic policy swap — Python's `coordinator.policy = coordinator.policy.reloaded()`.
   deps.policy.reload();
 
   writeJson(res, 200, {

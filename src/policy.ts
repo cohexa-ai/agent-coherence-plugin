@@ -16,11 +16,20 @@
  * happen via `/policy/track` + `/policy/untrack` endpoints landing in
  * Unit 3 / Unit 6); this module is read-only at the registry layer for now.
  *
- * Cross-language glob semantics: hand-rolled regex translation mirrors
- * Python's _glob_match exactly — `*` matches within a path segment,
- * `**` matches zero-or-more segments, `?` matches a single non-slash char.
- * fnmatch's fnmatchcase semantics; KTD-B.3 C5 prefix contract applies to
- * the parity scenarios that cover policy decisions.
+ * Glob semantics: one grammar for every pattern (`globTokens`) — `*` matches
+ * within a path segment, `**` matches zero-or-more segments (a `/` after it is
+ * swallowed), `?` matches a single non-slash char, and every other character,
+ * `[` included, is literal. This is Python's `**` grammar; Python matches a
+ * pattern without `**` with fnmatch instead, where `*` and `?` cross `/`.
+ * KTD-B.3 C5 prefix contract applies to the parity scenarios that cover
+ * policy decisions.
+ *
+ * A strict path stays enforced for the coordinator's lifetime
+ * (Cohexa-ai/agent-coherence#261): strict wins over ignore (`isTracked`), a hot
+ * reload never drops a strict or user-added pattern while strict patterns are
+ * live (`reloaded`), and `/policy/untrack` refuses an entry that covers a strict
+ * path (`strictPatternsCovering`). The one way to stop enforcing a strict path
+ * is to restart the coordinator without its strict entry.
  */
 import { randomBytes } from "node:crypto";
 import { readFileSync, statSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
@@ -102,6 +111,11 @@ export class TrackedArtifactPolicy {
   readonly userAddedPatterns: ReadonlyArray<string>;
   readonly strictModePaths: ReadonlyArray<string>;
   readonly rejectedPatterns: ReadonlyArray<RejectedPattern>;
+  // What the strict-coverage check reads from the strict and tracked
+  // patterns, built once: an untrack request and the spawn diagnostic decide
+  // every entry against the same patterns.
+  private readonly coverageStrict: ReadonlyArray<Glob>;
+  private readonly coverageTracked: ReadonlyArray<Glob>;
 
   private constructor(args: {
     coordinatorRoot: string;
@@ -117,14 +131,36 @@ export class TrackedArtifactPolicy {
     this.userAddedPatterns = args.userAddedPatterns;
     this.strictModePaths = args.strictModePaths;
     this.rejectedPatterns = args.rejectedPatterns;
+    // A literal strict path no tracked pattern reaches puts nothing in strict
+    // mode (an intersection), so no entry can cover it.
+    this.coverageStrict = this.strictModePaths
+      .filter((s) => !isLiteralGlob(s) || this.matchesTracked(s))
+      .map(globOf);
+    this.coverageTracked = union(this.userAddedPatterns, this.trackedPatterns).map(globOf);
   }
 
   /**
    * Load policy: defaults + .coherence/tracked.yaml opt-in +
    * .coherence/ignored.yaml opt-out + .coherence/strict_mode.yaml
-   * strict opt-in (zero-Python Unit 6; mirrors Python policy.py).
+   * strict opt-in (zero-Python Unit 6; mirrors Python policy.py). Names, once
+   * at spawn, any ignored pattern that strict overrides (#261).
    */
   static load(coordinatorRoot: string): TrackedArtifactPolicy {
+    const policy = TrackedArtifactPolicy.read(coordinatorRoot);
+    const overridden = policy.ignoredPatternsOverriddenByStrict();
+    if (overridden.length > 0) {
+      process.stderr.write(
+        `agent-coherence: WARNING — ignored pattern(s) ${overridden.join(", ")} cover paths in ` +
+          `strict mode; strict wins, so those paths stay tracked and enforced. To stop enforcing ` +
+          `a strict path, remove its entry from .coherence/strict_mode.yaml and restart the ` +
+          `coordinator.\n`,
+      );
+    }
+    return policy;
+  }
+
+  /** Read the policy files, without `load`'s spawn-time diagnostic. */
+  private static read(coordinatorRoot: string): TrackedArtifactPolicy {
     const rejected: RejectedPattern[] = [];
     const added = loadYamlPatterns(join(coordinatorRoot, ".coherence", "tracked.yaml"), rejected);
     const ignored = loadYamlPatterns(join(coordinatorRoot, ".coherence", "ignored.yaml"), rejected);
@@ -140,34 +176,166 @@ export class TrackedArtifactPolicy {
   }
 
   /**
-   * v0.2 KTD-O (Node port): a path is in strict mode iff it is TRACKED and
-   * matches at least one strict_mode_paths glob. Intersection semantics —
-   * strict never applies to untracked paths. Empty strict_mode_paths
-   * short-circuits to false (v0.1.1 warn-only behavior preserved).
+   * Re-read the policy files for a hot reload (`/policy/track`,
+   * `/policy/untrack`) without narrowing strict enforcement (#261). Ignored
+   * patterns come from disk as they are; they cannot untrack a strict path
+   * anyway. While this policy has strict patterns, every strict and user-added
+   * pattern it carries is kept even if the file no longer lists it — strict
+   * mode needs both — so a hand-edited strict_mode.yaml or tracked.yaml
+   * followed by any track or untrack cannot end enforcement mid-run. Additions
+   * on disk still apply. Without strict patterns the files are read verbatim.
+   */
+  reloaded(): TrackedArtifactPolicy {
+    const fresh = TrackedArtifactPolicy.read(this.coordinatorRoot);
+    if (this.strictModePaths.length === 0) return fresh;
+    return new TrackedArtifactPolicy({
+      coordinatorRoot: fresh.coordinatorRoot,
+      trackedPatterns: fresh.trackedPatterns,
+      ignoredPatterns: fresh.ignoredPatterns,
+      userAddedPatterns: union(this.userAddedPatterns, fresh.userAddedPatterns),
+      strictModePaths: union(this.strictModePaths, fresh.strictModePaths),
+      rejectedPatterns: fresh.rejectedPatterns,
+    });
+  }
+
+  private matchesTracked(normalized: string): boolean {
+    return matchesAny(normalized, this.trackedPatterns) || matchesAny(normalized, this.userAddedPatterns);
+  }
+
+  private matchesStrict(normalized: string): boolean {
+    return this.strictModePaths.length > 0 && matchesAny(normalized, this.strictModePaths);
+  }
+
+  /**
+   * v0.2 KTD-O (Node port): a path is in strict mode iff it is TRACKED (a
+   * default or user-added pattern) and matches at least one strict_mode_paths
+   * glob. Intersection semantics — strict never applies to a path no tracked
+   * pattern matches. An ignored pattern does not take a path out of strict
+   * mode (see `isTracked`). Empty strict_mode_paths short-circuits to false
+   * (v0.1.1 warn-only behavior preserved).
    */
   isStrictMode(parentRelativePath: string): boolean {
     if (this.strictModePaths.length === 0) return false;
-    if (!this.isTracked(parentRelativePath)) return false;
     const normalized = normalizeRelative(parentRelativePath);
     if (normalized === null) return false;
-    return this.strictModePaths.some((p) => globMatch(normalized.replace(/\\/g, "/"), p));
+    return this.matchesTracked(normalized) && this.matchesStrict(normalized);
   }
 
   /**
    * Return true if the given parent-repo-relative path is coordinated.
    * Algorithm: path is tracked if it matches any default OR user-added
-   * pattern, AND does not match any ignored pattern. Ignore wins ties.
+   * pattern, AND does not match any ignored pattern — unless it also matches a
+   * strict pattern: strict wins over ignore (#261). An ignore pattern, however
+   * broad (`**`) and however it arrived (a leftover ignored.yaml at spawn or
+   * `/policy/untrack` at runtime), never drops a strict path onto the
+   * untracked fast path, where a read reports version 0 and a CAS commit is
+   * accepted at any expected version. For every path no strict pattern
+   * matches, ignore wins ties as before.
    */
   isTracked(parentRelativePath: string): boolean {
     const normalized = normalizeRelative(parentRelativePath);
     if (normalized === null) return false;
+    if (!this.matchesTracked(normalized)) return false;
+    if (!matchesAny(normalized, this.ignoredPatterns)) return true;
+    return this.matchesStrict(normalized);
+  }
 
-    const tracked =
-      matchesAny(normalized, this.trackedPatterns) ||
-      matchesAny(normalized, this.userAddedPatterns);
-    if (!tracked) return false;
-    if (matchesAny(normalized, this.ignoredPatterns)) return false;
-    return true;
+  /**
+   * The strict patterns under which `pattern` — a path or a glob, as
+   * `/policy/untrack` receives it — matches at least one path this policy
+   * puts in strict mode: some path matches `pattern`, a strict pattern and a
+   * tracked (default or user-added) pattern at once.
+   *
+   * Decided on the glob languages themselves, so an entry spelled differently
+   * from the strict pattern is still caught: `data/**` and `**` both cover a
+   * strict `data/*.json`. A literal strict path is decided exactly by matching
+   * it. A strict glob is decided by a product search (`globsIntersect`) on its
+   * own budget of `globIntersectBudgets.pattern` steps, drawn from one
+   * `globIntersectBudgets.call` for the entry. Running out errs toward
+   * "covers" (a refusal, never a silent untrack): a strict glob whose own
+   * budget runs out counts as covered, and once the entry's budget runs out so
+   * does every strict pattern not yet decided and not ruled out by literal
+   * prefixes and suffixes. Empty when no strict path is covered.
+   */
+  strictPatternsCovering(pattern: string): string[] {
+    return this.strictPatternsCoveringEach([pattern])[0]!;
+  }
+
+  /**
+   * `strictPatternsCovering` for each of `patterns`, in order: one
+   * `/policy/untrack` request, decided under one `globIntersectBudgets.request`
+   * so its cost is bounded however many entries it carries. Each entry still
+   * has its own `globIntersectBudgets.call`. Once the request's budget runs
+   * out, every later entry counts as covering each strict pattern its literal
+   * ends do not rule out, so a request of costly entries is refused rather
+   * than held past the client's timeout.
+   */
+  strictPatternsCoveringEach(patterns: ReadonlyArray<string>): string[][] {
+    const requestBudget = new SearchBudget(globIntersectBudgets.request);
+    return patterns.map((p) =>
+      this.strictPatternsCoveringWithin(p, new SearchBudget(globIntersectBudgets.call, requestBudget)),
+    );
+  }
+
+  /**
+   * Ignored patterns that cover a strict path, which strict therefore
+   * overrides (`isTracked`). Reported once at `load` (spawn), not on hot
+   * reloads. Every entry is decided under one `globIntersectBudgets.diagnostic`,
+   * so a large or pathological ignored.yaml cannot hold up the spawn, and an
+   * entry stops at the first strict pattern it covers. Once the budget runs
+   * out, the remaining entries a strict pattern might cover are reported,
+   * erring toward the warning.
+   */
+  ignoredPatternsOverriddenByStrict(): string[] {
+    const total = new SearchBudget(globIntersectBudgets.diagnostic);
+    return this.ignoredPatterns.filter((p) => this.strictPatternsCoveringWithin(p, total, true).length > 0);
+  }
+
+  private strictPatternsCoveringWithin(pattern: string, callBudget: SearchBudget, firstOnly = false): string[] {
+    const covering: string[] = [];
+    if (this.coverageStrict.length === 0) return covering;
+    // Paths are matched with a leading "./" stripped (normalizeRelative), so
+    // an entry spelled that way names the same paths.
+    const entry = globOf(normalizeRelative(pattern) ?? pattern);
+    for (const strict of this.coverageStrict) {
+      // A path both match carries both literal prefixes and suffixes; if they
+      // do not nest, the strict pattern is exactly not covered, at no cost.
+      if (!affixesNest([entry.affixes, strict.affixes])) continue;
+      let covered: boolean;
+      try {
+        covered = isLiteralGlob(strict.pattern)
+          ? // Its language is the one path (tracked: the index keeps no other),
+            // so matching it decides it exactly.
+            tokensMatch(entry.tokens, strict.pattern, callBudget)
+          : this.strictGlobCovered(entry, strict, callBudget);
+      } catch (err) {
+        if (!(err instanceof BudgetExhausted)) throw err;
+        covered = true;
+      }
+      if (covered) {
+        covering.push(strict.pattern);
+        if (firstOnly) break;
+      }
+    }
+    return covering;
+  }
+
+  private strictGlobCovered(entry: Glob, strict: Glob, callBudget: SearchBudget): boolean {
+    // Only a tracked pattern whose literal ends nest with the entry's and the
+    // strict glob's can share a path with both; with none, the strict glob is
+    // exactly not covered, at no search cost.
+    const tracked = this.coverageTracked.filter((t) =>
+      affixesNest([entry.affixes, strict.affixes, t.affixes]),
+    );
+    if (tracked.length === 0) return false;
+    // A budget per strict glob, so one costly pattern (or many cheap ones)
+    // never decides the others: a shared budget marks every pattern after the
+    // point it ran out as covering.
+    const budget = new SearchBudget(globIntersectBudgets.pattern, callBudget);
+    return (
+      globsIntersect([entry.tokens, strict.tokens], budget) &&
+      tracked.some((t) => globsIntersect([entry.tokens, strict.tokens, t.tokens], budget))
+    );
   }
 
   summary(): PolicySummary {
@@ -225,9 +393,13 @@ export class PolicyRef {
     return this.current.summary();
   }
 
-  /** Re-parse the YAML files and swap the snapshot (Python's `coordinator.policy = load(...)`). */
+  /**
+   * Re-parse the YAML files and swap the snapshot (Python's
+   * `coordinator.policy = coordinator.policy.reloaded()`): a reload never
+   * narrows strict enforcement (`TrackedArtifactPolicy.reloaded`).
+   */
   reload(): void {
-    this.current = TrackedArtifactPolicy.load(this.current.coordinatorRoot);
+    this.current = this.current.reloaded();
   }
 }
 
@@ -471,7 +643,6 @@ function matchesAny(path: string, patterns: ReadonlyArray<string>): boolean {
 /**
  * Posix-style glob matcher. Supports `**` (zero-or-more path segments),
  * `*` (zero-or-more chars within a segment, no `/`), `?` (one non-slash char).
- * Mirrors Python's _glob_match for KTD-B parity.
  */
 // Per-process cache of compiled glob patterns. Hot path: every hook on
 // every tracked-artifact lookup compiles `**` once per session otherwise.
@@ -481,10 +652,276 @@ const compiledGlobs: Map<string, RegExp> = new Map();
 export function globMatch(path: string, pattern: string): boolean {
   let regex = compiledGlobs.get(pattern);
   if (regex === undefined) {
-    regex = new RegExp("^" + patternToRegex(pattern) + "$");
+    regex = globRegex(pattern);
     compiledGlobs.set(pattern, regex);
   }
   return regex.test(path);
+}
+
+/** The backtracking regex a pattern compiles to (exported for the differential test). */
+export function globRegex(pattern: string): RegExp {
+  return new RegExp("^" + patternToRegex(pattern) + "$");
+}
+
+// ----------------------------------------------------------------------
+// Glob tokens and their automaton
+//
+// The tokens spell exactly the language `patternToRegex` compiles a pattern
+// to: `**` is any run (a following `/` swallowed), `*` a run without `/`, `?`
+// one character but `/`, and every other character a literal, `[` included.
+// The regex has no flags, so its `.` stops at a line terminator, its `$`
+// matches only at the end, and it reads UTF-16 code units, as the automaton
+// does. Both the linear matcher and the strict-coverage search read them; a
+// differential test against the regex pins the mirror.
+// ----------------------------------------------------------------------
+
+type Token =
+  | { readonly kind: "any_run" }
+  | { readonly kind: "seg_run" }
+  | { readonly kind: "seg_one" }
+  | { readonly kind: "lit"; readonly ch: string };
+
+const ANY_RUN: Token = { kind: "any_run" };
+const SEG_RUN: Token = { kind: "seg_run" };
+const SEG_ONE: Token = { kind: "seg_one" };
+
+/** What a regex `.` without the `s` flag does not match. */
+const LINE_TERMINATORS: ReadonlySet<string> = new Set(["\n", "\r", "\u2028", "\u2029"]);
+
+export function globTokens(pattern: string): Token[] {
+  const tokens: Token[] = [];
+  let i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i]!;
+    if (c === "*" && pattern[i + 1] === "*") {
+      tokens.push(ANY_RUN);
+      i += 2;
+      if (pattern[i] === "/") i += 1;
+    } else if (c === "*") {
+      tokens.push(SEG_RUN);
+      i += 1;
+    } else if (c === "?") {
+      tokens.push(SEG_ONE);
+      i += 1;
+    } else {
+      tokens.push({ kind: "lit", ch: c });
+      i += 1;
+    }
+  }
+  return tokens;
+}
+
+function isRun(token: Token): boolean {
+  return token.kind === "any_run" || token.kind === "seg_run";
+}
+
+/**
+ * Whether `token` consumes `ch`; `null` stands for every character no pattern
+ * names (not `/`, not a line terminator).
+ */
+function tokenAccepts(token: Token, ch: string | null): boolean {
+  switch (token.kind) {
+    case "any_run":
+      return ch === null || !LINE_TERMINATORS.has(ch);
+    case "seg_run":
+    case "seg_one":
+      return ch !== "/";
+    case "lit":
+      return ch === token.ch;
+  }
+}
+
+/** The states, sorted, plus every state a run token can skip to. */
+function closure(states: Iterable<number>, tokens: ReadonlyArray<Token>): number[] {
+  const out = new Set(states);
+  const stack = [...out];
+  while (stack.length > 0) {
+    const i = stack.pop()!;
+    if (i < tokens.length && isRun(tokens[i]!) && !out.has(i + 1)) {
+      out.add(i + 1);
+      stack.push(i + 1);
+    }
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+function advance(states: ReadonlyArray<number>, tokens: ReadonlyArray<Token>, ch: string | null): number[] {
+  const next = new Set<number>();
+  for (const i of states) {
+    if (i >= tokens.length || !tokenAccepts(tokens[i]!, ch)) continue;
+    next.add(isRun(tokens[i]!) ? i : i + 1);
+  }
+  return closure(next, tokens);
+}
+
+/**
+ * Whether `path` matches `tokens` exactly as their regex does, in time linear
+ * in the path: the automaton stepped one code unit at a time, never
+ * backtracking. Each step is charged to `budget`, when one is given, at the
+ * size of the state it leaves.
+ */
+export function tokensMatch(tokens: ReadonlyArray<Token>, path: string, budget?: SearchBudget): boolean {
+  let states = closure([0], tokens);
+  for (let i = 0; i < path.length; i++) {
+    if (budget !== undefined) charge(budget, 1 + states.length);
+    states = advance(states, tokens, path[i]!);
+    if (states.length === 0) return false;
+  }
+  return states.includes(tokens.length);
+}
+
+// ----------------------------------------------------------------------
+// Bounded overlap search (strict coverage, #261)
+// ----------------------------------------------------------------------
+
+/**
+ * Search steps the strict-coverage decisions may take. A step is one
+ * automaton state carried across one character, so the cost is bounded
+ * whatever the patterns' alphabet. Mutable so tests can lower them.
+ *
+ * - `pattern`: one strict glob, before it counts as covered.
+ * - `call`: one untrack entry, across every strict pattern.
+ * - `request`: one `/policy/untrack` request, across its entries.
+ * - `diagnostic`: the spawn-time override warning, across every ignored entry.
+ *
+ * The values are the Python coordinator's (`policy.py`).
+ */
+export const globIntersectBudgets = {
+  pattern: 200_000,
+  call: 2_000_000,
+  request: 4_000_000,
+  diagnostic: 2_000_000,
+};
+
+/** A bounded glob search ran out of steps; every caller counts it as "covers". */
+export class BudgetExhausted extends Error {
+  constructor() {
+    super("glob search budget exhausted");
+  }
+}
+
+/** Search steps left, drawn from `parent` too when one is given. */
+export class SearchBudget {
+  remaining: number;
+  private readonly parent: SearchBudget | undefined;
+
+  constructor(steps: number, parent?: SearchBudget) {
+    this.remaining = steps;
+    this.parent = parent;
+  }
+
+  spend(steps: number): void {
+    this.remaining -= steps;
+    if (this.remaining < 0) throw new BudgetExhausted();
+    this.parent?.spend(steps);
+  }
+}
+
+let automatonSteps = 0;
+
+/** Steps every charged search and match has taken in this process (for tests). */
+export function automatonStepsTaken(): number {
+  return automatonSteps;
+}
+
+function charge(budget: SearchBudget, steps: number): void {
+  automatonSteps += steps;
+  budget.spend(steps);
+}
+
+/** A pattern with what the strict-coverage check reads from it. */
+interface Glob {
+  readonly pattern: string;
+  readonly tokens: ReadonlyArray<Token>;
+  readonly affixes: readonly [string, string];
+}
+
+function globOf(pattern: string): Glob {
+  const tokens = globTokens(pattern);
+  return { pattern, tokens, affixes: literalAffixes(tokens) };
+}
+
+/** True when `pattern` matches exactly one path, itself. */
+function isLiteralGlob(pattern: string): boolean {
+  return !pattern.includes("*") && !pattern.includes("?");
+}
+
+function literalRun(tokens: Iterable<Token>): string {
+  let run = "";
+  for (const token of tokens) {
+    if (token.kind !== "lit") break;
+    run += token.ch;
+  }
+  return run;
+}
+
+/** The literal prefix and suffix every path matching `tokens` carries. */
+function literalAffixes(tokens: ReadonlyArray<Token>): readonly [string, string] {
+  const reversedSuffix = literalRun([...tokens].reverse());
+  return [literalRun(tokens), reversedSuffix.split("").reverse().join("")];
+}
+
+/**
+ * False when no path can carry every literal prefix and suffix: the prefixes
+ * must each start the longest one, the suffixes each end theirs. Exact as a
+ * necessary condition, so it rules a search out, never in.
+ */
+function affixesNest(affixes: ReadonlyArray<readonly [string, string]>): boolean {
+  const longest = (i: 0 | 1) => affixes.reduce((a, b) => (b[i].length > a.length ? b[i] : a), "");
+  const prefix = longest(0);
+  const suffix = longest(1);
+  return affixes.every(([p, s]) => prefix.startsWith(p) && suffix.endsWith(s));
+}
+
+/**
+ * True when some non-empty path matches every pattern `tokenLists` spells
+ * (`globTokens`) under `globMatch`.
+ *
+ * A product of the patterns' automata searched over an alphabet of every
+ * character the patterns name, `/`, and one stand-in for every other
+ * character (exact: that stand-in is accepted wherever any unnamed character
+ * is). Each transition is charged to `budget` at the size of the state it
+ * leaves; running out throws `BudgetExhausted`, which every caller counts as
+ * "intersects".
+ */
+export function globsIntersect(tokenLists: ReadonlyArray<ReadonlyArray<Token>>, budget: SearchBudget): boolean {
+  // Most pairs an untrack check meets (`.log` against `.json`, `svc3/` against
+  // `svc7/`) fail on their literal ends: settled without a search.
+  if (!affixesNest(tokenLists.map(literalAffixes))) return false;
+  const named = new Set<string>(["/"]);
+  for (const tokens of tokenLists) {
+    for (const token of tokens) {
+      if (token.kind === "lit") named.add(token.ch);
+    }
+  }
+  // Sorted, so the bounded search explores in the same order on every run and
+  // the same entry is never refused on one coordinator and accepted on the next.
+  const alphabet: Array<string | null> = [...[...named].sort(), null];
+  const key = (state: ReadonlyArray<ReadonlyArray<number>>) => state.map((s) => s.join(",")).join("|");
+  const start = tokenLists.map((tokens) => closure([0], tokens));
+  const seen = new Set([key(start)]);
+  const frontier = [start];
+  while (frontier.length > 0) {
+    const state = frontier.pop()!;
+    const step = 1 + state.reduce((n, s) => n + s.length, 0);
+    for (const ch of alphabet) {
+      charge(budget, step);
+      const next = state.map((s, i) => advance(s, tokenLists[i]!, ch));
+      if (!next.every((s) => s.length > 0)) continue;
+      if (next.every((s, i) => s.includes(tokenLists[i]!.length))) return true;
+      const k = key(next);
+      if (!seen.has(k)) {
+        seen.add(k);
+        frontier.push(next);
+      }
+    }
+  }
+  return false;
+}
+
+/** Order-preserving union: `first`, then what `second` adds. */
+function union(first: ReadonlyArray<string>, second: ReadonlyArray<string>): string[] {
+  return [...new Set([...first, ...second])];
 }
 
 function patternToRegex(pattern: string): string {

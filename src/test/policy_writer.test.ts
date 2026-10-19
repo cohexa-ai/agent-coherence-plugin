@@ -389,3 +389,43 @@ test("PolicyRef: reload after an append is visible through the ref (no stale-by-
     cleanup();
   }
 });
+
+test("PolicyRef: a reload never narrows strict enforcement while strict patterns are live", () => {
+  // Cohexa-ai/agent-coherence#261: a hand-edited strict_mode.yaml or
+  // tracked.yaml, followed by any track or untrack, must not end enforcement
+  // mid-run; only a restart without the strict entry does.
+  const { root, cleanup } = makeRoot();
+  try {
+    mkdirSync(join(root, ".coherence"), { recursive: true });
+    writeFileSync(join(root, ".coherence", "tracked.yaml"), '- "data/**"\n', "utf8");
+    writeFileSync(join(root, ".coherence", "strict_mode.yaml"), '- "data/*.json"\n', "utf8");
+    const ref = PolicyRef.load(root);
+    assert.equal(ref.isStrictMode("data/a.json"), true);
+
+    writeFileSync(join(root, ".coherence", "tracked.yaml"), '- "notes.md"\n', "utf8");
+    writeFileSync(join(root, ".coherence", "strict_mode.yaml"), "", "utf8");
+    ref.reload();
+
+    assert.equal(ref.isStrictMode("data/a.json"), true);
+    assert.equal(ref.isTracked("notes.md"), true); // an addition on disk still applies
+  } finally {
+    cleanup();
+  }
+});
+
+test("PolicyRef: without strict patterns a reload reads the files verbatim", () => {
+  const { root, cleanup } = makeRoot();
+  try {
+    mkdirSync(join(root, ".coherence"), { recursive: true });
+    writeFileSync(join(root, ".coherence", "tracked.yaml"), '- "data/**"\n', "utf8");
+    const ref = PolicyRef.load(root);
+    assert.equal(ref.isTracked("data/a.json"), true);
+
+    writeFileSync(join(root, ".coherence", "tracked.yaml"), "", "utf8");
+    ref.reload();
+
+    assert.equal(ref.isTracked("data/a.json"), false);
+  } finally {
+    cleanup();
+  }
+});
