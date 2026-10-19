@@ -413,6 +413,19 @@ test("the spawn-time override diagnostic is bounded in total", () => {
   });
 });
 
+test("a literal strict path is decided by matching it, in steps linear in the path", () => {
+  // Searching it as a glob gives the same answer at far more cost; matching
+  // the one path its language holds takes a few steps per character.
+  const deep = "src/" + "d/".repeat(40) + "x.json";
+  const policy = policyWith({ tracked: ["src/**"], strict: [deep] });
+  for (const entry of ["src/**/*.json", "src/**/d/*/*.json", "**/*.json"]) {
+    const before = automatonStepsTaken();
+    assert.deepEqual(policy.strictPatternsCovering(entry), [deep]);
+    const steps = automatonStepsTaken() - before;
+    assert.ok(steps <= 8 * deep.length, `${entry}: ${steps} steps for a ${deep.length}-character path`);
+  }
+});
+
 test("an ordinary untrack is decided quickly against a large strict set", () => {
   const strict = Array.from({ length: 45 }, (_, i) => `**/svc${i}/*/*.json`);
   const policy = policyWith({ tracked: ["**/*.json"], strict });

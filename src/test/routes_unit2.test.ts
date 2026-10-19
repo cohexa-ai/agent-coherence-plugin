@@ -355,6 +355,18 @@ test("policy/untrack: a './'-led or dotted spelling of a strict path is refused 
   }
 });
 
+test("policy/untrack: a strict entry after a plain one is refused too, and nothing is written", async () => {
+  const { post, cleanup, root } = await makeServer(STRICT_DATA);
+  try {
+    const r = await post("/policy/untrack", { paths: ["notes.md", "data/a.json"] });
+    assert.equal(r.status, 409);
+    assert.deepEqual(r.body.refused, [{ path: "data/a.json", strict_patterns: ["data/**"] }]);
+    assert.equal(existsSync(join(root, ".coherence", "ignored.yaml")), false);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("policy/untrack: a refusal reports the request's invalid entries as rejected", async () => {
   const { post, cleanup, root } = await makeServer(STRICT_DATA);
   try {
