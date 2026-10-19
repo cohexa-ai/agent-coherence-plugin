@@ -15,10 +15,9 @@ If the command exits 3, the coordinator refused because a path is enforced
 in strict mode, and nothing was untracked. Report the refused paths and the
 next step the message names (remove the entry from
 `.coherence/strict_mode.yaml`, then restart the coordinator). Do not edit
-those files yourself unless the user asks you to. A Python coordinator from
-an `agent-coherence` release after 0.14.1 refuses this way. The bundled Node
-coordinator does not refuse yet: on a Node workspace, untracking a strict
-path also takes it out of strict mode.
+those files yourself unless the user asks you to. The bundled Node
+coordinator refuses this way, and so does a Python coordinator from an
+`agent-coherence` release after 0.14.1.
 
 If no paths were given, ask the user which workspace-relative path(s) they
 want to untrack. Don't invoke the CLI without arguments: the bundled Node CLI exits 1 with no output, and the Python console script exits 2 with a usage error.
