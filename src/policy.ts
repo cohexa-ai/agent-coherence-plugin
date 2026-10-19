@@ -668,11 +668,13 @@ export function globMatch(path: string, pattern: string): boolean {
  * Runs (`*` or `**`) a pattern may hold and still be matched by its regex. The
  * regex backtracks into every run, so a failing match costs up to the path's
  * length to the power of its runs: `"**".repeat(12) + "Z"` took 5.9 s on a
- * 21-character path, and every hook matches every pattern on the
- * coordinator's one thread. A pattern over the limit is matched by
- * `tokensMatch`, linear in the path.
+ * 21-character path, and two runs (`**a**Z`) took about 2 s on a
+ * 50,000-character one, which a hook path may be. Every hook matches every
+ * pattern on the coordinator's one thread. A pattern over the limit is
+ * matched by `tokensMatch`, linear in the path; one run, anchored at both
+ * ends, is linear in the regex too.
  */
-const REGEX_RUN_LIMIT = 2;
+const REGEX_RUN_LIMIT = 1;
 
 function compileGlob(pattern: string): (path: string) => boolean {
   const tokens = globTokens(pattern);
@@ -757,33 +759,38 @@ function tokenAccepts(token: Token, ch: string | null): boolean {
 }
 
 /**
- * The marked states, plus every state a run token can skip to, in ascending
- * order. A run only skips to the next state, so one ascending pass closes the
- * set and yields it sorted: no set and no sort on this hot path.
+ * Append `state` and every state a run token can skip to from it, keeping
+ * `out` ascending and duplicate-free. States arrive in ascending order and a
+ * run only skips to the next state, so the closure of each is a contiguous
+ * run of states: one already reached adds nothing new.
+ *
+ * The work is proportional to the states produced, never to the pattern's
+ * length: the search charges each step at the states it carries, and a step
+ * that scanned every token let long patterns hold the coordinator's one
+ * thread for seconds within the same budget.
  */
-function closedStates(marks: Uint8Array, tokens: ReadonlyArray<Token>): number[] {
+function pushClosed(out: number[], state: number, tokens: ReadonlyArray<Token>): void {
+  if (out.length > 0 && state <= out[out.length - 1]!) return;
+  let i = state;
+  out.push(i);
+  while (i < tokens.length && isRun(tokens[i]!)) out.push(++i);
+}
+
+/** The automaton's start: state 0 and every state its leading runs skip to. */
+function startStates(tokens: ReadonlyArray<Token>): number[] {
   const out: number[] = [];
-  for (let i = 0; i <= tokens.length; i++) {
-    if (marks[i] === 0) continue;
-    out.push(i);
-    if (i < tokens.length && isRun(tokens[i]!)) marks[i + 1] = 1;
-  }
+  pushClosed(out, 0, tokens);
   return out;
 }
 
-function closure(states: Iterable<number>, tokens: ReadonlyArray<Token>): number[] {
-  const marks = new Uint8Array(tokens.length + 1);
-  for (const i of states) marks[i] = 1;
-  return closedStates(marks, tokens);
-}
-
+/** The states after reading `ch` from the ascending `states`, ascending. */
 function advance(states: ReadonlyArray<number>, tokens: ReadonlyArray<Token>, ch: string | null): number[] {
-  const marks = new Uint8Array(tokens.length + 1);
+  const out: number[] = [];
   for (const i of states) {
     if (i >= tokens.length || !tokenAccepts(tokens[i]!, ch)) continue;
-    marks[isRun(tokens[i]!) ? i : i + 1] = 1;
+    pushClosed(out, isRun(tokens[i]!) ? i : i + 1, tokens);
   }
-  return closedStates(marks, tokens);
+  return out;
 }
 
 /**
@@ -793,7 +800,7 @@ function advance(states: ReadonlyArray<number>, tokens: ReadonlyArray<Token>, ch
  * size of the state it leaves.
  */
 export function tokensMatch(tokens: ReadonlyArray<Token>, path: string, budget?: SearchBudget): boolean {
-  let states = closure([0], tokens);
+  let states = startStates(tokens);
   for (let i = 0; i < path.length; i++) {
     if (budget !== undefined) charge(budget, 1 + states.length);
     states = advance(states, tokens, path[i]!);
@@ -932,7 +939,7 @@ export function globsIntersect(tokenLists: ReadonlyArray<ReadonlyArray<Token>>, 
   if (!affixesNest(tokenLists.map(literalAffixes))) return false;
   const alphabet = searchAlphabet(tokenLists);
   const key =(state: ReadonlyArray<ReadonlyArray<number>>) => state.map((s) => s.join(",")).join("|");
-  const start = tokenLists.map((tokens) => closure([0], tokens));
+  const start = tokenLists.map(startStates);
   const seen = new Set([key(start)]);
   const frontier = [start];
   while (frontier.length > 0) {
