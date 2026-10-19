@@ -355,6 +355,19 @@ test("policy/untrack: a './'-led or dotted spelling of a strict path is refused 
   }
 });
 
+test("policy/track is never refused for a strict path; only the untrack of it is", async () => {
+  const { post, cleanup } = await makeServer(STRICT_DATA);
+  try {
+    const tracked = await post("/policy/track", { paths: ["data/a.json"] });
+    assert.equal(tracked.status, 200);
+    assert.deepEqual(tracked.body, { ok: true, added: ["data/a.json"], rejected: [] });
+    const untracked = await post("/policy/untrack", { paths: ["data/a.json"] });
+    assert.equal(untracked.status, 409);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("policy/untrack: a strict entry after a plain one is refused too, and nothing is written", async () => {
   const { post, cleanup, root } = await makeServer(STRICT_DATA);
   try {

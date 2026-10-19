@@ -87,6 +87,16 @@ test("a `**`-heavy pattern is matched in time linear in the path, not by backtra
   assert.ok(performance.now() - start < 250, `${(performance.now() - start).toFixed(0)} ms`);
 });
 
+test("a two-run pattern is matched without backtracking on a long hook path", () => {
+  // Hook paths carry no length bound below the request cap, and a regex with
+  // two runs backtracks quadratically: `**a**Z` held every hook for about two
+  // seconds on a 50,000-character path.
+  const start = performance.now();
+  assert.equal(globMatch("a".repeat(50_000), "**a**Z"), false);
+  assert.equal(globMatch("a".repeat(50_000) + "Z", "**a**Z"), true);
+  assert.ok(performance.now() - start < 250, `${(performance.now() - start).toFixed(0)} ms`);
+});
+
 test("a single-star-heavy pattern is matched without backtracking too", () => {
   const pattern = "*a".repeat(12) + "Z";
   let start = performance.now();
@@ -276,6 +286,24 @@ test("the overlap search never over-reports either: no intersection without a wi
   assert.deepEqual(spurious, []);
 });
 
+test("the three-way search (entry, strict, tracked) never over-reports either", () => {
+  // A spurious three-way intersection refuses an untrack that covers no
+  // strict path. Every reported one must have a short witness.
+  const samples = paths("ab/x.[]", 5);
+  const matching = new Map(GRAMMAR.map((g) => [g, samples.filter((p) => globMatch(p, g))]));
+  const spurious: string[] = [];
+  for (let i = 0; i < GRAMMAR.length; i++) {
+    for (let j = i + 1; j < GRAMMAR.length; j++) {
+      for (let k = j + 1; k < GRAMMAR.length; k++) {
+        const triple = [GRAMMAR[i]!, GRAMMAR[j]!, GRAMMAR[k]!];
+        const witness = matching.get(triple[0]!)!.some((p) => globMatch(p, triple[1]!) && globMatch(p, triple[2]!));
+        if (!witness && intersect(triple, new SearchBudget(10_000_000))) spurious.push(triple.join(" & "));
+      }
+    }
+  }
+  assert.deepEqual(spurious, []);
+});
+
 test("the coverage shortcuts never under-report a strict path the entry matches", () => {
   // strictPatternsCovering skips the search where literal ends rule a strict
   // pattern out, matches a literal strict path instead of searching, and keeps
@@ -424,6 +452,23 @@ test("a literal strict path is decided by matching it, in steps linear in the pa
     const steps = automatonStepsTaken() - before;
     assert.ok(steps <= 8 * deep.length, `${entry}: ${steps} steps for a ${deep.length}-character path`);
   }
+});
+
+test("an untrack request that spends its whole budget on long patterns still answers well inside the hook timeout", () => {
+  // A step is charged at the states it carries, so it must cost about that
+  // much: scanning every token of every pattern on each step let maximal
+  // entries against maximal tracked patterns hold the coordinator's one
+  // thread for seconds, past the 5 s hook timeout on a loaded host.
+  const tracked = Array.from({ length: 20 }, (_, i) => "**/" + String.fromCharCode(97 + i).repeat(1017) + "*.md");
+  const policy = policyWith({ tracked, strict: ["**/*.md"] });
+  const entries = Array.from({ length: 20 }, () => "?".repeat(1018) + "**");
+  const before = automatonStepsTaken();
+  const start = performance.now();
+  const coverage = policy.strictPatternsCoveringEach(entries);
+  const ms = performance.now() - start;
+  assert.ok(automatonStepsTaken() - before >= globIntersectBudgets.request, "the request spent its whole budget");
+  assert.ok(coverage.every((c) => c.length > 0), "every entry is refused");
+  assert.ok(ms < 1_000, `${ms.toFixed(0)} ms`);
 });
 
 test("an ordinary untrack is decided quickly against a large strict set", () => {
