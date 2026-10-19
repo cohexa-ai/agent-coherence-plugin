@@ -647,15 +647,34 @@ function matchesAny(path: string, patterns: ReadonlyArray<string>): boolean {
 // Per-process cache of compiled glob patterns. Hot path: every hook on
 // every tracked-artifact lookup compiles `**` once per session otherwise.
 // ce-review safe_auto fix: pure memoization, no semantic change.
-const compiledGlobs: Map<string, RegExp> = new Map();
+const compiledGlobs: Map<string, (path: string) => boolean> = new Map();
 
 export function globMatch(path: string, pattern: string): boolean {
-  let regex = compiledGlobs.get(pattern);
-  if (regex === undefined) {
-    regex = globRegex(pattern);
-    compiledGlobs.set(pattern, regex);
+  let matcher = compiledGlobs.get(pattern);
+  if (matcher === undefined) {
+    matcher = compileGlob(pattern);
+    compiledGlobs.set(pattern, matcher);
   }
-  return regex.test(path);
+  return matcher(path);
+}
+
+/**
+ * Runs (`*` or `**`) a pattern may hold and still be matched by its regex. The
+ * regex backtracks into every run, so a failing match costs up to the path's
+ * length to the power of its runs: `"**".repeat(12) + "Z"` took 5.9 s on a
+ * 21-character path, and every hook matches every pattern on the
+ * coordinator's one thread. A pattern over the limit is matched by
+ * `tokensMatch`, linear in the path.
+ */
+const REGEX_RUN_LIMIT = 2;
+
+function compileGlob(pattern: string): (path: string) => boolean {
+  const tokens = globTokens(pattern);
+  if (tokens.filter(isRun).length > REGEX_RUN_LIMIT) {
+    return (path) => tokensMatch(tokens, path);
+  }
+  const regex = globRegex(pattern);
+  return (path) => regex.test(path);
 }
 
 /** The backtracking regex a pattern compiles to (exported for the differential test). */

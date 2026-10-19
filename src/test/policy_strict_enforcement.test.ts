@@ -69,6 +69,34 @@ test("ignore still wins for a tracked path no strict pattern holds", () => {
   assert.equal(policy.isTracked("CLAUDE.md"), true);
 });
 
+// ------------------------------------------------------------ matcher running time
+
+test("a `**`-heavy pattern is matched in time linear in the path, not by backtracking", () => {
+  // Any bearer holder can track or untrack such an entry, and every hook
+  // matches its path against every pattern on the coordinator's one thread:
+  // the regex took seconds for this 21-character path, minutes for longer.
+  // The short path first: on the backtracking matcher it alone takes seconds,
+  // so the bound fails before the long paths, which never finish there.
+  const pattern = "**".repeat(12) + "Z";
+  let start = performance.now();
+  assert.equal(globMatch("a/".repeat(10) + "b", pattern), false);
+  assert.ok(performance.now() - start < 250, `${(performance.now() - start).toFixed(0)} ms`);
+  start = performance.now();
+  assert.equal(globMatch("a/".repeat(500) + "b", pattern), false);
+  assert.equal(globMatch("a/".repeat(500) + "bZ", pattern), true);
+  assert.ok(performance.now() - start < 250, `${(performance.now() - start).toFixed(0)} ms`);
+});
+
+test("a single-star-heavy pattern is matched without backtracking too", () => {
+  const pattern = "*a".repeat(12) + "Z";
+  let start = performance.now();
+  assert.equal(globMatch("a".repeat(32), pattern), false);
+  assert.ok(performance.now() - start < 250, `${(performance.now() - start).toFixed(0)} ms`);
+  start = performance.now();
+  assert.equal(globMatch("a".repeat(400), pattern), false);
+  assert.ok(performance.now() - start < 250, `${(performance.now() - start).toFixed(0)} ms`);
+});
+
 // ------------------------------------------------- strict coverage (untrack)
 
 const intersect = (patterns: string[], budget: SearchBudget) =>
@@ -194,6 +222,19 @@ test("the linear matcher agrees with the regex on every short path, line termina
     }
   }
   assert.deepEqual(disagree, []);
+});
+
+test("globMatch stays exact over the run limit, where it steps the automaton", () => {
+  for (const [path, pattern, expected] of [
+    ["x/a/b", "**/*a*/*b*", true],
+    ["a/x/b", "**/*a*/*b*", false],
+    ["x/axb", "**/a*b", true],
+    ["a/b", "**/a*b", false],
+    ["aaa", "*a*a*a", true],
+    ["a/aa", "*a*a*a", false],
+  ] as const) {
+    assert.equal(globMatch(path, pattern), expected, `${path} ~ ${pattern}`);
+  }
 });
 
 test("the overlap search never under-reports what the matcher matches", () => {
