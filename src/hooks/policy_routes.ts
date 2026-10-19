@@ -26,15 +26,24 @@
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
-import { appendPolicyYaml, MAX_POLICY_PATHS_PER_REQUEST, validatePolicyPath } from "../policy.js";
+import {
+  appendPolicyYaml,
+  MAX_POLICY_PATHS_PER_REQUEST,
+  partitionPolicyPaths,
+  type TrackedArtifactPolicy,
+} from "../policy.js";
 import { type HookDeps, writeJson, writeError, readJsonBody } from "./_common.js";
 
-/** The reason `/policy/untrack` answers when it refuses to untrack a strict path. */
-export const UNTRACK_STRICT_PATH_REASON = "untrack_strict_path";
+const UNTRACK_STRICT_PATH_REASON = "untrack_strict_path";
 
 interface RefusedEntry {
   path: string;
   strict_patterns: string[];
+}
+
+interface StrictUntrackRefusal {
+  refused: RefusedEntry[];
+  rejected: Array<{ path: string; reason: string }>;
 }
 
 function untrackStrictError(refused: ReadonlyArray<RefusedEntry>): string {
@@ -48,34 +57,23 @@ function untrackStrictError(refused: ReadonlyArray<RefusedEntry>): string {
 }
 
 /**
- * Answer 409 and return true when an entry covers a strict path (#261).
- * Untracking a strict path put it on the untracked fast path, where a CAS
- * commit at any expected version is accepted: a silent lost update. Strict
- * wins over ignore in the policy anyway, so the refusal is what tells the
- * operator the entry would not take effect. The check and the append that
- * follows run in one synchronous handler, so no reload can land between them.
+ * The entries of an untrack request that cover a strict path (#261), with the
+ * request's invalid entries, or null when none does. Untracking a strict path
+ * put it on the untracked fast path, where a CAS commit at any expected
+ * version is accepted: a silent lost update. Strict wins over ignore in the
+ * policy anyway, so the refusal is what tells the operator the entry would
+ * not take effect.
  */
-function refuseStrictUntrack(paths: ReadonlyArray<string>, res: ServerResponse, deps: HookDeps): boolean {
-  const safe: string[] = [];
-  const rejected: Array<{ path: string; reason: string }> = [];
-  for (const path of paths) {
-    const reason = validatePolicyPath(path);
-    if (reason === null) safe.push(path);
-    else rejected.push({ path, reason });
-  }
-  const coverage = deps.policy.get().strictPatternsCoveringEach(safe);
-  const refused: RefusedEntry[] = safe.flatMap((path, i) =>
+function strictUntrackRefusal(
+  paths: ReadonlyArray<string>,
+  policy: TrackedArtifactPolicy,
+): StrictUntrackRefusal | null {
+  const { valid, rejected } = partitionPolicyPaths(paths);
+  const coverage = policy.strictPatternsCoveringEach(valid);
+  const refused: RefusedEntry[] = valid.flatMap((path, i) =>
     coverage[i]!.length > 0 ? [{ path, strict_patterns: coverage[i]! }] : [],
   );
-  if (refused.length === 0) return false;
-  writeJson(res, 409, {
-    ok: false,
-    error: untrackStrictError(refused),
-    reason: UNTRACK_STRICT_PATH_REASON,
-    refused,
-    rejected,
-  });
-  return true;
+  return refused.length > 0 ? { refused, rejected } : null;
 }
 
 interface PolicyBody {
@@ -98,7 +96,19 @@ function handlePolicyMutation(
     writeError(res, 400, `max ${MAX_POLICY_PATHS_PER_REQUEST} paths per request`);
     return;
   }
-  if (yamlFileName === "ignored.yaml" && refuseStrictUntrack(paths, res, deps)) return;
+  // Decided and acted on within this one synchronous handler, so no reload can
+  // land between the check and the append below.
+  const refusal = yamlFileName === "ignored.yaml" ? strictUntrackRefusal(paths, deps.policy.get()) : null;
+  if (refusal !== null) {
+    writeJson(res, 409, {
+      ok: false,
+      error: untrackStrictError(refusal.refused),
+      reason: UNTRACK_STRICT_PATH_REASON,
+      refused: refusal.refused,
+      rejected: refusal.rejected,
+    });
+    return;
+  }
 
   const root = deps.policy.get().coordinatorRoot;
   const yamlPath = join(root, ".coherence", yamlFileName);

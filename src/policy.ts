@@ -68,6 +68,21 @@ export function validatePolicyPath(path: string): string | null {
   return null;
 }
 
+/** A track or untrack request's paths, split by `validatePolicyPath`, in request order. */
+export function partitionPolicyPaths(paths: ReadonlyArray<string>): {
+  valid: string[];
+  rejected: Array<{ path: string; reason: string }>;
+} {
+  const valid: string[] = [];
+  const rejected: Array<{ path: string; reason: string }> = [];
+  for (const path of paths) {
+    const reason = validatePolicyPath(path);
+    if (reason === null) valid.push(path);
+    else rejected.push({ path, reason });
+  }
+  return { valid, rejected };
+}
+
 /**
  * Default tracked patterns (Unit 2 commit 4 + KTD-L).
  *
@@ -134,8 +149,8 @@ export class TrackedArtifactPolicy {
     // A literal strict path no tracked pattern reaches puts nothing in strict
     // mode (an intersection), so no entry can cover it.
     this.coverageStrict = this.strictModePaths
-      .filter((s) => !isLiteralGlob(s) || this.matchesTracked(s))
-      .map(globOf);
+      .map(globOf)
+      .filter((s) => !s.isLiteral || this.matchesTracked(s.pattern));
     this.coverageTracked = union(this.userAddedPatterns, this.trackedPatterns).map(globOf);
   }
 
@@ -203,7 +218,7 @@ export class TrackedArtifactPolicy {
   }
 
   private matchesStrict(normalized: string): boolean {
-    return this.strictModePaths.length > 0 && matchesAny(normalized, this.strictModePaths);
+    return matchesAny(normalized, this.strictModePaths);
   }
 
   /**
@@ -287,37 +302,37 @@ export class TrackedArtifactPolicy {
    * erring toward the warning.
    */
   ignoredPatternsOverriddenByStrict(): string[] {
+    if (this.coverageStrict.length === 0) return [];
     const total = new SearchBudget(globIntersectBudgets.diagnostic);
-    return this.ignoredPatterns.filter((p) => this.strictPatternsCoveringWithin(p, total, true).length > 0);
+    return this.ignoredPatterns.filter((p) => {
+      const entry = entryGlob(p);
+      return this.coverageStrict.some((strict) => this.entryCoversStrict(entry, strict, total));
+    });
   }
 
-  private strictPatternsCoveringWithin(pattern: string, callBudget: SearchBudget, firstOnly = false): string[] {
-    const covering: string[] = [];
-    if (this.coverageStrict.length === 0) return covering;
-    // Paths are matched with a leading "./" stripped (normalizeRelative), so
-    // an entry spelled that way names the same paths.
-    const entry = globOf(normalizeRelative(pattern) ?? pattern);
-    for (const strict of this.coverageStrict) {
-      // A path both match carries both literal prefixes and suffixes; if they
-      // do not nest, the strict pattern is exactly not covered, at no cost.
-      if (!affixesNest([entry.affixes, strict.affixes])) continue;
-      let covered: boolean;
-      try {
-        covered = isLiteralGlob(strict.pattern)
-          ? // Its language is the one path (tracked: the index keeps no other),
-            // so matching it decides it exactly.
-            tokensMatch(entry.tokens, strict.pattern, callBudget)
-          : this.strictGlobCovered(entry, strict, callBudget);
-      } catch (err) {
-        if (!(err instanceof BudgetExhausted)) throw err;
-        covered = true;
-      }
-      if (covered) {
-        covering.push(strict.pattern);
-        if (firstOnly) break;
-      }
+  private strictPatternsCoveringWithin(pattern: string, callBudget: SearchBudget): string[] {
+    if (this.coverageStrict.length === 0) return [];
+    const entry = entryGlob(pattern);
+    return this.coverageStrict
+      .filter((strict) => this.entryCoversStrict(entry, strict, callBudget))
+      .map((strict) => strict.pattern);
+  }
+
+  /** Whether `entry` covers a path `strict` puts in strict mode; out of budget counts as covers. */
+  private entryCoversStrict(entry: Glob, strict: Glob, callBudget: SearchBudget): boolean {
+    // A path both match carries both literal prefixes and suffixes; if they
+    // do not nest, the strict pattern is exactly not covered, at no cost.
+    if (!affixesNest([entry.affixes, strict.affixes])) return false;
+    try {
+      // A literal strict path's language is the one path (tracked: the index
+      // keeps no other), so matching it decides it exactly.
+      return strict.isLiteral
+        ? tokensMatch(entry.tokens, strict.pattern, callBudget)
+        : this.strictGlobCovered(entry, strict, callBudget);
+    } catch (err) {
+      if (err instanceof BudgetExhausted) return true;
+      throw err;
     }
-    return covering;
   }
 
   private strictGlobCovered(entry: Glob, strict: Glob, callBudget: SearchBudget): boolean {
@@ -354,7 +369,7 @@ export class TrackedArtifactPolicy {
  * live-reloadable (plan Unit 1, "the load-bearing decision for G3").
  *
  * `createServer` captures its deps once by reference; Python re-assigns
- * `coordinator.policy = TrackedArtifactPolicy.load(root)` after every YAML
+ * `coordinator.policy = coordinator.policy.reloaded()` after every YAML
  * append. Node handlers must therefore read the policy THROUGH this ref
  * (never bind the inner TrackedArtifactPolicy), so a `reload()` after an
  * append is immediately visible to live handlers with no restart.
@@ -434,16 +449,7 @@ export function appendPolicyYaml(
 ): { added: string[]; rejected: Array<{ path: string; reason: string }> } {
   mkdirSync(dirname(yamlPath), { recursive: true });
 
-  const candidate: string[] = [];
-  const rejected: Array<{ path: string; reason: string }> = [];
-  for (const p of newPaths) {
-    const reason = validatePolicyPath(p);
-    if (reason !== null) {
-      rejected.push({ path: p, reason });
-      continue;
-    }
-    candidate.push(p);
-  }
+  const { valid: candidate, rejected } = partitionPolicyPaths(newPaths);
   if (candidate.length === 0) {
     return { added: [], rejected };
   }
@@ -750,27 +756,34 @@ function tokenAccepts(token: Token, ch: string | null): boolean {
   }
 }
 
-/** The states, sorted, plus every state a run token can skip to. */
-function closure(states: Iterable<number>, tokens: ReadonlyArray<Token>): number[] {
-  const out = new Set(states);
-  const stack = [...out];
-  while (stack.length > 0) {
-    const i = stack.pop()!;
-    if (i < tokens.length && isRun(tokens[i]!) && !out.has(i + 1)) {
-      out.add(i + 1);
-      stack.push(i + 1);
-    }
+/**
+ * The marked states, plus every state a run token can skip to, in ascending
+ * order. A run only skips to the next state, so one ascending pass closes the
+ * set and yields it sorted: no set and no sort on this hot path.
+ */
+function closedStates(marks: Uint8Array, tokens: ReadonlyArray<Token>): number[] {
+  const out: number[] = [];
+  for (let i = 0; i <= tokens.length; i++) {
+    if (marks[i] === 0) continue;
+    out.push(i);
+    if (i < tokens.length && isRun(tokens[i]!)) marks[i + 1] = 1;
   }
-  return [...out].sort((a, b) => a - b);
+  return out;
+}
+
+function closure(states: Iterable<number>, tokens: ReadonlyArray<Token>): number[] {
+  const marks = new Uint8Array(tokens.length + 1);
+  for (const i of states) marks[i] = 1;
+  return closedStates(marks, tokens);
 }
 
 function advance(states: ReadonlyArray<number>, tokens: ReadonlyArray<Token>, ch: string | null): number[] {
-  const next = new Set<number>();
+  const marks = new Uint8Array(tokens.length + 1);
   for (const i of states) {
     if (i >= tokens.length || !tokenAccepts(tokens[i]!, ch)) continue;
-    next.add(isRun(tokens[i]!) ? i : i + 1);
+    marks[isRun(tokens[i]!) ? i : i + 1] = 1;
   }
-  return closure(next, tokens);
+  return closedStates(marks, tokens);
 }
 
 /**
@@ -853,16 +866,26 @@ interface Glob {
   readonly pattern: string;
   readonly tokens: ReadonlyArray<Token>;
   readonly affixes: readonly [string, string];
+  /** True when the pattern matches exactly one path, itself. */
+  readonly isLiteral: boolean;
 }
 
 function globOf(pattern: string): Glob {
   const tokens = globTokens(pattern);
-  return { pattern, tokens, affixes: literalAffixes(tokens) };
+  return {
+    pattern,
+    tokens,
+    affixes: literalAffixes(tokens),
+    isLiteral: tokens.every((t) => t.kind === "lit"),
+  };
 }
 
-/** True when `pattern` matches exactly one path, itself. */
-function isLiteralGlob(pattern: string): boolean {
-  return !pattern.includes("*") && !pattern.includes("?");
+/**
+ * An untrack entry as a glob. Paths are matched with a leading "./" stripped
+ * (`normalizeRelative`), so an entry spelled that way names the same paths.
+ */
+function entryGlob(pattern: string): Glob {
+  return globOf(normalizeRelative(pattern) ?? pattern);
 }
 
 function literalRun(tokens: Iterable<Token>): string {
@@ -907,16 +930,8 @@ export function globsIntersect(tokenLists: ReadonlyArray<ReadonlyArray<Token>>, 
   // Most pairs an untrack check meets (`.log` against `.json`, `svc3/` against
   // `svc7/`) fail on their literal ends: settled without a search.
   if (!affixesNest(tokenLists.map(literalAffixes))) return false;
-  const named = new Set<string>(["/"]);
-  for (const tokens of tokenLists) {
-    for (const token of tokens) {
-      if (token.kind === "lit") named.add(token.ch);
-    }
-  }
-  // Sorted, so the bounded search explores in the same order on every run and
-  // the same entry is never refused on one coordinator and accepted on the next.
-  const alphabet: Array<string | null> = [...[...named].sort(), null];
-  const key = (state: ReadonlyArray<ReadonlyArray<number>>) => state.map((s) => s.join(",")).join("|");
+  const alphabet = searchAlphabet(tokenLists);
+  const key =(state: ReadonlyArray<ReadonlyArray<number>>) => state.map((s) => s.join(",")).join("|");
   const start = tokenLists.map((tokens) => closure([0], tokens));
   const seen = new Set([key(start)]);
   const frontier = [start];
@@ -936,6 +951,22 @@ export function globsIntersect(tokenLists: ReadonlyArray<ReadonlyArray<Token>>, 
     }
   }
   return false;
+}
+
+/**
+ * Every character the patterns name, `/`, and `null` for every other
+ * character. Sorted, so the bounded search explores in the same order on every
+ * run and the same entry is never refused on one coordinator and accepted on
+ * the next.
+ */
+function searchAlphabet(tokenLists: ReadonlyArray<ReadonlyArray<Token>>): Array<string | null> {
+  const named = new Set<string>(["/"]);
+  for (const tokens of tokenLists) {
+    for (const token of tokens) {
+      if (token.kind === "lit") named.add(token.ch);
+    }
+  }
+  return [...[...named].sort(), null];
 }
 
 /** Order-preserving union: `first`, then what `second` adds. */
