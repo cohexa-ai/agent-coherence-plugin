@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { ArtifactRegistry } from "../registry.js";
-import { PolicyRef } from "../policy.js";
+import { DEFAULT_TRACKED_PATTERNS, PolicyRef } from "../policy.js";
 import { SessionRegistry } from "../sessions.js";
 import { createServer } from "../server.js";
 
@@ -52,6 +52,12 @@ async function makeServer(policyFiles: Record<string, string> = {}) {
     });
     return { status: res.status, body: (await res.json()) as Record<string, unknown> };
   };
+  const get = async (path: string) => {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      headers: { Authorization: `Bearer ${SECRET}`, Host: "127.0.0.1" },
+    });
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
   const cleanup = () =>
     new Promise<void>((r) => {
       server.close(() => {
@@ -60,7 +66,7 @@ async function makeServer(policyFiles: Record<string, string> = {}) {
         r();
       });
     });
-  return { registry, sessions, post, cleanup, root: tmp };
+  return { registry, sessions, post, get, cleanup, root: tmp };
 }
 
 // ---------------------------------------------------------------- pre-bash
@@ -444,6 +450,26 @@ test("policy/untrack and /track: a '*'-led glob keeps every earlier entry in for
     assert.deepEqual(r.body, { ok: true, removed: ["*.log"], rejected: [] });
     // Still ignored: the earlier untrack of notes.md survives the '*' entry.
     assert.deepEqual((await casOnNotes()).body, { ok: true });
+  } finally {
+    await cleanup();
+  }
+});
+
+// ---------------------------------------------------------------- /status
+
+test("/status: a policy file that loads as no entries counts as rejected (#192)", async () => {
+  const { get, cleanup } = await makeServer({ "tracked.yaml": "- data/**\n- *.md\n" });
+  try {
+    const r = await get("/status");
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.policy_summary, {
+      coordinator_root: ".",
+      default_pattern_count: DEFAULT_TRACKED_PATTERNS.length,
+      user_added_pattern_count: 0,
+      ignored_pattern_count: 0,
+      strict_mode_pattern_count: 0,
+      rejected_pattern_count: 1,
+    });
   } finally {
     await cleanup();
   }

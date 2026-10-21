@@ -111,6 +111,7 @@ export interface PolicySummary {
   default_pattern_count: number;
   user_added_pattern_count: number;
   ignored_pattern_count: number;
+  strict_mode_pattern_count: number;
   rejected_pattern_count: number;
 }
 
@@ -359,6 +360,7 @@ export class TrackedArtifactPolicy {
       default_pattern_count: this.trackedPatterns.length,
       user_added_pattern_count: this.userAddedPatterns.length,
       ignored_pattern_count: this.ignoredPatterns.length,
+      strict_mode_pattern_count: this.strictModePaths.length,
       rejected_pattern_count: this.rejectedPatterns.length,
     };
   }
@@ -1013,39 +1015,10 @@ function patternToRegex(pattern: string): string {
  * Read a YAML file containing a list of pattern strings. Apply path-traversal
  * guard. Returns surviving patterns; mutates rejected with (pattern, reason)
  * for each rejection.
- *
- * Missing file → []. Malformed YAML → [] + logged WARNING. Non-list top-level → [].
  */
 function loadYamlPatterns(yamlPath: string, rejected: RejectedPattern[]): string[] {
-  let stat;
-  try {
-    stat = statSync(yamlPath);
-  } catch {
-    return [];
-  }
-  if (!stat.isFile()) return [];
-
-  let raw: unknown;
-  try {
-    const text = readFileSync(yamlPath, "utf8");
-    raw = yamlLoad(text);
-  } catch (err) {
-    process.stderr.write(
-      `agent-coherence: WARNING — malformed YAML at ${yamlPath}; falling back to defaults: ${String(err)}\n`,
-    );
-    return [];
-  }
-
-  if (raw === null || raw === undefined) return [];
-  if (!Array.isArray(raw)) {
-    process.stderr.write(
-      `agent-coherence: WARNING — ${yamlPath} top-level must be a list of patterns; got ${typeof raw}. Ignoring.\n`,
-    );
-    return [];
-  }
-
   const surviving: string[] = [];
-  for (const item of raw) {
+  for (const item of loadYamlList(yamlPath, rejected)) {
     if (typeof item !== "string") {
       rejected.push({ pattern: String(item), reason: `non-string pattern (${typeof item})` });
       continue;
@@ -1058,6 +1031,85 @@ function loadYamlPatterns(yamlPath: string, rejected: RejectedPattern[]): string
     surviving.push(item);
   }
   return surviving;
+}
+
+/**
+ * The top-level list of a policy file, or [] when the file loads as no entries.
+ *
+ * Missing, empty or null file → []. An unreadable file, malformed YAML or a
+ * non-list top level → [] + logged WARNING + one rejected entry for the whole
+ * file, under the name and reason the Python coordinator records (#192): the
+ * warning reaches only the coordinator's log, and the rejected count on
+ * /status is what tells an emptied file apart from no user patterns.
+ */
+function loadYamlList(yamlPath: string, rejected: RejectedPattern[]): unknown[] {
+  let stat;
+  try {
+    stat = statSync(yamlPath);
+  } catch {
+    return [];
+  }
+  if (!stat.isFile()) return [];
+
+  const name = policyFileName(yamlPath);
+  let text: string;
+  try {
+    text = readFileSync(yamlPath, "utf8");
+  } catch (err) {
+    process.stderr.write(
+      `agent-coherence: WARNING — could not read ${yamlPath}; it loads as no entries: ${String(err)}\n`,
+    );
+    rejected.push({ pattern: name, reason: "could not be read, so the file loads as no entries" });
+    return [];
+  }
+
+  let raw: unknown;
+  try {
+    raw = yamlLoad(text);
+  } catch (err) {
+    process.stderr.write(
+      `agent-coherence: WARNING — malformed YAML at ${yamlPath}; falling back to defaults: ${String(err)}\n`,
+    );
+    rejected.push({ pattern: name, reason: "not valid YAML, so the file loads as no entries" });
+    return [];
+  }
+
+  if (raw === null || raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    process.stderr.write(
+      `agent-coherence: WARNING — ${yamlPath} top-level must be a list of patterns; got ${typeof raw}. Ignoring.\n`,
+    );
+    rejected.push({
+      pattern: name,
+      reason: `top level is ${pythonTypeName(raw)}, not a list, so the file loads as no entries`,
+    });
+    return [];
+  }
+  return raw;
+}
+
+/**
+ * The name the Python coordinator's loader gives a top level that is not a
+ * list (`type(raw).__name__`). Only the rejected count reaches /status, so
+ * where js-yaml types a scalar differently from PyYAML (`4.0` and `1e3` load
+ * as integers here, and a timestamp at exactly midnight UTC reads as a date)
+ * the name is close rather than exact.
+ */
+function pythonTypeName(value: unknown): string {
+  if (typeof value === "string") return "str";
+  if (typeof value === "boolean") return "bool";
+  if (typeof value === "number") return Number.isInteger(value) ? "int" : "float";
+  if (value instanceof Date) {
+    const midnight =
+      value.getUTCHours() === 0 &&
+      value.getUTCMinutes() === 0 &&
+      value.getUTCSeconds() === 0 &&
+      value.getUTCMilliseconds() === 0;
+    return midnight ? "date" : "datetime";
+  }
+  if (ArrayBuffer.isView(value)) return "bytes";
+  if (typeof value === "object") return "dict";
+  return typeof value;
 }
 
 /** Path-traversal guard. Returns null if pattern is acceptable, else a short reason. */

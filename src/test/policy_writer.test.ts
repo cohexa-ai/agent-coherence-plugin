@@ -451,3 +451,131 @@ test("PolicyRef: without strict patterns a reload reads the files verbatim", () 
     cleanup();
   }
 });
+
+// The Python coordinator records a policy file that loads as no entries as
+// (".coherence/<file>", reason) (#192); these are its reasons, word for word.
+const NOT_YAML = "not valid YAML, so the file loads as no entries";
+const UNREADABLE = "could not be read, so the file loads as no entries";
+const notAList = (type: string) => `top level is ${type}, not a list, so the file loads as no entries`;
+
+function seedPolicy(root: string, files: Record<string, string>): void {
+  mkdirSync(join(root, ".coherence"), { recursive: true });
+  for (const [name, text] of Object.entries(files)) {
+    writeFileSync(join(root, ".coherence", name), text, "utf8");
+  }
+}
+
+test("TrackedArtifactPolicy: a policy file that loads as no entries is counted as rejected (#192)", () => {
+  const { root, cleanup } = makeRoot();
+  try {
+    // The unquoted `- *.md` plugin v0.3.0 to v0.5.0 wrote is a YAML alias.
+    seedPolicy(root, {
+      "tracked.yaml": "- data/**\n- *.md\n",
+      "ignored.yaml": "mode: strict\n",
+      "strict_mode.yaml": "runbook.md\n",
+    });
+    const policy = TrackedArtifactPolicy.load(root);
+    assert.deepEqual(policy.rejectedPatterns, [
+      { pattern: ".coherence/tracked.yaml", reason: NOT_YAML },
+      { pattern: ".coherence/ignored.yaml", reason: notAList("dict") },
+      { pattern: ".coherence/strict_mode.yaml", reason: notAList("str") },
+    ]);
+    assert.equal(policy.summary().rejected_pattern_count, 3);
+    assert.equal(policy.summary().user_added_pattern_count, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("TrackedArtifactPolicy: an unreadable policy file is counted as rejected, in file order (#192)", () => {
+  if (process.getuid?.() === 0) return; // root reads a mode-000 file
+  const { root, cleanup } = makeRoot();
+  const tracked = join(root, ".coherence", "tracked.yaml");
+  try {
+    seedPolicy(root, { "tracked.yaml": '- "keep.md"\n', "ignored.yaml": '- "../x"\n' });
+    chmodSync(tracked, 0o000);
+    const policy = TrackedArtifactPolicy.load(root);
+    assert.deepEqual(policy.rejectedPatterns, [
+      { pattern: ".coherence/tracked.yaml", reason: UNREADABLE },
+      { pattern: "../x", reason: "contains '..' (path traversal)" },
+    ]);
+    assert.equal(policy.summary().user_added_pattern_count, 0);
+  } finally {
+    chmodSync(tracked, 0o600);
+    cleanup();
+  }
+});
+
+test("TrackedArtifactPolicy: an empty, null or non-file policy file is not rejected (#192)", () => {
+  const { root, cleanup } = makeRoot();
+  try {
+    seedPolicy(root, { "tracked.yaml": "", "ignored.yaml": "~\n" });
+    mkdirSync(join(root, ".coherence", "strict_mode.yaml"));
+    assert.deepEqual(TrackedArtifactPolicy.load(root).rejectedPatterns, []);
+  } finally {
+    cleanup();
+  }
+});
+
+test("TrackedArtifactPolicy: names a non-list top level by the Python coordinator's type name (#192)", () => {
+  const cases: Array<[string, string]> = [
+    ["42\n", "int"],
+    ["4.5\n", "float"],
+    ["true\n", "bool"],
+    ["a: 1\n", "dict"],
+    ["plain\n", "str"],
+    ["2026-01-01\n", "date"],
+    ["2026-01-01T10:30:00Z\n", "datetime"],
+    ["2026-01-01T00:30:00Z\n", "datetime"],
+    ["2026-01-01T00:00:30Z\n", "datetime"],
+    ["2026-01-01T00:00:00.5Z\n", "datetime"],
+    ["!!binary aGVsbG8=\n", "bytes"],
+  ];
+  for (const [text, type] of cases) {
+    const { root, cleanup } = makeRoot();
+    try {
+      seedPolicy(root, { "tracked.yaml": text });
+      assert.deepEqual(
+        TrackedArtifactPolicy.load(root).rejectedPatterns,
+        [{ pattern: ".coherence/tracked.yaml", reason: notAList(type) }],
+        JSON.stringify(text),
+      );
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+test("TrackedArtifactPolicy: summary reports strict_mode_pattern_count, in the Python key order (#192)", () => {
+  const { root, cleanup } = makeRoot();
+  try {
+    seedPolicy(root, { "tracked.yaml": '- "data/**"\n', "strict_mode.yaml": '- "data/**"\n- "docs/*.md"\n' });
+    const summary = TrackedArtifactPolicy.load(root).summary();
+    assert.deepEqual(Object.keys(summary), [
+      "coordinator_root",
+      "default_pattern_count",
+      "user_added_pattern_count",
+      "ignored_pattern_count",
+      "strict_mode_pattern_count",
+      "rejected_pattern_count",
+    ]);
+    assert.equal(summary.strict_mode_pattern_count, 2);
+  } finally {
+    cleanup();
+  }
+});
+
+test("PolicyRef: a reload counts a policy file that broke mid-run, without narrowing strict (#192)", () => {
+  const { root, cleanup } = makeRoot();
+  try {
+    seedPolicy(root, { "tracked.yaml": '- "data/**"\n', "strict_mode.yaml": '- "data/**"\n' });
+    const ref = PolicyRef.load(root);
+    writeFileSync(join(root, ".coherence", "tracked.yaml"), "- data/**\n- *.md\n", "utf8");
+    ref.reload();
+    assert.equal(ref.isStrictMode("data/a.json"), true);
+    assert.equal(ref.summary().user_added_pattern_count, 1);
+    assert.equal(ref.summary().rejected_pattern_count, 1);
+  } finally {
+    cleanup();
+  }
+});
