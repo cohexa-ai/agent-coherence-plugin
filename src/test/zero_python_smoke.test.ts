@@ -234,6 +234,43 @@ test("ZERO-PYTHON SMOKE: four-step warn sequence + strict deny, no Python (or an
   }
 });
 
+test("ZERO-PYTHON SMOKE: the untrack CLI exits 3 when the Node coordinator refuses a strict path, and nothing is written", async () => {
+  // Cohexa-ai/agent-coherence#261: the coordinator's 409 and the CLI's
+  // classification of it, end to end through the compiled CLI.
+  const root = mkdtempSync(join(tmpdir(), "zero-py-untrack-"));
+  const emptyDir = join(root, "empty-path");
+  mkdirSync(emptyDir, { recursive: true });
+  mkdirSync(join(root, ".coherence"), { recursive: true });
+  writeFileSync(join(root, ".coherence", "strict_mode.yaml"), '- "CLAUDE.md"\n');
+  const env = zeroPythonEnv(emptyDir);
+  try {
+    const { close } = await makeCoordinator(root, "s".repeat(32));
+    // MUST be async spawn: spawnSync would deadlock the in-process server.
+    const untrack = (path: string) =>
+      new Promise<{ status: number | null; stderr: string }>((r) => {
+        const child = spawn(
+          process.execPath,
+          [join(dirname(HOOK_CLIENT_JS), "cli_untrack.js"), path, "--root", root],
+          { cwd: root, env, stdio: ["ignore", "ignore", "pipe"] },
+        );
+        let stderr = "";
+        child.stderr.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
+        child.on("close", (status) => r({ status, stderr }));
+      });
+
+    const refused = await untrack("CLAUDE.md");
+    assert.equal(refused.status, 3, refused.stderr);
+    assert.match(refused.stderr, /refused 'CLAUDE\.md': enforced in strict mode by CLAUDE\.md/);
+    assert.equal(existsSync(join(root, ".coherence", "ignored.yaml")), false);
+
+    const plain = await untrack("notes.md");
+    assert.equal(plain.status, 0, plain.stderr);
+    await close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test(
   "install-time zero-Python assertion (decision B) — opt-in via ZERO_PYTHON_INSTALL_CHECK=1",
   { skip: process.env.ZERO_PYTHON_INSTALL_CHECK !== "1" },
