@@ -1020,7 +1020,10 @@ function loadYamlPatterns(yamlPath: string, rejected: RejectedPattern[]): string
   const surviving: string[] = [];
   for (const item of loadYamlList(yamlPath, rejected)) {
     if (typeof item !== "string") {
-      rejected.push({ pattern: String(item), reason: `non-string pattern (${typeof item})` });
+      rejected.push({
+        pattern: describeNonString(item),
+        reason: `non-string pattern (${typeof item})`,
+      });
       continue;
     }
     const reason = validatePattern(item);
@@ -1031,6 +1034,18 @@ function loadYamlPatterns(yamlPath: string, rejected: RejectedPattern[]): string
     surviving.push(item);
   }
   return surviving;
+}
+
+/**
+ * A non-string policy entry as rejected-pattern text, without calling the
+ * entry's own stringifier: String() on a committed `- {toString: 1}` throws,
+ * and on nested aliases it builds every expansion (CWE-776). Only the rejected
+ * count reaches /status, so the text need not match Python's str(item).
+ */
+function describeNonString(item: unknown): string {
+  const isPrimitive = item === null || (typeof item !== "object" && typeof item !== "function");
+  if (isPrimitive) return String(item);
+  return Array.isArray(item) ? "<list>" : `<${pythonTypeName(item)}>`;
 }
 
 /**

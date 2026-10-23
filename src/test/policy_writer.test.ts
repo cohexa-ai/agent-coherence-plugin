@@ -579,3 +579,69 @@ test("PolicyRef: a reload counts a policy file that broke mid-run, without narro
     cleanup();
   }
 });
+
+// A committed policy file is attacker-shaped input: describing a non-string
+// entry must never run its own stringifier or walk its aliases.
+test("TrackedArtifactPolicy: a non-string entry with an uncallable toString is rejected, not thrown", () => {
+  const { root, cleanup } = makeRoot();
+  try {
+    seedPolicy(root, { "tracked.yaml": '- {toString: 1}\n- "data/**"\n' });
+    const policy = TrackedArtifactPolicy.load(root);
+    assert.deepEqual(policy.rejectedPatterns, [
+      { pattern: "<dict>", reason: "non-string pattern (object)" },
+    ]);
+    assert.equal(policy.summary().user_added_pattern_count, 1);
+    const ref = PolicyRef.load(root);
+    ref.reload();
+    assert.equal(ref.summary().rejected_pattern_count, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("TrackedArtifactPolicy: a nested-alias entry is rejected without expanding its aliases", () => {
+  // Eight levels of nine aliases: String() of this entry builds ~194M
+  // characters (one level more exceeds V8's string limit and throws).
+  const anchors = "abcdefgh".split("");
+  const levels = anchors.map((name, i) => {
+    const members = i === 0 ? Array(9).fill("lol") : Array(9).fill(`*${anchors[i - 1]}`);
+    return `&${name} [${members.join(",")}]`;
+  });
+  const { root, cleanup } = makeRoot();
+  try {
+    seedPolicy(root, { "tracked.yaml": `- [${levels.join(", ")}]\n` });
+    const start = performance.now();
+    const policy = TrackedArtifactPolicy.load(root);
+    assert.ok(performance.now() - start < 250, `${(performance.now() - start).toFixed(0)} ms`);
+    assert.deepEqual(policy.rejectedPatterns, [
+      { pattern: "<list>", reason: "non-string pattern (object)" },
+    ]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("TrackedArtifactPolicy: names a non-string entry by its value or Python type name", () => {
+  const cases: Array<[string, string, string]> = [
+    ["42", "42", "number"],
+    ["true", "true", "boolean"],
+    ["~", "null", "object"],
+    ["[a, b]", "<list>", "object"],
+    ["{a: 1}", "<dict>", "object"],
+    ["2026-01-01", "<date>", "object"],
+    ["!!binary aGVsbG8=", "<bytes>", "object"],
+  ];
+  for (const [entry, pattern, type] of cases) {
+    const { root, cleanup } = makeRoot();
+    try {
+      seedPolicy(root, { "tracked.yaml": `- ${entry}\n` });
+      assert.deepEqual(
+        TrackedArtifactPolicy.load(root).rejectedPatterns,
+        [{ pattern, reason: `non-string pattern (${type})` }],
+        entry,
+      );
+    } finally {
+      cleanup();
+    }
+  }
+});
