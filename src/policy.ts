@@ -443,8 +443,10 @@ export class PolicyRef {
  *
  * Locking note (deliberate divergence from Python's fcntl.flock): all Node
  * writes flow through the single coordinator process whose handlers are
- * synchronous on one event loop, and the pid-file mutex guarantees one
- * coordinator per workspace — so there is no concurrent writer to exclude.
+ * synchronous on one event loop, and the coordinator's lock on server.pid
+ * (coordinator_lock.ts, #217) keeps one coordinator per workspace — so there
+ * is no concurrent writer to exclude. A host that cannot take that lock logs
+ * so at start-up and has no such guarantee.
  * The write itself is tmp-file + atomic rename so a crash cannot leave a
  * torn YAML.
  */

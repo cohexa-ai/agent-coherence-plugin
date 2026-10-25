@@ -428,33 +428,166 @@ if [ ! -f "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" ]; then
   exit 1
 fi
 
-# Stage 3: simple "is coordinator running" check (WORKSPACE/PIDFILE resolved
-# up top, before the virgin-store marker). Unit 5 replaces this best-effort
-# check with a proper fcntl flock per KTD-A.5 point 1.
+# Whether a coordinator holds its lock on server.pid: held, free, or unknown
+# when no lock tool here can tell. A coordinator, Node or Python, holds an
+# exclusive flock on the file for its whole life, and the kernel drops it when
+# the coordinator dies (#217). Each probe takes the lock for an instant, shared
+# where it can, as the Python coordinator's own probe does, so two probes do
+# not read each other as a coordinator; a coordinator starting at that moment
+# retries.
+pidfile_lock_state() {
+  local status
+  # No file, no holder; and flock(1) would create one.
+  [ -f "$PIDFILE" ] || { echo free; return; }
+  # perl first: it alone tells a held lock (1) from a file system that cannot
+  # lock (3), where BusyBox flock(1) exits 1 for both.
+  if command -v perl >/dev/null 2>&1; then
+    perl -MFcntl=:flock -e 'open(my $fh, "<", $ARGV[0]) or exit 2; exit 0 if flock($fh, LOCK_SH | LOCK_NB); exit($!{EWOULDBLOCK} ? 1 : 3)' "$PIDFILE" 2>/dev/null
+    status=$?
+    case "$status" in 0) echo free; return ;; 1) echo held; return ;; 3) echo unknown; return ;; esac
+  fi
+  if command -v flock >/dev/null 2>&1; then
+    flock -s -n "$PIDFILE" true 2>/dev/null
+    status=$?
+    case "$status" in 0) echo free; return ;; 1) echo held; return ;; esac
+  fi
+  case "${OSTYPE:-}" in
+    darwin*)
+      # Exclusive only. -k: without it lockf deletes the file once the
+      # command has run.
+      lockf -k -n -s -t 0 "$PIDFILE" true 2>/dev/null
+      status=$?
+      case "$status" in 0) echo free; return ;; 75) echo held; return ;; esac
+      ;;
+  esac
+  echo unknown
+}
+
+# The pid a server.pid content ($1) publishes as serving: line 1 when line 2
+# holds a port and that pid is alive; nothing otherwise. A coordinator that is
+# starting has not written its port yet, and one that is stopping has removed it.
+serving_pid_in() {
+  local pid port
+  pid="$(printf '%s\n' "$1" | sed -n 1p)"
+  port="$(printf '%s\n' "$1" | sed -n 2p)"
+  if [ -n "$pid" ] && [ -n "$port" ] && kill -0 "$pid" 2>/dev/null; then
+    printf '%s' "$pid"
+  fi
+}
+
+# Whether pid $1 is alive and, where ps can say, runs a coordinator: the pid
+# in a stale server.pid may since belong to any process.
+pid_runs_coordinator() {
+  local command_line
+  kill -0 "$1" 2>/dev/null || return 1
+  # BusyBox ps has no -p; /proc says the same on Linux. Where neither can
+  # say, the pid's liveness decides, as before.
+  command_line="$(ps -ww -p "$1" -o command= 2>/dev/null)" ||
+    command_line="$(tr '\0' ' ' 2>/dev/null <"/proc/$1/cmdline")" ||
+    { kill -0 "$1" 2>/dev/null; return; }
+  case "$command_line" in
+    *dist/coordinator.js*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# First-provision backend stamp: this bootstrap initialized a VIRGIN workspace
+# (no state.db before boot) and a Node coordinator serves it, or at least is
+# still alive at the startup deadline below, so the store is Node-owned from
+# birth. Record that as the explicit backend selection. Without the stamp, the
+# dispatcher's guard (a) (state.db present → python default) would misread the
+# Node-born store as an established Python workspace on the NEXT session and
+# route to the Python bootstrap — one working session, then silent degrade
+# after reboot on exactly the zero-Python machines the Node default exists
+# for. An operator's existing selection file is never overwritten.
+stamp_node_backend() {
+  if [ "$workspace_had_state_db" = "0" ] && [ ! -f "${WORKSPACE}/.coherence/coordinator_backend" ]; then
+    mkdir -p "${WORKSPACE}/.coherence"
+    echo "node" >"${WORKSPACE}/.coherence/coordinator_backend"
+  fi
+}
+
+# Another session's coordinator serves this workspace instead of the one
+# started here (#217), which exits without touching it. The store is
+# Node-owned only if that one is Node's: the Python coordinator's server.pid
+# has no backend line.
+finish_joined() {
+  echo "agent-coherence: $1" >&2
+  if [ "$(sed -n 3p "$PIDFILE" 2>/dev/null)" = "backend=node" ]; then
+    stamp_node_backend
+  fi
+  exit 0
+}
+
+# Stage 3: is a coordinator already serving this workspace (WORKSPACE/PIDFILE
+# resolved up top, before the virgin-store marker)? One holding the lock with
+# its port published is. One holding it without a port is starting or
+# stopping: a coordinator is started anyway, and the lock decides, so this
+# session joins the holder once it serves or takes over once it lets go. A
+# Node coordinator started before the lock existed holds none and keeps
+# serving after a plugin update, so a live one named by a `backend=node` file
+# counts too; with no lock tool at all, any live pid does, as before.
 if [ -f "$PIDFILE" ]; then
   EXISTING_PID=$(head -1 "$PIDFILE" 2>/dev/null || echo "")
-  if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
-    echo "agent-coherence: coordinator already running (pid=$EXISTING_PID)" >&2
+  lock_state="$(pidfile_lock_state)"
+  coordinator_running=0
+  if [ "$lock_state" = "held" ]; then
+    [ -n "$(serving_pid_in "$(cat "$PIDFILE" 2>/dev/null)")" ] && coordinator_running=1
+  elif [ -n "$EXISTING_PID" ]; then
+    if [ "$(sed -n 3p "$PIDFILE" 2>/dev/null)" = "backend=node" ]; then
+      pid_runs_coordinator "$EXISTING_PID" && coordinator_running=1
+    elif [ "$lock_state" = "unknown" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+      coordinator_running=1
+    fi
+  fi
+  if [ "$coordinator_running" = "1" ]; then
+    echo "agent-coherence: coordinator already running${EXISTING_PID:+ (pid=$EXISTING_PID)}" >&2
     exit 0
   fi
-  echo "agent-coherence: stale pid file (pid='${EXISTING_PID}' not running); spawning fresh" >&2
+  if [ "$lock_state" = "held" ]; then
+    echo "agent-coherence: a coordinator holds ${PIDFILE} but serves no port (starting or stopping); starting one that waits for it" >&2
+  else
+    echo "agent-coherence: stale pid file (pid='${EXISTING_PID}' not running); spawning fresh" >&2
+  fi
 fi
 
-# Stage 4: spawn the coordinator. Detach from the SessionStart hook's
-# process group so the hook can exit cleanly while the coordinator keeps
-# running for subsequent PreToolUse / Stop hook calls.
+# Stage 4: spawn the coordinator in a session of its own (node's spawn with
+# detached: true calls setsid; macOS ships no setsid(1)), so nothing that
+# signals the SessionStart hook's process group, as a hook timeout may,
+# reaches the coordinator that later hooks need. The launcher prints the
+# coordinator's own pid, also when `node` is a launcher that does not exec.
 COORD_LOG="${CLAUDE_PLUGIN_DATA}/coordinator.log"
+# Whether the coordinator started here exited because another held the lock,
+# as its last log line says; the log is shared by every session's coordinator.
+spawned_coordinator_lost() {
+  [ -n "$SPAWNED_PID" ] && tail -n 50 "$COORD_LOG" 2>/dev/null | grep -qF "; exiting (pid=${SPAWNED_PID})"
+}
+launch_coordinator() {
+  node -e '
+const { spawn } = require("node:child_process");
+const { openSync } = require("node:fs");
+const [entry, logPath] = process.argv.slice(1);
+const log = openSync(logPath, "a");
+const child = spawn(process.execPath, [entry], { detached: true, stdio: ["ignore", log, log] });
+if (child.pid !== undefined) process.stdout.write(String(child.pid));
+child.unref();
+' "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" "$COORD_LOG" 2>>"$COORD_LOG"
+}
 pidfile_before_spawn="$(cat "$PIDFILE" 2>/dev/null)"
-nohup node "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" >>"$COORD_LOG" 2>&1 &
-SPAWNED_PID=$!
-disown 2>/dev/null || true
+SPAWNED_PID="$(launch_coordinator)"
 
 # Startup gate: wait until a coordinator serves this workspace or ours exits.
-# A coordinator writes server.pid naming itself once it has bound its port, so
-# the workspace is served once server.pid changes to name a live process. That
-# is ours, or ours under a `node` launcher that does not exec (its pid is not
-# $!), or another session's when two start at once (#217). A changed file, not
-# just a different pid, so a stale file whose pid was reused never counts.
+# A coordinator writes server.pid naming itself, with its port, once it has
+# bound that port, so the workspace is served once server.pid changes to
+# publish a live pid. That is ours, or another session's when two start at
+# once (#217): ours then waits for the lock and exits, so that session is
+# joined, not spawned. Where no lock tool can tell, both serve, as before
+# #217, and the session reports its own. A changed file, not just a different
+# pid, so a stale file whose pid was reused never counts. Ours exiting is a
+# failure unless another coordinator holds the lock: one that has published
+# already is joined at once, one still starting is waited for, and one that
+# lets go without serving (stopping slower than ours waits for the lock) gets
+# one more coordinator started in its place.
 #
 # A fixed half-second wait was not enough: a coordinator fails start-up only
 # after loading its native module and opening state.db, which took 1.3-1.7 s
@@ -464,18 +597,46 @@ disown 2>/dev/null || true
 # only be slow. Only the spawn path pays this; a running session exits above.
 READY_TIMEOUT_S=10
 ready_deadline=$((SECONDS + READY_TIMEOUT_S))
-coordinator_serving=0
-while kill -0 "$SPAWNED_PID" 2>/dev/null; do
+gate_outcome=waiting
+relaunched=0
+while :; do
   pidfile_now="$(cat "$PIDFILE" 2>/dev/null)"
-  serving_pid="$(printf '%s\n' "$pidfile_now" | head -n 1)"
-  if [ "$pidfile_now" != "$pidfile_before_spawn" ] && [ -n "$serving_pid" ] && kill -0 "$serving_pid" 2>/dev/null; then
-    coordinator_serving=1
+  serving_pid="$(serving_pid_in "$pidfile_now")"
+  if [ "$pidfile_now" != "$pidfile_before_spawn" ] && [ -n "$serving_pid" ]; then
+    if [ "$serving_pid" = "$SPAWNED_PID" ] || [ "$(pidfile_lock_state)" = "unknown" ]; then
+      gate_outcome=serving
+    else
+      gate_outcome=joined
+    fi
     break
+  fi
+  if ! kill -0 "$SPAWNED_PID" 2>/dev/null; then
+    if [ "$(pidfile_lock_state)" = "held" ]; then
+      if [ -n "$serving_pid" ]; then
+        gate_outcome=joined
+        break
+      fi
+    elif [ "$relaunched" = "0" ] && spawned_coordinator_lost; then
+      echo "agent-coherence: the coordinator holding ${PIDFILE} let go without serving; starting another" >&2
+      relaunched=1
+      pidfile_before_spawn="$(cat "$PIDFILE" 2>/dev/null)"
+      SPAWNED_PID="$(launch_coordinator)"
+    else
+      gate_outcome=exited
+      break
+    fi
   fi
   [ "$SECONDS" -ge "$ready_deadline" ] && break
   sleep 0.1
 done
-if ! kill -0 "$SPAWNED_PID" 2>/dev/null; then
+
+if [ "$gate_outcome" = "joined" ]; then
+  finish_joined "another coordinator already serves this workspace (pid=${serving_pid}); the one started here (pid=${SPAWNED_PID}) exits"
+fi
+if [ "$gate_outcome" = "waiting" ] && ! kill -0 "$SPAWNED_PID" 2>/dev/null && [ "$(pidfile_lock_state)" = "held" ]; then
+  finish_joined "another coordinator holds ${PIDFILE} but has not started serving after ${READY_TIMEOUT_S}s (see ${COORD_LOG})"
+fi
+if [ "$gate_outcome" != "serving" ] && ! kill -0 "$SPAWNED_PID" 2>/dev/null; then
   echo "agent-coherence: Node coordinator exited before it started serving; recent ${COORD_LOG}:" >&2
   tail -n 12 "$COORD_LOG" >&2 2>/dev/null || true
   # A NODE_MODULE_VERSION death means node_modules is ABI-stale despite a
@@ -491,23 +652,9 @@ if ! kill -0 "$SPAWNED_PID" 2>/dev/null; then
   fi
   exit 1
 fi
-if [ "$coordinator_serving" = "0" ]; then
+if [ "$gate_outcome" = "waiting" ]; then
   echo "agent-coherence: Node coordinator (pid=${SPAWNED_PID}) has not started serving after ${READY_TIMEOUT_S}s; it may still be starting (see ${COORD_LOG})" >&2
 fi
 
-# First-provision backend stamp: this bootstrap just initialized a VIRGIN
-# workspace (no state.db before boot) and its coordinator is serving, or at
-# least still alive at the deadline above, so the store is Node-owned from
-# birth. Record that as the explicit backend
-# selection. Without the stamp, the dispatcher's guard (a) (state.db present
-# → python default) would misread the Node-born store as an established
-# Python workspace on the NEXT session and route to the Python bootstrap —
-# one working session, then silent degrade after reboot on exactly the
-# zero-Python machines the Node default exists for. An operator's existing
-# selection file is never overwritten.
-if [ "$workspace_had_state_db" = "0" ] && [ ! -f "${WORKSPACE}/.coherence/coordinator_backend" ]; then
-  mkdir -p "${WORKSPACE}/.coherence"
-  echo "node" >"${WORKSPACE}/.coherence/coordinator_backend"
-fi
-
+stamp_node_backend
 echo "agent-coherence: spawned Node coordinator (pid=${SPAWNED_PID}, log=${COORD_LOG})" >&2

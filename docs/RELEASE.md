@@ -361,8 +361,10 @@ This is an OPERATOR step, not an automated one. The plugin cannot rotate the sec
 # 2. Verify no coordinator process is still alive.
 cd <repo>
 cat .coherence/server.pid 2>/dev/null
-# If a PID is listed, kill it:
-kill $(head -1 .coherence/server.pid) 2>/dev/null
+# A stopped or crashed coordinator leaves its pid on line 1, and that pid may
+# since belong to another process. Kill it only while it runs the coordinator:
+pid="$(head -1 .coherence/server.pid 2>/dev/null)"
+[ -n "$pid" ] && ps -p "$pid" -o command= | grep -q coordinator && kill "$pid"
 
 # 3. Remove the old secret.
 rm .coherence/hook.secret
