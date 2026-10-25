@@ -2,9 +2,9 @@
  * A strict path stays enforced for the coordinator's lifetime
  * (Cohexa-ai/agent-coherence#261, Node parity in #177).
  *
- * Covers the policy evaluator (strict wins over ignore), the glob matcher's
- * running time on a `**`-heavy pattern, and the overlap decision
- * `/policy/untrack` refuses an entry on.
+ * Covers the policy evaluator (strict wins over ignore), the two glob
+ * grammars and the matcher's running time on star-heavy patterns, and the
+ * overlap decision `/policy/untrack` refuses an entry on.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -24,6 +24,7 @@ import {
   tokensMatch,
   TrackedArtifactPolicy,
 } from "../policy.js";
+import { FNMATCH_VECTORS } from "./fnmatch_vectors.js";
 
 function policyWith(files: { tracked?: string[]; ignored?: string[]; strict?: string[] }) {
   const root = mkdtempSync(join(tmpdir(), "policy-strict-"));
@@ -107,6 +108,48 @@ test("a single-star-heavy pattern is matched without backtracking too", () => {
   assert.ok(performance.now() - start < 250, `${(performance.now() - start).toFixed(0)} ms`);
 });
 
+test("a pattern without ** whose stars cross '/' is matched without backtracking", () => {
+  // A backtracking regex for it took 81 s on a 100-character path.
+  const start = performance.now();
+  assert.equal(globMatch("a".repeat(10_000), "*a*a*a*a*a*a*b"), false);
+  assert.equal(globMatch("a/".repeat(5_000) + "b", "*a*a*a*a*a*a*b"), true);
+  assert.ok(performance.now() - start < 250, `${(performance.now() - start).toFixed(0)} ms`);
+});
+
+// ------------------------------------------------------- the two grammars (#209)
+
+test("a pattern without ** matches as CPython's fnmatch.fnmatchcase does", () => {
+  const disagree = FNMATCH_VECTORS.filter(([pattern, name, expected]) => globMatch(name, pattern) !== expected);
+  assert.deepEqual(disagree, []);
+});
+
+test("a pattern without ** follows fnmatch: '*' and '?' cross '/', '[...]' is a class; with ** they do not", () => {
+  for (const [path, pattern, expected] of [
+    ["docs/a/b.md", "docs/*.md", true],
+    ["a/b", "a?b", true],
+    ["data/5.json", "data/[0-9].json", true],
+    ["src/x/y.py", "src/*.py", true],
+    ["a/aa", "*a*a*a", true],
+    ["data/[ab].json", "data/[ab].json", false],
+    ["\u{1F600}.md", "?.md", true],
+    // Any ** switches the whole pattern to the ** grammar, as in Python.
+    ["x[ab]", "x[**]", true],
+    ["docs/a/b.md", "docs/**/*.md", true],
+    ["x/a/b.md", "**/x/*.md", false],
+  ] as const) {
+    assert.equal(globMatch(path, pattern), expected, `${path} ~ ${pattern}`);
+  }
+});
+
+test("tracked, ignored and strict patterns without ** decide paths as fnmatch reads them", () => {
+  const policy = policyWith({ tracked: ["data/**", "notes/*.md"], strict: ["data/[0-9].json"], ignored: ["docs/*.md"] });
+  assert.equal(policy.isTracked("notes/a/b.md"), true);
+  assert.equal(policy.isStrictMode("data/5.json"), true);
+  assert.equal(policy.isStrictMode("data/x.json"), false);
+  // docs/plans/x.md is a default tracked path; the ignore crosses '/' to reach it.
+  assert.equal(policy.isTracked("docs/plans/x.md"), false);
+});
+
 // ------------------------------------------------- strict coverage (untrack)
 
 const intersect = (patterns: string[], budget: SearchBudget) =>
@@ -120,9 +163,14 @@ const COVERAGE_CASES: Array<[string, string[]]> = [
   ["**", ["data/*.json"]], // a broader pattern
   ["./data/a.json", ["data/*.json"]], // a leading ./ is the same path
   ["./data/**", ["data/*.json"]], // ... and the same glob
-  ["data/[ab].json", ["data/*.json"]], // '[' is a literal: one path data/*.json holds
-  ["*.json", []], // '*' never crosses '/'
-  ["data?a.json", []], // nor does '?'
+  ["data/[ab].json", ["data/*.json"]], // a class: data/a.json and data/b.json are strict
+  ["*.json", ["data/*.json"]], // without **, '*' crosses '/'
+  ["data?a.json", ["data/*.json"]], // and so does '?'
+  ["data/[!a-z].json", ["data/*.json"]], // a negated class: data/0.json
+  ["data[!a-z]x.json", ["data/*.json"]], // which matches '/' too
+  ["data/[0-9]", []], // a class, but no .json
+  ["data/[z-a].json", []], // a reversed range: a class of no characters
+  ["data/[a.json", ["data/*.json"]], // an unterminated '[' is a literal
   ["data/a.txt", []], // tracked, not strict
   ["data/*.txt", []], // disjoint glob
   ["notes/**", []], // strict-free
@@ -177,7 +225,70 @@ test("a strict ** covers an entry only where the entry reaches a tracked path", 
   assert.deepEqual(policy.strictPatternsCovering("docs/**"), ["**"]);
 });
 
-test("the overlap search keeps single stars within a segment", () => {
+test("a pattern holding a class is searched as a glob, not matched as a literal path", () => {
+  // The Python coordinator's test, made on the text: any '*', '?' or '['.
+  for (const [strict, inside, outside] of [
+    ["data/[ab].json", "data/a.json", "data/c.json"],
+    ["data/a[b].json", "data/ab.json", "data/ac.json"],
+  ] as const) {
+    const policy = policyWith({ tracked: ["data/**"], strict: [strict] });
+    assert.deepEqual(policy.strictPatternsCovering(inside), [strict]);
+    assert.deepEqual(policy.strictPatternsCovering(outside), []);
+  }
+});
+
+test("a class too wide to enumerate is searched as any one character, erring toward a refusal", () => {
+  const policy = policyWith({ tracked: ["data/**"], strict: ["data/z*.json"] });
+  // [a-y] is enumerated, so it is decided exactly: no 'z'.
+  assert.deepEqual(policy.strictPatternsCovering("data/[a-y]*.json"), []);
+  // 256 members: read as any one character, as the Python coordinator reads it.
+  assert.deepEqual(policy.strictPatternsCovering("data/[Ā-ǿ]*.json"), ["data/z*.json"]);
+  // The limit is 64: [0-o] is enumerated, [0-p] is not.
+  assert.deepEqual(policy.strictPatternsCovering("data/[0-o]*.json"), []);
+  assert.deepEqual(policy.strictPatternsCovering("data/[0-p]*.json"), ["data/z*.json"]);
+});
+
+test("a negated class reaches the characters no pattern names", () => {
+  // [!/x] accepts neither character the patterns name: only x/a and its kind.
+  const policy = policyWith({ tracked: ["x/**"], strict: ["x/*"] });
+  assert.deepEqual(policy.strictPatternsCovering("x/[!/x]"), ["x/*"]);
+});
+
+test("the overlap search takes the Python coordinator's steps, entry for entry", () => {
+  // Steps measured on the Python coordinator (agent-coherence dev) for the same policies.
+  const cases: Array<[Parameters<typeof policyWith>[0], Array<[string, boolean, number]>]> = [
+    [DATA, [
+      ["data/**", true, 974], ["data/a.json", true, 982], ["**", true, 1074], ["*.json", true, 1146],
+      ["data/a.txt", false, 0], ["notes/**", false, 0], ["data?a.json", true, 982], ["./data/**", true, 974],
+      ["data/[0-9]", false, 460], ["data/[0-8]", false, 437], ["data/[!a-z].json", true, 2831],
+      ["*", true, 1074], ["?", false, 60], ["data/*", true, 974],
+      ["data/[z-a].json", false, 190], ["data/[a.json", true, 1195],
+    ]],
+    [{ strict: ["CLAUDE.md"] }, [
+      ["*.md", true, 10], ["C?AUDE.md", true, 10], ["[C]LAUDE.md", true, 10], ["**", true, 27], ["*/CLAUDE.md", false, 10],
+    ]],
+    [{ strict: ["**"] }, [["notes/**", true, 1255], ["docs/**", true, 916], ["*.md", true, 675], ["plan.md", true, 629]]],
+    // A literal strict path costs one step per code point, not per UTF-16 unit.
+    [{ tracked: ["notes/**"], strict: ["notes/\u{1F600}.md"] }, [["*.md", true, 11], ["notes/?.md", true, 11]]],
+    // The search reads a pattern without ** per code point.
+    [{ tracked: ["data/**"], strict: ["data/\u{1F600}*"] }, [["data/?", true, 250], ["data/?*", true, 250]]],
+    // An unterminated '[' makes a strict pattern a glob, searched rather than matched.
+    [{ tracked: ["data/**"], strict: ["data/[x.json"] }, [["data/*", true, 1210], ["*.json", true, 1416]]],
+    // The search alphabet is in code-point order: U+E000 before U+1F600.
+    [{ tracked: ["**"], strict: ["**"] }, [["[\u{1F600}]*", true, 20], ["*\u{1F600}*", true, 80]]],
+    [{ tracked: ["x/**"], strict: ["x/*"] }, [["x/[!/x]", true, 72]]],
+  ];
+  for (const [files, entries] of cases) {
+    const policy = policyWith(files);
+    for (const [entry, covers, steps] of entries) {
+      const before = automatonStepsTaken();
+      const covering = policy.strictPatternsCovering(entry);
+      assert.deepEqual([covering.length > 0, automatonStepsTaken() - before], [covers, steps], entry);
+    }
+  }
+});
+
+test("a ** pattern keeps its single stars within a segment in the overlap search too", () => {
   assert.equal(intersect(["**/a*b", "a/b"], new SearchBudget(100_000)), false);
   const policy = policyWith({ tracked: ["src/**"], strict: ["src/a/b/x/?"] });
   assert.deepEqual(policy.strictPatternsCovering("src/*/x/**"), []);
@@ -201,13 +312,17 @@ test("the spawn names an ignored pattern strict overrides, once", () => {
 
 // -------------------------------------- the automaton agrees with the matcher
 
-// Every shape the grammar has: runs, a segment run, a segment character, the
-// slash swallowed after **, a literal '[' and a run meeting a segment boundary.
+// Every shape both grammars have. With **: runs, a segment run, a segment
+// character, the slash swallowed after **, and a run meeting a segment
+// boundary. Without: runs and '?' that cross '/', classes plain, negated and
+// ranged, and an unterminated '['.
 const GRAMMAR = [
   "a", "a.x", "x", "*", "?", "**", "**/a", "a/**", "a/**/b", "**/*", "**/a?", "**/*.x", "a?",
   "a*b", "*.x", "a/*", "*/b", "?/?", "[a]", "a[", "**/a*b", "*x/**", "a*/**", "a?b",
+  "[ab]", "[!a]", "[a-b]/x", "a[!x]b", "/x/a",
 ];
-const RUN_HEAVY = ["**/*a*b", "**/**/**/a", "a/**/*/*b*", "**/*a*/*b*", "*/**/*x*", "*a*a*a"];
+const RUN_HEAVY = ["**/*a*b", "**/**/**/a", "a/**/*/*b*", "**/*a*/*b*", "*/**/*x*"];
+const DOUBLE_STAR = GRAMMAR.filter((p) => p.includes("**"));
 
 function paths(alphabet: string, maxLength: number): string[] {
   const out: string[] = [];
@@ -220,11 +335,11 @@ function paths(alphabet: string, maxLength: number): string[] {
 }
 
 test("the linear matcher agrees with the regex on every short path, line terminators included", () => {
-  // The regex's `.` stops at \n, \r, \u2028 and \u2029, and its `$` matches
-  // only at the end; the automaton must do the same.
+  // The regex of a ** pattern: its `.` stops at \n, \r, \u2028 and \u2029,
+  // and its `$` matches only at the end; the automaton must do the same.
   const samples = [...paths("ab/x.[", 4), ...paths("a/\n\r\u2028x", 3)];
   const disagree: string[] = [];
-  for (const pattern of [...GRAMMAR, ...RUN_HEAVY]) {
+  for (const pattern of [...DOUBLE_STAR, ...RUN_HEAVY]) {
     const tokens = globTokens(pattern);
     const regex = globRegex(tokens);
     for (const p of samples) {
@@ -240,8 +355,6 @@ test("globMatch stays exact over the run limit, where it steps the automaton", (
     ["a/x/b", "**/*a*/*b*", false],
     ["x/axb", "**/a*b", true],
     ["a/b", "**/a*b", false],
-    ["aaa", "*a*a*a", true],
-    ["a/aa", "*a*a*a", false],
   ] as const) {
     assert.equal(globMatch(path, pattern), expected, `${path} ~ ${pattern}`);
   }
@@ -250,8 +363,9 @@ test("globMatch stays exact over the run limit, where it steps the automaton", (
 test("the overlap search never under-reports what the matcher matches", () => {
   // Wherever some short path matches every pattern of a pair or triple, the
   // search must say they intersect: an under-report accepts an untrack that
-  // covers a strict path.
-  const samples = paths("ab/x.", 4);
+  // covers a strict path. (A class with a reversed range followed by '!' is
+  // the one known exception, shared with the Python coordinator; none is here.)
+  const samples = paths("ab/x.[", 4);
   const matching = new Map(GRAMMAR.map((g) => [g, new Set(samples.filter((p) => globMatch(p, g)))]));
   const missed: string[] = [];
   for (let i = 0; i < GRAMMAR.length; i++) {
@@ -271,8 +385,9 @@ test("the overlap search never under-reports what the matcher matches", () => {
 });
 
 test("the overlap search never over-reports either: no intersection without a witness path", () => {
-  // The grammar has no approximation, so a reported intersection has a
-  // witness; over this corpus one of at most five characters always exists.
+  // These patterns meet no approximation (no class over 64 members, no
+  // reversed range), so a reported intersection has a witness; over this
+  // corpus one of at most five characters always exists.
   const samples = paths("ab/x.[]", 5);
   const matching = new Map(GRAMMAR.map((g) => [g, samples.filter((p) => globMatch(p, g))]));
   const spurious: string[] = [];

@@ -16,12 +16,13 @@
  * happen via `/policy/track` + `/policy/untrack` endpoints landing in
  * Unit 3 / Unit 6); this module is read-only at the registry layer for now.
  *
- * Glob semantics: one grammar for every pattern (`globTokens`) — `*` matches
- * within a path segment, `**` matches zero-or-more segments (a `/` after it is
- * swallowed), `?` matches a single non-slash char, and every other character,
- * `[` included, is literal. This is Python's `**` grammar; Python matches a
- * pattern without `**` with fnmatch instead, where `*` and `?` cross `/`.
- * KTD-B.3 C5 prefix contract applies to the parity scenarios that cover
+ * Glob semantics are the Python coordinator's two grammars. A pattern
+ * containing `**` (`globTokens`): `**` matches zero-or-more segments (a `/`
+ * after it is swallowed), `*` matches within a path segment, `?` matches a
+ * single non-slash char, and every other character, `[` included, is literal.
+ * A pattern without `**` is matched as `fnmatch.fnmatchcase` matches it
+ * (`fnmatchMatcher`, #209): `*` and `?` cross `/`, and `[...]` is a character
+ * class. KTD-B.3 C5 prefix contract applies to the parity scenarios that cover
  * policy decisions.
  *
  * A strict path stays enforced for the coordinator's lifetime
@@ -328,7 +329,7 @@ export class TrackedArtifactPolicy {
       // A literal strict path's language is the one path (tracked: the index
       // keeps no other), so matching it decides it exactly.
       return strict.isLiteral
-        ? tokensMatch(entry.tokens, strict.pattern, callBudget)
+        ? matchesCharged(entry, strict.pattern, callBudget)
         : this.strictGlobCovered(entry, strict, callBudget);
     } catch (err) {
       if (err instanceof BudgetExhausted) return true;
@@ -649,8 +650,9 @@ function matchesAny(path: string, patterns: ReadonlyArray<string>): boolean {
 }
 
 /**
- * Posix-style glob matcher. Supports `**` (zero-or-more path segments),
- * `*` (zero-or-more chars within a segment, no `/`), `?` (one non-slash char).
+ * Whether `path` matches a policy pattern: one with `**` by its tokens (`**`
+ * zero-or-more path segments, `*` zero-or-more chars within a segment, `?`
+ * one non-slash char), one without as fnmatch matches it (`fnmatchMatcher`).
  */
 // Per-process cache of compiled glob patterns. Hot path: every hook on
 // every tracked-artifact lookup compiles `**` once per session otherwise.
@@ -679,6 +681,7 @@ export function globMatch(path: string, pattern: string): boolean {
 const REGEX_RUN_LIMIT = 1;
 
 function compileGlob(pattern: string): (path: string) => boolean {
+  if (!pattern.includes("**")) return fnmatchMatcher(pattern);
   const tokens = globTokens(pattern);
   if (tokens.filter(isRun).length > REGEX_RUN_LIMIT) {
     return (path) => tokensMatch(tokens, path);
@@ -702,35 +705,63 @@ function tokenRegex(token: Token): string {
       return "[^/]";
     case "lit":
       return token.ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    case "all_run":
+    case "any_one":
+    case "class":
+      // Only a pattern with `**` has a regex; `fnmatchMatcher` matches the rest.
+      throw new Error(`a ${token.kind} token has no regex`);
   }
 }
 
 // ----------------------------------------------------------------------
 // Glob tokens and their automaton
 //
-// A pattern is parsed once, into tokens: `**` is any run (a following `/`
-// swallowed), `*` a run without `/`, `?` one character but `/`, and every
-// other character a literal, `[` included. The regex (`globRegex`), the linear
-// matcher and the strict-coverage search all read them. The regex has no
-// flags, so its `.` stops at a line terminator, its `$` matches only at the
-// end, and it reads UTF-16 code units, as the automaton does; a differential
-// test pins that the two agree.
+// A pattern containing `**` is parsed once, into tokens: `**` is any run (a
+// following `/` swallowed), `*` a run without `/`, `?` one character but `/`,
+// and every other character a literal, `[` included. Its regex (`globRegex`),
+// the linear matcher and the strict-coverage search all read them. The regex
+// has no flags, so its `.` stops at a line terminator, its `$` matches only at
+// the end, and it reads UTF-16 code units, as the automaton does; a
+// differential test pins that the two agree.
+//
+// A pattern without `**` is matched as the Python coordinator matches it, by
+// fnmatch (`fnmatchMatcher`). The search reads it through the tokens Python's
+// search reads (`fnmatchSearchTokens`), approximations included, so both
+// coordinators refuse the same untrack entries.
 // ----------------------------------------------------------------------
 
 type Token =
   | { readonly kind: "any_run" }
   | { readonly kind: "seg_run" }
   | { readonly kind: "seg_one" }
-  | { readonly kind: "lit"; readonly ch: string };
+  | { readonly kind: "lit"; readonly ch: string }
+  // Without `**`: `*` is a run of any characters and `?` any one character.
+  | { readonly kind: "all_run" }
+  | { readonly kind: "any_one" }
+  | { readonly kind: "class"; readonly negated: boolean; readonly members: ReadonlySet<string> };
 
 const ANY_RUN: Token = { kind: "any_run" };
 const SEG_RUN: Token = { kind: "seg_run" };
 const SEG_ONE: Token = { kind: "seg_one" };
+const ALL_RUN: Token = { kind: "all_run" };
+const ANY_ONE: Token = { kind: "any_one" };
 
 /** What a regex `.` without the `s` flag does not match. */
 const LINE_TERMINATORS: ReadonlySet<string> = new Set(["\n", "\r", "\u2028", "\u2029"]);
 
+/**
+ * Characters a class may enumerate before the search reads it as any one
+ * character: every member joins the search alphabet, which every explored
+ * state walks. The Python coordinator's `_CLASS_MEMBER_LIMIT`.
+ */
+const CLASS_MEMBER_LIMIT = 64;
+
+/** The tokens the overlap search reads; a pattern with `**` is also matched by them. */
 export function globTokens(pattern: string): Token[] {
+  return pattern.includes("**") ? doubleStarTokens(pattern) : fnmatchSearchTokens(pattern);
+}
+
+function doubleStarTokens(pattern: string): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   while (i < pattern.length) {
@@ -753,8 +784,347 @@ export function globTokens(pattern: string): Token[] {
   return tokens;
 }
 
+/**
+ * The search's tokens for a pattern without `**`, a port of the Python
+ * coordinator's `_glob_tokens`, read per code point: `*` any run, `?` any one
+ * character, `[...]` a class, an unterminated `[` a literal. Never used to
+ * match (`fnmatchMatcher` matches): as in Python, a class over
+ * `CLASS_MEMBER_LIMIT` members reads as any one character, and a reversed
+ * range adds no members. fnmatch drops a reversed range with its two ends and,
+ * when a `!` follows them, reads the rest of the class as negated (a lone `!`
+ * as any one character), so for such a class the search accepts fewer
+ * characters than fnmatch and can miss a refusal, as the Python coordinator's
+ * search does.
+ */
+function fnmatchSearchTokens(pattern: string): Token[] {
+  const chars = Array.from(pattern);
+  const closeAt = nextIndexOf(chars, "]");
+  const tokens: Token[] = [];
+  let i = 0;
+  while (i < chars.length) {
+    const c = chars[i]!;
+    i += 1;
+    if (c === "*") {
+      tokens.push(ALL_RUN);
+    } else if (c === "?") {
+      tokens.push(ANY_ONE);
+    } else if (c === "[") {
+      const close = classClose(chars, closeAt, i);
+      if (close < 0) {
+        tokens.push({ kind: "lit", ch: "[" });
+        continue;
+      }
+      tokens.push(searchClass(chars.slice(i, close)));
+      i = close + 1;
+    } else {
+      tokens.push({ kind: "lit", ch: c });
+    }
+  }
+  return tokens;
+}
+
+/**
+ * Where the class opened just before `start` closes, or -1 when it does not:
+ * fnmatch skips a leading `!`, then a leading `]`, before looking for `]`.
+ */
+function classClose(chars: ReadonlyArray<string>, closeAt: ReadonlyArray<number>, start: number): number {
+  let j = start;
+  if (chars[j] === "!") j += 1;
+  if (chars[j] === "]") j += 1;
+  return closeAt[j]!;
+}
+
+/**
+ * For each index (`chars.length` included), the index of the next `target` at
+ * or after it, or -1. Looking each one up keeps a pattern of many unterminated
+ * `[` linear, where scanning the rest of the pattern for each is quadratic.
+ */
+function nextIndexOf(chars: ReadonlyArray<string>, target: string): number[] {
+  const next = new Array<number>(chars.length + 1).fill(-1);
+  for (let k = chars.length - 1; k >= 0; k--) next[k] = chars[k] === target ? k : next[k + 1]!;
+  return next;
+}
+
+function searchClass(body: ReadonlyArray<string>): Token {
+  const negated = body[0] === "!";
+  const chars = negated ? body.slice(1) : body;
+  const members = new Set<string>();
+  let tooWide = false;
+  let k = 0;
+  while (k < chars.length && !tooWide) {
+    if (k + 2 < chars.length && chars[k + 1] === "-") {
+      const lo = chars[k]!.codePointAt(0)!;
+      const hi = chars[k + 2]!.codePointAt(0)!;
+      if (hi - lo < CLASS_MEMBER_LIMIT) {
+        for (let cp = lo; cp <= hi; cp++) members.add(String.fromCodePoint(cp));
+      } else {
+        tooWide = true;
+      }
+      k += 3;
+    } else {
+      members.add(chars[k]!);
+      k += 1;
+    }
+    tooWide ||= members.size > CLASS_MEMBER_LIMIT;
+  }
+  // Any one character accepts more than the class does, never less, in either
+  // polarity (a negated class accepts `/` too): the search errs toward "covers".
+  return tooWide ? ANY_ONE : { kind: "class", negated, members };
+}
+
+// ----------------------------------------------------------------------
+// fnmatch, for a pattern without `**`
+// ----------------------------------------------------------------------
+
+/** One character of a pattern without `**`, as `re` reads fnmatch's translation of it. */
+type FnmatchChar =
+  | { readonly kind: "lit"; readonly cp: number }
+  | { readonly kind: "any" }
+  | { readonly kind: "set"; readonly negated: boolean; readonly ranges: ReadonlyArray<readonly [number, number]> }
+  | { readonly kind: "never" };
+
+const FN_ANY: FnmatchChar = { kind: "any" };
+const FN_NEVER: FnmatchChar = { kind: "never" };
+const HYPHEN = 0x2d;
+
+/**
+ * Match a pattern without `**` exactly as the Python coordinator's
+ * `fnmatch.fnmatchcase` does, per code point (Python 3.11 to 3.14 agree). The
+ * pattern splits at `*` into fixed runs: the first must start the path, the
+ * last must end it, and each run between sits at its leftmost fit. fnmatch's
+ * regex matches the same paths (each run between stars is an atomic group);
+ * a JavaScript regex has no atomic groups, and backtracking took over a minute
+ * on `*a*a*a*a*a*a*b` against a 100-character path.
+ */
+function fnmatchMatcher(pattern: string): (path: string) => boolean {
+  const runs = fnmatchRuns(pattern);
+  // Literal ends rule most paths out before the path is read as code points.
+  const head = literalText(runs[0]!, false);
+  const tail = literalText(runs[runs.length - 1]!, true);
+  return (path) => path.startsWith(head) && path.endsWith(tail) && fixedRunsMatch(runs, codePointsOf(path));
+}
+
+/** The literal characters a run starts (or, `fromEnd`, ends) with. */
+function literalText(run: ReadonlyArray<FnmatchChar>, fromEnd: boolean): string {
+  const chars: string[] = [];
+  for (const c of fromEnd ? [...run].reverse() : run) {
+    if (c.kind !== "lit") break;
+    chars.push(String.fromCodePoint(c.cp));
+  }
+  return (fromEnd ? chars.reverse() : chars).join("");
+}
+
+// The last path read as code points: `matchesAny` tests one path against every
+// pattern in turn, so it is read once, not once per pattern.
+let lastPath = "";
+let lastCodePoints: number[] = [];
+
+function codePointsOf(path: string): number[] {
+  if (path !== lastPath) {
+    lastPath = path;
+    lastCodePoints = Array.from(path, (c) => c.codePointAt(0)!);
+  }
+  return lastCodePoints;
+}
+
+function fnmatchRuns(pattern: string): FnmatchChar[][] {
+  const chars = Array.from(pattern);
+  const closeAt = nextIndexOf(chars, "]");
+  const runs: FnmatchChar[][] = [[]];
+  let i = 0;
+  while (i < chars.length) {
+    const c = chars[i]!;
+    const run = runs[runs.length - 1]!;
+    i += 1;
+    if (c === "*") {
+      runs.push([]);
+    } else if (c === "?") {
+      run.push(FN_ANY);
+    } else if (c === "[" && classClose(chars, closeAt, i) >= 0) {
+      const close = classClose(chars, closeAt, i);
+      run.push(fnmatchSet(chars, i, close));
+      i = close + 1;
+    } else {
+      run.push({ kind: "lit", cp: c.codePointAt(0)! });
+    }
+  }
+  return runs;
+}
+
+/**
+ * The set `chars[start..end)`, a class body, reads as: a port of
+ * `fnmatch.translate`'s class handling, then of `re`'s reading of what it
+ * writes. `!` first negates, `]` first is a member, `a-z` is a code-point
+ * range, and a reversed range is dropped together with its two ends.
+ */
+function fnmatchSet(chars: ReadonlyArray<string>, start: number, end: number): FnmatchChar {
+  const body = chars.slice(start, end);
+  // The regex text fnmatch writes for the body, one character per entry.
+  let text = body.includes("-") ? rangedSetText(chars, start, end) : body.flatMap(escapeBackslash);
+  text = text.flatMap((c) => ("&~|".includes(c) ? ["\\", c] : [c]));
+  if (text.length === 0) return FN_NEVER;
+  if (text.length === 1 && text[0] === "!") return FN_ANY;
+  const negated = text[0] === "!";
+  if (negated) text = text.slice(1);
+  else if (text[0] === "^" || text[0] === "[") text = ["\\", ...text];
+  return { kind: "set", negated, ranges: mergeRanges(readSetBody(text)) };
+}
+
+/**
+ * `ranges` sorted and merged, so a membership test is a binary search: a
+ * class of thousands of members is tested at every position of every path a
+ * hook matches against it.
+ */
+function mergeRanges(ranges: ReadonlyArray<readonly [number, number]>): Array<readonly [number, number]> {
+  const merged: Array<[number, number]> = [];
+  for (const [lo, hi] of [...ranges].sort((a, b) => a[0] - b[0])) {
+    const last = merged[merged.length - 1];
+    if (last !== undefined && lo <= last[1] + 1) last[1] = Math.max(last[1], hi);
+    else merged.push([lo, hi]);
+  }
+  return merged;
+}
+
+function inRanges(ranges: ReadonlyArray<readonly [number, number]>, cp: number): boolean {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const [first, last] = ranges[mid]!;
+    if (cp < first) hi = mid - 1;
+    else if (cp > last) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+
+/**
+ * `fnmatch.translate` on a class body holding `-`: split it at the hyphens
+ * that make ranges, drop each reversed range by merging its neighbours, and
+ * escape every remaining `\` and `-`.
+ */
+function rangedSetText(chars: ReadonlyArray<string>, start: number, end: number): string[] {
+  const chunks: string[][] = [];
+  let i = start;
+  let k = chars[start] === "!" ? start + 2 : start + 1;
+  for (;;) {
+    k = indexWithin(chars, "-", k, end);
+    if (k < 0) break;
+    chunks.push(chars.slice(i, k));
+    i = k + 1;
+    k += 3;
+  }
+  const tail = chars.slice(i, end);
+  if (tail.length > 0) chunks.push(tail);
+  else chunks[chunks.length - 1]!.push("-");
+  return withoutReversedRanges(chunks).flatMap((chunk, m) => [...(m > 0 ? ["-"] : []), ...chunk.flatMap(escapeSetChar)]);
+}
+
+/**
+ * fnmatch's removal of reversed ranges, right to left: where a chunk's last
+ * character is above the next chunk's first, both go and the two chunks
+ * merge. The chunk being merged into is kept reversed, so each merge costs
+ * only the chunk it absorbs; copying the growing chunk on every merge took
+ * seconds on a 64 KiB class.
+ */
+function withoutReversedRanges(chunks: ReadonlyArray<ReadonlyArray<string>>): string[][] {
+  const done: string[][] = [];
+  let merging = [...chunks[chunks.length - 1]!].reverse();
+  for (let m = chunks.length - 1; m > 0; m--) {
+    const before = chunks[m - 1]!;
+    if (before[before.length - 1]!.codePointAt(0)! > merging[merging.length - 1]!.codePointAt(0)!) {
+      merging.pop();
+      for (let k = before.length - 2; k >= 0; k--) merging.push(before[k]!);
+    } else {
+      done.push(merging.reverse());
+      merging = [...before].reverse();
+    }
+  }
+  done.push(merging.reverse());
+  return done.reverse();
+}
+
+function indexWithin(chars: ReadonlyArray<string>, target: string, from: number, to: number): number {
+  for (let k = from; k < to; k++) if (chars[k] === target) return k;
+  return -1;
+}
+
+function escapeBackslash(c: string): string[] {
+  return c === "\\" ? ["\\", c] : [c];
+}
+
+function escapeSetChar(c: string): string[] {
+  return c === "\\" || c === "-" ? ["\\", c] : [c];
+}
+
+/**
+ * The ranges `re` reads from a set body written by fnmatch, as if a `]`
+ * followed it: an escape is its one literal character, a `]` is a member only
+ * first, and a `-` between two characters makes a range.
+ */
+function readSetBody(text: ReadonlyArray<string>): Array<readonly [number, number]> {
+  const ranges: Array<readonly [number, number]> = [];
+  let p = 0;
+  const atom = (): number => {
+    const c = text[p++]!;
+    return (c === "\\" ? text[p++]! : c).codePointAt(0)!;
+  };
+  while (p < text.length && !(text[p] === "]" && ranges.length > 0)) {
+    const lo = atom();
+    if (text[p] !== "-") {
+      ranges.push([lo, lo]);
+      continue;
+    }
+    p += 1;
+    if (p >= text.length || text[p] === "]") {
+      ranges.push([lo, lo], [HYPHEN, HYPHEN]);
+      break;
+    }
+    ranges.push([lo, atom()]);
+  }
+  return ranges;
+}
+
+/** Whether `path` (code points) holds `runs` as `fnmatchMatcher` describes. */
+function fixedRunsMatch(runs: ReadonlyArray<ReadonlyArray<FnmatchChar>>, path: ReadonlyArray<number>): boolean {
+  const first = runs[0]!;
+  if (runs.length === 1) return path.length === first.length && runFits(first, path, 0);
+  const last = runs[runs.length - 1]!;
+  const lastStart = path.length - last.length;
+  if (lastStart < first.length || !runFits(first, path, 0) || !runFits(last, path, lastStart)) return false;
+  let at = first.length;
+  for (const run of runs.slice(1, -1)) {
+    let fit = at;
+    while (fit + run.length <= lastStart && !runFits(run, path, fit)) fit += 1;
+    if (fit + run.length > lastStart) return false;
+    at = fit + run.length;
+  }
+  return true;
+}
+
+function runFits(run: ReadonlyArray<FnmatchChar>, path: ReadonlyArray<number>, at: number): boolean {
+  return run.every((c, k) => fnmatchCharAccepts(c, path[at + k]!));
+}
+
+function fnmatchCharAccepts(c: FnmatchChar, cp: number): boolean {
+  switch (c.kind) {
+    case "lit":
+      return cp === c.cp;
+    case "any":
+      return true;
+    case "set":
+      return inRanges(c.ranges, cp) !== c.negated;
+    case "never":
+      return false;
+  }
+}
+
+// ----------------------------------------------------------------------
+// The token automaton
+// ----------------------------------------------------------------------
+
 function isRun(token: Token): boolean {
-  return token.kind === "any_run" || token.kind === "seg_run";
+  return token.kind === "any_run" || token.kind === "seg_run" || token.kind === "all_run";
 }
 
 /**
@@ -770,6 +1140,11 @@ function tokenAccepts(token: Token, ch: string | null): boolean {
       return ch !== "/";
     case "lit":
       return ch === token.ch;
+    case "all_run":
+    case "any_one":
+      return true;
+    case "class":
+      return ch === null ? token.negated : token.members.has(ch) !== token.negated;
   }
 }
 
@@ -809,10 +1184,10 @@ function advance(states: ReadonlyArray<number>, tokens: ReadonlyArray<Token>, ch
 }
 
 /**
- * Whether `path` matches `tokens` exactly as their regex does, in time linear
- * in the path: the automaton stepped one code unit at a time, never
- * backtracking. Each step is charged to `budget`, when one is given, at the
- * size of the state it leaves.
+ * Whether `path` matches the tokens of a pattern with `**` exactly as their
+ * regex does, in time linear in the path: the automaton stepped one code unit
+ * at a time, never backtracking. Each step is charged to `budget`, when one
+ * is given, at the size of the state it leaves.
  */
 export function tokensMatch(tokens: ReadonlyArray<Token>, path: string, budget?: SearchBudget): boolean {
   let states = startStates(tokens);
@@ -888,18 +1263,37 @@ interface Glob {
   readonly pattern: string;
   readonly tokens: ReadonlyArray<Token>;
   readonly affixes: readonly [string, string];
-  /** True when the pattern matches exactly one path, itself. */
+  /**
+   * True when the pattern has no `*`, `?` or `[`, so it matches one path,
+   * itself: the Python coordinator's test, made on the text, so a pattern with
+   * an unterminated `[` is searched as a glob there and here.
+   */
   readonly isLiteral: boolean;
+  /** `globMatch` for a pattern without `**`, compiled on first use, uncached beyond this glob. */
+  readonly fnmatches: (path: string) => boolean;
 }
 
 function globOf(pattern: string): Glob {
   const tokens = globTokens(pattern);
+  let matcher: ((path: string) => boolean) | undefined;
   return {
     pattern,
     tokens,
     affixes: literalAffixes(tokens),
-    isLiteral: tokens.every((t) => t.kind === "lit"),
+    isLiteral: !/[*?[]/.test(pattern),
+    fnmatches: (path) => (matcher ??= fnmatchMatcher(pattern))(path),
   };
+}
+
+/**
+ * Whether `path` matches `entry`, charged to `budget` as the Python
+ * coordinator charges it: a pattern with `**` per automaton step, one without
+ * one step per character, since fnmatch is linear in the path.
+ */
+function matchesCharged(entry: Glob, path: string, budget: SearchBudget): boolean {
+  if (entry.pattern.includes("**")) return tokensMatch(entry.tokens, path, budget);
+  charge(budget, 1 + Array.from(path).length);
+  return entry.fnmatches(path);
 }
 
 /**
@@ -910,19 +1304,19 @@ function entryGlob(pattern: string): Glob {
   return globOf(normalizeRelative(pattern) ?? pattern);
 }
 
-function literalRun(tokens: Iterable<Token>): string {
+/** The literal characters `tokens` start with, kept in pattern order when read from the end. */
+function literalRun(tokens: Iterable<Token>, fromEnd = false): string {
   let run = "";
   for (const token of tokens) {
     if (token.kind !== "lit") break;
-    run += token.ch;
+    run = fromEnd ? token.ch + run : run + token.ch;
   }
   return run;
 }
 
 /** The literal prefix and suffix every path matching `tokens` carries. */
 function literalAffixes(tokens: ReadonlyArray<Token>): readonly [string, string] {
-  const reversedSuffix = literalRun([...tokens].reverse());
-  return [literalRun(tokens), reversedSuffix.split("").reverse().join("")];
+  return [literalRun(tokens), literalRun([...tokens].reverse(), true)];
 }
 
 /**
@@ -939,7 +1333,8 @@ function affixesNest(affixes: ReadonlyArray<readonly [string, string]>): boolean
 
 /**
  * True when some non-empty path matches every pattern `tokenLists` spells
- * (`globTokens`) under `globMatch`.
+ * (`globTokens`) under `globMatch`, up to the approximations of a class
+ * (`fnmatchSearchTokens`).
  *
  * A product of the patterns' automata searched over an alphabet of every
  * character the patterns name, `/`, and one stand-in for every other
@@ -976,19 +1371,21 @@ export function globsIntersect(tokenLists: ReadonlyArray<ReadonlyArray<Token>>, 
 }
 
 /**
- * Every character the patterns name, `/`, and `null` for every other
- * character. Sorted, so the bounded search explores in the same order on every
- * run and the same entry is never refused on one coordinator and accepted on
- * the next.
+ * Every character the patterns name (a class names its members), `/`, and
+ * `null` for every other character. Sorted by code point, as the Python
+ * coordinator sorts it, so the bounded search explores in the same order on
+ * every run and on both coordinators, and the same entry is never refused on
+ * one and accepted on the other.
  */
 function searchAlphabet(tokenLists: ReadonlyArray<ReadonlyArray<Token>>): Array<string | null> {
   const named = new Set<string>(["/"]);
   for (const tokens of tokenLists) {
     for (const token of tokens) {
       if (token.kind === "lit") named.add(token.ch);
+      else if (token.kind === "class") token.members.forEach((m) => named.add(m));
     }
   }
-  return [...[...named].sort(), null];
+  return [...[...named].sort((a, b) => a.codePointAt(0)! - b.codePointAt(0)!), null];
 }
 
 /** Order-preserving union: `first`, then what `second` adds. */

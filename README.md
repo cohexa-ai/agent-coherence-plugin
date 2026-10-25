@@ -250,7 +250,7 @@ The coordinator creates `.coherence/` at your repo root automatically. Inside it
 | `state.db` | SQLite-WAL artifact state. Per-artifact MESI state, versions, SHA-256 content hashes. **Never** raw file content. | ✓ |
 | `hook.secret` | Bearer token for hook auth, mode `0600`. 32 random bytes hex-encoded. | ✓ |
 | `server.pid` | Coordinator process discovery (`<pid>\n<port>\nbackend=...\n`). | ✓ |
-| `tracked.yaml` | Your opt-in patterns (gitignore-style globs). Commit if you want the tracked set to apply across team checkouts. | Operator's choice |
+| `tracked.yaml` | Your opt-in patterns. A pattern with `**` is a path glob: `**` spans any number of directories, and `*` and `?` stay within one. A pattern without `**` matches as Python's `fnmatch` does: `*` and `?` also match `/`, so `docs/*.md` reaches `docs/a/b.md`, and `[...]` is a character class. Both coordinator backends read patterns this way. Commit if you want the tracked set to apply across team checkouts. | Operator's choice |
 | `ignored.yaml` | Your opt-out patterns. Same. An entry never takes a strict path out of strict mode. | Operator's choice |
 | `strict_mode.yaml` *(library v0.8.2+)* | Per-artifact strict-mode opt-in. Same shape. Same intersection semantics with `tracked_paths`. | Operator's choice |
 | `audit.log` *(library v0.8.2+)* | Append-only JSONL of strict-mode denial events. Mode `0600`. Denials only — no command bodies, no user content. | ✓ |
