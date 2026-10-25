@@ -225,8 +225,8 @@ test("the linear matcher agrees with the regex on every short path, line termina
   const samples = [...paths("ab/x.[", 4), ...paths("a/\n\r\u2028x", 3)];
   const disagree: string[] = [];
   for (const pattern of [...GRAMMAR, ...RUN_HEAVY]) {
-    const regex = globRegex(pattern);
     const tokens = globTokens(pattern);
+    const regex = globRegex(tokens);
     for (const p of samples) {
       if (tokensMatch(tokens, p) !== regex.test(p)) disagree.push(`${pattern} ~ ${JSON.stringify(p)}`);
     }
