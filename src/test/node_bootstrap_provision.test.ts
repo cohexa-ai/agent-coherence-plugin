@@ -53,12 +53,24 @@ const STUB_TSCONFIG = JSON.stringify({
   include: ['src/**/*'],
 });
 
-// The inline `declare` keeps the stub compilable with no @types/node in the
-// stub's (empty) node_modules; the runtime global exists in Node regardless.
+// What the bootstrap waits for before calling a coordinator spawned: it writes
+// server.pid naming itself, as the real one does once its port is bound.
+const SERVE_LIKE_A_COORDINATOR =
+  'const dir = (process.env.AGENT_COHERENCE_WORKSPACE ?? process.cwd()) + "/.coherence";\n' +
+  'mkdirSync(dir, { recursive: true });\n' +
+  'writeFileSync(dir + "/server.pid", `${process.pid}\\n0\\nbackend=node\\n`);\n' +
+  'setInterval(() => {}, 60_000);\n';
+// The inline `declare`s and the unchecked import keep the stub compilable with
+// no @types/node in the stub's (empty) node_modules; Node provides them at run
+// time regardless.
 const HEALTHY_COORDINATOR_TS =
-  'declare function setInterval(cb: () => void, ms: number): unknown;\nsetInterval(() => {}, 60_000);\n';
+  '// @ts-ignore -- the stub package has no @types/node; Node provides the module.\n' +
+  'import { mkdirSync, writeFileSync } from "node:fs";\n' +
+  'declare const process: { pid: number; env: Record<string, string | undefined>; cwd(): string };\n' +
+  'declare function setInterval(cb: () => void, ms: number): unknown;\n' +
+  SERVE_LIKE_A_COORDINATOR;
 const CRASHING_COORDINATOR_TS = 'throw new Error("stub coordinator crash on boot");\n';
-const HEALTHY_PREBUILT_JS = 'setInterval(() => {}, 60_000);\n';
+const HEALTHY_PREBUILT_JS = 'import { mkdirSync, writeFileSync } from "node:fs";\n' + SERVE_LIKE_A_COORDINATOR;
 
 // The exact crash a Node-major change produces once node_modules holds a
 // binary built for the previous ABI — the failure this file's ABI-stamp
@@ -159,6 +171,8 @@ test('REGRESSION: dist-less package (marketplace clone) self-builds src/ and spa
       );
       const m = /spawned Node coordinator \(pid=(\d+)/.exec(r.stderr);
       assert.ok(m, `no spawn line in stderr:\n${r.stderr}`);
+      // Let through because it serves, not because the deadline passed.
+      assert.doesNotMatch(r.stderr, /has not started serving/);
       // The bootstrap's own liveness gate passed; the pid must still be up.
       assert.doesNotThrow(() => process.kill(Number(m[1]), 0));
       // First successful provision of a VIRGIN workspace stamps the backend,
@@ -198,6 +212,7 @@ test('provisioning is keyed: an unchanged package skips the rebuild and just spa
       assert.doesNotMatch(second.stderr, /building src\//);
       assert.doesNotMatch(second.stderr, /Node ABI changed/);
       assert.match(second.stderr, /spawned Node coordinator/);
+      assert.doesNotMatch(second.stderr, /has not started serving/);
       assert.equal(readFileSync(join(data, ABI_STAMP), 'utf8').trim(), RUNNING_ABI);
     } finally {
       killSpawned(second.stderr ?? '');
@@ -229,7 +244,7 @@ test("LIVENESS GATE: a coordinator that dies on boot → exit 1 with a log excer
   try {
     const r = runBootstrap(root, data, ws);
     assert.equal(r.status, 1, `expected loud failure:\n${r.stdout}\n${r.stderr}`);
-    assert.match(r.stderr, /exited immediately after spawn/);
+    assert.match(r.stderr, /exited before it started serving/);
     // The crash log tail is surfaced so the failure is diagnosable from the
     // hook output alone.
     assert.match(r.stderr, /stub coordinator crash on boot/);
@@ -242,6 +257,85 @@ test("LIVENESS GATE: a coordinator that dies on boot → exit 1 with a log excer
     assert.equal(readFileSync(join(data, ABI_STAMP), 'utf8').trim(), RUNNING_ABI);
     assert.doesNotMatch(r.stderr, /next session reprovisions/);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test("LIVENESS GATE: a coordinator that dies after half a second, before it serves → exit 1, NO false 'spawned', no stamp", () => {
+  // A real coordinator fails start-up only after loading its native module
+  // and opening state.db: measured at 1.3-1.7 s under heavy load. A fixed
+  // half-second check let such a coordinator through as spawned and pinned a
+  // fresh workspace to the Node backend.
+  const lateCrash = 'setTimeout(() => { throw new Error("stub coordinator crash after 1.5 s"); }, 1500);\n';
+  const root = makeStubRoot({ prebuiltDistJs: lateCrash });
+  const { data, ws, cleanup } = makeDirs();
+  try {
+    const r = runBootstrap(root, data, ws);
+    try {
+      assert.equal(r.status, 1, `expected loud failure:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /exited before it started serving/);
+      assert.match(r.stderr, /stub coordinator crash after 1\.5 s/);
+      assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
+      assert.equal(existsSync(join(ws, '.coherence', 'coordinator_backend')), false);
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('LIVENESS GATE: a coordinator still alive but not serving after the deadline is warned about, then let through', () => {
+  // Only a coordinator that exits counts as failed: one that is merely slow
+  // keeps today's handling (spawned, and a fresh workspace stamped node).
+  const root = makeStubRoot({ prebuiltDistJs: 'setInterval(() => {}, 60_000);\n' });
+  const { data, ws, cleanup } = makeDirs();
+  try {
+    const r = runBootstrap(root, data, ws);
+    try {
+      assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /has not started serving after 10s; it may still be starting/);
+      assert.match(r.stderr, /spawned Node coordinator/);
+      assert.equal(readFileSync(join(ws, '.coherence', 'coordinator_backend'), 'utf8').trim(), 'node');
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('LIVENESS GATE: a coordinator serving under a pid other than the spawned one ends the wait', () => {
+  // A `node` launcher that runs node as a child instead of exec'ing it, as a
+  // version manager's shim can, leaves the coordinator under a pid the
+  // bootstrap did not spawn; so does another session's coordinator winning a
+  // simultaneous start. Either way the workspace is served.
+  const root = makeStubRoot({ prebuiltDistJs: HEALTHY_PREBUILT_JS });
+  const { data, ws, cleanup } = makeDirs();
+  const launcherBin = mkdtempSync(join(tmpdir(), 'provision-launcher-'));
+  writeExecutable(join(launcherBin, 'node'), `#!/usr/bin/env bash\n"${process.execPath}" "$@"\nexit $?\n`);
+  const pidFile = join(ws, '.coherence', 'server.pid');
+  try {
+    const r = runBootstrapIn(root, data, ws, launcherBin);
+    try {
+      assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /spawned Node coordinator/);
+      assert.doesNotMatch(r.stderr, /has not started serving/);
+    } finally {
+      killSpawned(r.stderr ?? '');
+      if (existsSync(pidFile)) {
+        try {
+          process.kill(Number(readFileSync(pidFile, 'utf8').split('\n')[0]), 'SIGKILL');
+        } catch {
+          // already exited
+        }
+      }
+    }
+  } finally {
+    rmSync(launcherBin, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
     cleanup();
   }
@@ -264,6 +358,7 @@ test('dev-checkout shape: a package WITH dist/ is mirrored (no build) and spawns
       );
       assert.doesNotMatch(r.stderr, /building src\//);
       assert.match(r.stderr, /spawned Node coordinator/);
+      assert.doesNotMatch(r.stderr, /has not started serving/);
       assert.equal(existsSync(join(ws, '.coherence', 'coordinator_backend')), false);
     } finally {
       killSpawned(r.stderr ?? '');
@@ -397,7 +492,7 @@ test('SELF-HEAL: a NODE_MODULE_VERSION crash invalidates the stamp so the next s
   try {
     const r = runBootstrap(root, data, ws);
     assert.equal(r.status, 1, `expected loud failure:\n${r.stdout}\n${r.stderr}`);
-    assert.match(r.stderr, /exited immediately after spawn/);
+    assert.match(r.stderr, /exited before it started serving/);
     assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
     // The stamp vouched for a tree that cannot load. Dropping it is what
     // turns "dead until the user figures it out" into one bad session: the

@@ -444,18 +444,39 @@ fi
 # process group so the hook can exit cleanly while the coordinator keeps
 # running for subsequent PreToolUse / Stop hook calls.
 COORD_LOG="${CLAUDE_PLUGIN_DATA}/coordinator.log"
+pidfile_before_spawn="$(cat "$PIDFILE" 2>/dev/null)"
 nohup node "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" >>"$COORD_LOG" 2>&1 &
 SPAWNED_PID=$!
 disown 2>/dev/null || true
 
-# Startup liveness gate: an entry/dependency problem kills the child within
-# milliseconds (the pre-fix failure mode logged hundreds of MODULE_NOT_FOUND
-# crashes behind a false success line). Half a second catches that class; a
-# healthy coordinator keeps running. Only the spawn path pays this — the
-# common already-running session exits above.
-sleep 0.5
+# Startup gate: wait until a coordinator serves this workspace or ours exits.
+# A coordinator writes server.pid naming itself once it has bound its port, so
+# the workspace is served once server.pid changes to name a live process. That
+# is ours, or ours under a `node` launcher that does not exec (its pid is not
+# $!), or another session's when two start at once (#217). A changed file, not
+# just a different pid, so a stale file whose pid was reused never counts.
+#
+# A fixed half-second wait was not enough: a coordinator fails start-up only
+# after loading its native module and opening state.db, which took 1.3-1.7 s
+# under heavy load, so a dying coordinator was reported as spawned, pinned a
+# fresh workspace to node below and skipped the ABI self-heal. One still alive
+# but not serving at the deadline is warned about and let through: it may
+# only be slow. Only the spawn path pays this; a running session exits above.
+READY_TIMEOUT_S=10
+ready_deadline=$((SECONDS + READY_TIMEOUT_S))
+coordinator_serving=0
+while kill -0 "$SPAWNED_PID" 2>/dev/null; do
+  pidfile_now="$(cat "$PIDFILE" 2>/dev/null)"
+  serving_pid="$(printf '%s\n' "$pidfile_now" | head -n 1)"
+  if [ "$pidfile_now" != "$pidfile_before_spawn" ] && [ -n "$serving_pid" ] && kill -0 "$serving_pid" 2>/dev/null; then
+    coordinator_serving=1
+    break
+  fi
+  [ "$SECONDS" -ge "$ready_deadline" ] && break
+  sleep 0.1
+done
 if ! kill -0 "$SPAWNED_PID" 2>/dev/null; then
-  echo "agent-coherence: Node coordinator exited immediately after spawn; recent ${COORD_LOG}:" >&2
+  echo "agent-coherence: Node coordinator exited before it started serving; recent ${COORD_LOG}:" >&2
   tail -n 12 "$COORD_LOG" >&2 2>/dev/null || true
   # A NODE_MODULE_VERSION death means node_modules is ABI-stale despite a
   # stamp that vouched for it — a hand-restored tree, a partial install, a
@@ -470,10 +491,14 @@ if ! kill -0 "$SPAWNED_PID" 2>/dev/null; then
   fi
   exit 1
 fi
+if [ "$coordinator_serving" = "0" ]; then
+  echo "agent-coherence: Node coordinator (pid=${SPAWNED_PID}) has not started serving after ${READY_TIMEOUT_S}s; it may still be starting (see ${COORD_LOG})" >&2
+fi
 
 # First-provision backend stamp: this bootstrap just initialized a VIRGIN
-# workspace (no state.db before boot) and proved the coordinator lives, so
-# the store is Node-owned from birth. Record that as the explicit backend
+# workspace (no state.db before boot) and its coordinator is serving, or at
+# least still alive at the deadline above, so the store is Node-owned from
+# birth. Record that as the explicit backend
 # selection. Without the stamp, the dispatcher's guard (a) (state.db present
 # → python default) would misread the Node-born store as an established
 # Python workspace on the NEXT session and route to the Python bootstrap —
