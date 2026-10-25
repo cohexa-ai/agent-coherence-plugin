@@ -96,8 +96,8 @@ The coordinator's state directory is `<repo>/.coherence/`. Contents:
 | `state.db` | SQLite-WAL artifact state | default user umask | Per-artifact MESI state, version numbers, `content_hash` (SHA-256, hex). **Never** raw file content. |
 | `hook.secret` | Bearer token for HTTP auth | `0600` | 64 hex chars (32 random bytes) |
 | `server.pid` | Coordinator process discovery | default | Port + PID of the lazy-spawned coordinator |
-| `tracked.yaml` | User-committed opt-in patterns | default | Gitignore-style globs |
-| `ignored.yaml` | User-committed opt-out patterns | default | Gitignore-style globs |
+| `tracked.yaml` | User-committed opt-in patterns | default | Glob patterns: path globs with `**`, Python `fnmatch` without (see the README) |
+| `ignored.yaml` | User-committed opt-out patterns | default | Glob patterns, as `tracked.yaml` |
 
 **Content-hash-only invariant**: `state.db` stores SHA-256 content
 hashes, never file bytes. A read attacker who exfiltrates `state.db` learns

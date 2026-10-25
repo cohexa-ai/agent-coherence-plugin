@@ -421,14 +421,14 @@ test("PolicyRef: with strict patterns live, a reload still applies new ignore an
     writeFileSync(join(root, ".coherence", "strict_mode.yaml"), '- "data/*.json"\n', "utf8");
     const ref = PolicyRef.load(root);
     assert.equal(ref.isTracked("data/skip.txt"), true);
-    assert.equal(ref.isStrictMode("data/sub/a.json"), false);
+    assert.equal(ref.isStrictMode("data/sub/a.txt"), false);
 
     appendPolicyYaml(join(root, ".coherence", "ignored.yaml"), ["data/skip.txt"]);
-    writeFileSync(join(root, ".coherence", "strict_mode.yaml"), '- "data/*.json"\n- "data/sub/*.json"\n', "utf8");
+    writeFileSync(join(root, ".coherence", "strict_mode.yaml"), '- "data/*.json"\n- "data/sub/*.txt"\n', "utf8");
     ref.reload();
 
     assert.equal(ref.isTracked("data/skip.txt"), false); // a non-strict path: ignore wins
-    assert.equal(ref.isStrictMode("data/sub/a.json"), true); // a strict entry added on disk applies
+    assert.equal(ref.isStrictMode("data/sub/a.txt"), true); // a strict entry added on disk applies
     assert.equal(ref.isStrictMode("data/a.json"), true);
   } finally {
     cleanup();
