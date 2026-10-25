@@ -32,10 +32,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { writeExecutable } from './executable_fixture.js';
 
 // __dirname at runtime is dist/test/; plugin root is two levels up
 const __filename = fileURLToPath(import.meta.url);
@@ -271,8 +272,7 @@ function writeFakeGh(dir: string, rscMain: RscBehavior, rscDev: RscBehavior): st
     'esac',
   ].join('\n');
   const ghPath = join(binDir, 'gh');
-  writeFileSync(ghPath, `${script}\n`);
-  chmodSync(ghPath, 0o755);
+  writeExecutable(ghPath, `${script}\n`);
   return binDir;
 }
 
