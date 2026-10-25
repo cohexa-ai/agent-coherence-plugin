@@ -23,6 +23,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { escapeNonprintable, httpErrorLine, pyRepr } from "./cli_output.js";
 import {
   CLI_REQUEST_TIMEOUT_MS,
+  type CoordinatorEndpoint,
   findCoordinatorRoot,
   requestJsonStatus,
   resolveEndpoint,
@@ -157,11 +158,16 @@ function strictRefusalEntries(
   return refused;
 }
 
-function reportStrictRefusal(entries: Array<{ path: string; strict_patterns: string[] }>): void {
+function reportStrictRefusal(
+  entries: Array<{ path: string; strict_patterns: string[] }>,
+  rejected: ReadonlyArray<Record<string, unknown>>,
+  invalid: ReadonlyArray<[string, string]>,
+): void {
   for (const entry of entries) {
     const named = entry.strict_patterns.map(escapeNonprintable).join(", ");
     err(`agent-coherence-untrack: refused ${pyRepr(entry.path)}: enforced in strict mode by ${named}`);
   }
+  printRejections("agent-coherence-untrack", rejected, invalid);
   err(
     "agent-coherence-untrack: nothing was untracked. A strict path stays enforced while the " +
       "coordinator runs; remove its entry from .coherence/strict_mode.yaml and restart the " +
@@ -188,18 +194,53 @@ function rejectedPath(entry: Record<string, unknown>): string {
   return typeof path === "string" ? pyRepr(path) : escapeNonprintable(path);
 }
 
-async function postPolicy(
+function printRejections(
   prog: PolicyProg,
-  endpointPath: "/policy/track" | "/policy/untrack",
-  root: string,
-  paths: string[],
-): Promise<Answer | null> {
+  rejected: ReadonlyArray<Record<string, unknown>>,
+  invalid: ReadonlyArray<[string, string]>,
+): void {
+  for (const entry of rejected) {
+    err(`${prog}: rejected ${rejectedPath(entry)}: ${escapeNonprintable(entry.reason ?? "")}`);
+  }
+  for (const [p, reason] of invalid) err(`${prog}: rejected ${pyRepr(p)}: ${reason}`);
+}
+
+/** A refusal's `rejected` list, or none when it has the wrong shape: the refusal is what to report. */
+function refusalRejections(body: Record<string, unknown> | null): Array<Record<string, unknown>> {
+  const rejected = body?.rejected;
+  return Array.isArray(rejected) && rejected.every(isPlainObject) ? rejected : [];
+}
+
+/** An exit 2 once the request was sent: the failure line, then the CLI's own rejections. */
+function failAfterRequest(prog: PolicyProg, line: string, invalid: ReadonlyArray<[string, string]>): number {
+  err(`${prog}: ${line}`);
+  printRejections(prog, [], invalid);
+  return 2;
+}
+
+/**
+ * The coordinator's endpoint, or null once its absence is reported. Nothing
+ * was sent, so the CLI's own rejections stay unprinted, as library #379 allows.
+ */
+function findEndpoint(prog: PolicyProg, root: string): CoordinatorEndpoint | null {
   try {
-    const endpoint = resolveEndpoint(resolve(root));
-    return await requestJsonStatus(endpoint, "POST", endpointPath, { paths }, undefined, CLI_REQUEST_TIMEOUT_MS);
+    return resolveEndpoint(resolve(root));
   } catch (exc) {
     err(`${prog}: ${escapeNonprintable((exc as Error).message)}`);
     return null;
+  }
+}
+
+/** The answer, or the message of the network error that left it incomplete. */
+async function postPolicy(
+  endpoint: CoordinatorEndpoint,
+  endpointPath: "/policy/track" | "/policy/untrack",
+  paths: string[],
+): Promise<Answer | string> {
+  try {
+    return await requestJsonStatus(endpoint, "POST", endpointPath, { paths }, undefined, CLI_REQUEST_TIMEOUT_MS);
+  } catch (exc) {
+    return (exc as Error).message;
   }
 }
 
@@ -210,14 +251,13 @@ async function postPolicy(
  * a coordinator refused because a path is enforced in strict mode exits 3,
  * classified on any error status, as the Python CLI does.
  */
-function reportRefusal(prog: PolicyProg, answer: Answer): number {
+function reportRefusal(prog: PolicyProg, answer: Answer, invalid: ReadonlyArray<[string, string]>): number {
   const refused = prog === "agent-coherence-untrack" && answer.status >= 400 ? strictRefusalEntries(answer.body) : null;
   if (refused !== null) {
-    reportStrictRefusal(refused);
+    reportStrictRefusal(refused, refusalRejections(answer.body), invalid);
     return 3;
   }
-  err(`${prog}: ${httpErrorLine(answer.status, answer.body)}`);
-  return 2;
+  return failAfterRequest(prog, httpErrorLine(answer.status, answer.body), invalid);
 }
 
 function printApplied(prog: PolicyProg, verb: "tracked" | "untracked", root: string, applied: string[]): void {
@@ -266,28 +306,21 @@ async function runPolicyMutation(
     else valid.push(normalized);
   }
   if (valid.length === 0) {
-    for (const [p, reason] of invalid) err(`${prog}: rejected ${pyRepr(p)}: ${reason}`);
+    printRejections(prog, [], invalid);
     return 1;
   }
 
-  const answer = await postPolicy(prog, endpointPath, root, valid);
-  if (answer === null) return 2;
-  if (answer.status < 200 || answer.status >= 300) return reportRefusal(prog, answer);
-  if (answer.body === null) {
-    err(`${prog}: coordinator returned a non-JSON response`);
-    return 2;
-  }
+  const endpoint = findEndpoint(prog, root);
+  if (endpoint === null) return 2;
+  const answer = await postPolicy(endpoint, endpointPath, valid);
+  if (typeof answer === "string") return failAfterRequest(prog, escapeNonprintable(answer), invalid);
+  if (answer.status < 200 || answer.status >= 300) return reportRefusal(prog, answer, invalid);
+  if (answer.body === null) return failAfterRequest(prog, "coordinator returned a non-JSON response", invalid);
   const result = readPolicyAnswer(answer.body, resultKey);
-  if (result === null) {
-    err(`${prog}: unexpected ${endpointPath} answer shape`);
-    return 2;
-  }
+  if (result === null) return failAfterRequest(prog, `unexpected ${endpointPath} answer shape`, invalid);
 
   printApplied(prog, verb, root, result.applied);
-  for (const entry of result.rejected) {
-    err(`${prog}: rejected ${rejectedPath(entry)}: ${escapeNonprintable(entry.reason ?? "")}`);
-  }
-  for (const [p, reason] of invalid) err(`${prog}: rejected ${pyRepr(p)}: ${reason}`);
+  printRejections(prog, result.rejected, invalid);
   return 0;
 }
 

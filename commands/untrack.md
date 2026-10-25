@@ -7,16 +7,17 @@ allowed-tools: ["Bash"]
 Run `agent-coherence-untrack $ARGUMENTS` and report the output.
 
 The command's stdout lists each successfully untracked path. Stderr carries
-any rejections (invalid path syntax). The coordinator does NOT delete
-existing artifact rows from SQLite — it just adds the path to ignored.yaml
-so future Reads suppress warnings. A path enforced in strict mode is never
-untracked this way.
+any rejections (invalid path syntax, from the CLI or the coordinator), also
+when the command exits 3, or exits 2 after the request was sent. The
+coordinator does NOT delete existing artifact rows from SQLite — it just
+adds the path to ignored.yaml so future Reads suppress warnings. A path
+enforced in strict mode is never untracked this way.
 
 If the command exits 3, the coordinator refused because a path is enforced
-in strict mode, and nothing was untracked. Report the refused paths and the
-next step the message names (remove the entry from
-`.coherence/strict_mode.yaml`, then restart the coordinator, which the
-README's Strict mode section describes). An entry the coordinator could not
+in strict mode, and nothing was untracked. Report the refused paths, any
+rejected ones listed with them, and the next step the message names
+(remove the entry from `.coherence/strict_mode.yaml`, then restart the
+coordinator, which the README's Strict mode section describes). An entry the coordinator could not
 finish checking is refused the same way, naming strict patterns it may not
 cover. Before suggesting the strict-mode step for a long or `*`-heavy entry,
 retry such entries in smaller requests and give each a more literal path (for

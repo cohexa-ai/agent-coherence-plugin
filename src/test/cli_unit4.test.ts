@@ -689,6 +689,105 @@ test("untrack: the strict refusal is read on any error status, and never by trac
   }
 });
 
+test("untrack: a strict refusal also prints the answer's rejections and the CLI's own, before the closing line (#212)", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    coord.answers.set("/policy/untrack", [
+      409,
+      { ...STRICT_REFUSAL, rejected: [{ path: "\\x", reason: "path must be relative (no leading \\)" }] },
+    ]);
+    const run = await runCli("cli_untrack.js", ["data/a.txt", "\\x", "../outside", "--root", coord.root], coord.root);
+    assert.equal(run.status, 3, run.stderr);
+    assert.equal(run.stdout, "");
+    assert.equal(
+      run.stderr,
+      "agent-coherence-untrack: refused 'data/a.txt': enforced in strict mode by data/**\n" +
+        "agent-coherence-untrack: rejected '\\\\x': path must be relative (no leading \\)\n" +
+        "agent-coherence-untrack: rejected '../outside': contains '..'\n" +
+        STRICT_RESTART_LINE +
+        "\n",
+    );
+  } finally {
+    await coord.close();
+  }
+});
+
+test("untrack: a strict refusal whose rejected list has the wrong shape still exits 3 with the CLI's own rejections (#212)", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    for (const rejected of ["\\x", [{ path: "\\x", reason: "no leading \\" }, "\\y"]]) {
+      coord.answers.set("/policy/untrack", [409, { ...STRICT_REFUSAL, rejected }]);
+      const run = await runCli("cli_untrack.js", ["data/a.txt", "../outside", "--root", coord.root], coord.root);
+      assert.equal(run.status, 3, run.stderr);
+      assert.equal(
+        run.stderr,
+        "agent-coherence-untrack: refused 'data/a.txt': enforced in strict mode by data/**\n" +
+          "agent-coherence-untrack: rejected '../outside': contains '..'\n" +
+          STRICT_RESTART_LINE +
+          "\n",
+      );
+    }
+  } finally {
+    await coord.close();
+  }
+});
+
+for (const prog of ["track", "untrack"] as const) {
+  test(`${prog}: an exit 2 after the request still prints the CLI's own rejections (#212)`, async () => {
+    const coord = await startCannedCoordinator();
+    const route = `/policy/${prog}`;
+    try {
+      for (const [status, body, line] of [
+        [500, { error: "internal: Error" }, `HTTP 500: internal: Error`],
+        [200, { ok: true, [prog === "track" ? "added" : "removed"]: "notes.md" }, `unexpected ${route} answer shape`],
+      ] as const) {
+        coord.answers.set(route, [status, body]);
+        const run = await runCli(`cli_${prog}.js`, ["notes.md", "../outside", "--root", coord.root], coord.root);
+        assert.equal(run.status, 2, run.stderr);
+        assert.equal(
+          run.stderr,
+          `agent-coherence-${prog}: ${line}\n` + `agent-coherence-${prog}: rejected '../outside': contains '..'\n`,
+        );
+      }
+    } finally {
+      await coord.close();
+    }
+  });
+
+  test(`${prog}: a request cut off before its answer prints the CLI's own rejections, no coordinator does not (#212)`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "cli-policy-cut-"));
+    const server = createNetServer((socket) => {
+      socket.on("error", () => {});
+      socket.once("data", () => {
+        socket.end("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n" + '{"ok":');
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const argv = ["notes.md", "../outside", "--root", root];
+    try {
+      // No port file: nothing was sent, which library #379 lets stay silent.
+      const absent = await runCli(`cli_${prog}.js`, argv, root);
+      assert.equal(absent.status, 2, absent.stderr);
+      assert.match(absent.stderr, new RegExp(`^agent-coherence-${prog}: no coordinator running for this workspace`));
+      assert.doesNotMatch(absent.stderr, /rejected/);
+
+      mkdirSync(join(root, ".coherence"), { recursive: true });
+      writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${(server.address() as AddressInfo).port}\n`);
+      writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
+      const cut = await runCli(`cli_${prog}.js`, argv, root);
+      assert.equal(cut.status, 2, cut.stderr);
+      assert.equal(
+        cut.stderr,
+        `agent-coherence-${prog}: coordinator closed the connection before the response was complete\n` +
+          `agent-coherence-${prog}: rejected '../outside': contains '..'\n`,
+      );
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 test("untrack: a hostile strict refusal prints its path quoted and every field escaped", async () => {
   const coord = await startCannedCoordinator();
   try {
