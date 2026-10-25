@@ -167,6 +167,45 @@ export const GRANT_CHANGE_DENY_REASON_TEMPLATE =
   "denial.";
 
 /**
+ * BYTE-IDENTICAL to Python `OUT_OF_BAND_DENY_REASON_TEMPLATE` (#205): a
+ * reader holding a valid grant hashed bytes the coordinator never recorded,
+ * at the version it already holds, so no session committed the change. It
+ * names no writer, and tells the session not to undo what may be its user's
+ * own edit.
+ */
+export const OUT_OF_BAND_DENY_REASON_TEMPLATE =
+  "Stale read denied: {path} on disk no longer matches v{current_version}, " +
+  "the version you last read, and no session committed the change, so it " +
+  "was made outside the coordinator. Do not restore or overwrite {path}: " +
+  "the change may be your user's work. Tell your user that {path} changed " +
+  "outside the coordinator; the read stays denied until the change is " +
+  "committed through the coordinator. This denial is structural (v0.2 " +
+  "strict mode); retrying the same operation will produce the same denial.";
+
+/**
+ * BYTE-IDENTICAL to Python `OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE` (#205): the
+ * warn-mode read notice and pre-edit's disk notice, carried context-only.
+ */
+export const OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE =
+  "⚠ {path} on disk differs from v{version}, the last content committed " +
+  "through the coordinator, and no session committed the change: it was " +
+  "made outside the coordinator. Read {path} before relying on it, and do " +
+  "not write it from an earlier read; that write would replace the change.";
+
+export function outOfBandChangeNotice(path: string, version: number): string {
+  return fmt(OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE, { path, version: String(version) });
+}
+
+/**
+ * Python `summary_reports_an_out_of_band_change`: the caller's bytes differ
+ * from the record while the version it last observed is still current.
+ */
+export function summaryReportsAnOutOfBandChange(summary: StaleSummary): boolean {
+  const prior = summary.prior_version_seen_by_session;
+  return prior !== null && summary.hash_differs && summary.current_version === prior;
+}
+
+/**
  * Does this summary support the claim that the artifact was WRITTEN?
  * Mirrors Python `hook_payloads.summary_reports_a_write` exactly.
  *
@@ -276,8 +315,24 @@ export function fmt(template: string, subs: Record<string, string>): string {
  * - timestamp via `pythonIsoUtc` (never toISOString);
  * - NO additionalContext key.
  * The `source` arg is kept for call-site telemetry parity with Python.
+ * `outOfBand` is Python's `out_of_band=True`: only the valid-grant read arm
+ * asks for it, and the summary must still confirm the change (#205).
  */
-export function emitStrictDeny(args: { source: string; summary: StaleSummary }): HookSpecificOutput {
+export function emitStrictDeny(args: {
+  source: string;
+  summary: StaleSummary;
+  outOfBand?: boolean;
+}): HookSpecificOutput {
+  if (args.outOfBand === true && summaryReportsAnOutOfBandChange(args.summary)) {
+    return {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: fmt(OUT_OF_BAND_DENY_REASON_TEMPLATE, {
+        path: args.summary.path,
+        current_version: String(args.summary.current_version),
+      }),
+    };
+  }
   if (!summaryReportsAWrite(args.summary)) {
     return {
       hookEventName: "PreToolUse",

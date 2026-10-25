@@ -26,7 +26,7 @@ import { ArtifactRegistry } from "../registry.js";
 import { PolicyRef } from "../policy.js";
 import { SessionRegistry } from "../sessions.js";
 import { createServer } from "../server.js";
-import { sessionToAgentId } from "../agent_id.js";
+import { fmt, OUT_OF_BAND_DENY_REASON_TEMPLATE } from "../hook_payloads.js";
 
 const HOOK_CLIENT_JS = join(dirname(fileURLToPath(import.meta.url)), "..", "hook_client.js");
 const SID_A = "44444444-4444-4444-8444-444444444444";
@@ -102,6 +102,7 @@ test("ZERO-PYTHON SMOKE: four-step warn sequence + strict deny, no Python (or an
   mkdirSync(join(root, ".coherence"), { recursive: true });
   const env = zeroPythonEnv(emptyDir);
   const secret = "s".repeat(32);
+  let close: (() => Promise<void>) | undefined;
   try {
     // Precondition: python (and everything else) is unresolvable in the child env.
     for (const exe of ["python3", "python", "git"]) {
@@ -109,7 +110,7 @@ test("ZERO-PYTHON SMOKE: four-step warn sequence + strict deny, no Python (or an
       assert.notEqual(probe.error, undefined, `${exe} must be unresolvable in the smoke env`);
     }
 
-    const { close } = await makeCoordinator(root, secret);
+    ({ close } = await makeCoordinator(root, secret));
     const abs = join(root, "CLAUDE.md");
     writeFileSync(abs, "v1 content\n");
 
@@ -195,7 +196,9 @@ test("ZERO-PYTHON SMOKE: four-step warn sequence + strict deny, no Python (or an
     });
     assert.equal(trkStatus, 0);
 
-    // B invalidated A again above; A pre-reads → strict DENY, byte-stable prefix.
+    // A holds SHARED at the current version from its stale re-read, but the
+    // bytes on disk are not the recorded content (B's HASH_3 is synthetic),
+    // and no session committed them → strict out-of-band DENY (#205).
     const r5 = await clientCall(
       "pre-read",
       root,
@@ -203,16 +206,13 @@ test("ZERO-PYTHON SMOKE: four-step warn sequence + strict deny, no Python (or an
       env,
     );
     assert.equal(r5.status, "stale");
+    const summary5 = r5.summary as Record<string, unknown>;
+    assert.equal(summary5.prior_version_seen_by_session, summary5.current_version);
     const hso5 = r5.hookSpecificOutput as Record<string, unknown>;
     assert.equal(hso5.permissionDecision, "deny");
-    assert.match(
-      hso5.permissionDecisionReason as string,
-      // R7: the deny names the writer's AGENT id, not the session id it was
-      // derived from. Derived here rather than pasted so the pin stays an
-      // attribution check -- a bare `[0-9a-f]{8}` would pass for any writer.
-      new RegExp(
-        `^Stale read denied: CLAUDE\\.md was updated by agent ${sessionToAgentId(SID_B).slice(0, 8)} at .+\\. Re-read CLAUDE\\.md via the Read tool before proceeding\\. This denial is structural \\(v0\\.2 strict mode\\); retrying the same operation will produce the same denial\\.$`,
-      ),
+    assert.equal(
+      hso5.permissionDecisionReason,
+      fmt(OUT_OF_BAND_DENY_REASON_TEMPLATE, { path: "CLAUDE.md", current_version: String(summary5.current_version) }),
     );
     assert.equal("additionalContext" in hso5, false);
 
@@ -227,9 +227,10 @@ test("ZERO-PYTHON SMOKE: four-step warn sequence + strict deny, no Python (or an
       (r6.hookSpecificOutput as Record<string, unknown>).permissionDecisionReason,
       hso5.permissionDecisionReason,
     );
-
-    await close();
   } finally {
+    // In finally, so a failed assertion fails the test instead of leaving
+    // the server open and the run waiting on it.
+    await close?.();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -243,8 +244,9 @@ test("ZERO-PYTHON SMOKE: the untrack CLI exits 3 when the Node coordinator refus
   mkdirSync(join(root, ".coherence"), { recursive: true });
   writeFileSync(join(root, ".coherence", "strict_mode.yaml"), '- "CLAUDE.md"\n');
   const env = zeroPythonEnv(emptyDir);
+  let close: (() => Promise<void>) | undefined;
   try {
-    const { close } = await makeCoordinator(root, "s".repeat(32));
+    ({ close } = await makeCoordinator(root, "s".repeat(32)));
     // MUST be async spawn: spawnSync would deadlock the in-process server.
     const untrack = (path: string) =>
       new Promise<{ status: number | null; stderr: string }>((r) => {
@@ -265,8 +267,8 @@ test("ZERO-PYTHON SMOKE: the untrack CLI exits 3 when the Node coordinator refus
 
     const plain = await untrack("notes.md");
     assert.equal(plain.status, 0, plain.stderr);
-    await close();
   } finally {
+    await close?.();
     rmSync(root, { recursive: true, force: true });
   }
 });

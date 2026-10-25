@@ -7,8 +7,10 @@
  * Wire shape per KTD-B / KTD-B.3 C3:
  * - Request: `{session_id, path}`
  * - Response: `{ok: true}` on clean acquire; `{ok: true, hookSpecificOutput: {...}}`
- *   with collision warning if another session held M/E; `{ok: false, reason}`
- *   on protocol error (single-writer violation propagated).
+ *   with collision warning if another session held M/E; `disk_differs: true`
+ *   with the out-of-band notice when the file on disk no longer holds the
+ *   recorded content (#205); `{ok: false, reason}` on protocol error
+ *   (single-writer violation propagated).
  *
  * Note on collision detection ordering: the Python handler peeks `exclusiveHolder`
  * BEFORE calling `write()` (which would invalidate the holder). We mirror this:
@@ -17,16 +19,22 @@
  * the victim will see on their next hook.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Artifact } from "../registry.js";
+import { join } from "node:path";
 import { CoherenceError } from "../coherence_error.js";
+import { hashRegularFile } from "../disk_content.js";
 import { MESIState } from "../states.js";
 import {
   buildCollisionResponse,
   emitStrictDeny,
   nowUnix,
+  outOfBandChangeNotice,
   type StaleSummary,
 } from "../hook_payloads.js";
 import {
   drainNoticeText,
+  holdsContentClaim,
+  isRecentSelfCommitLag,
   isValidPath,
   isValidSessionId,
   readJsonBody,
@@ -35,9 +43,38 @@ import {
   writeError,
   writeJson,
 } from "./_common.js";
-import { deliverPendingReground, writeFastAdmit } from "./reground.js";
+import { attachPreToolUseContext, deliverPendingReground, writeFastAdmit } from "./reground.js";
 
 export type PreEditDeps = HookDeps;
+
+/**
+ * Python `_a_write_is_in_flight`: another session holds an uncommitted write
+ * claim whose bytes may still be landing, so a differing disk proves nothing.
+ * Node records no heartbeats, so only Python's no-heartbeat arm applies: any
+ * peer in EXCLUSIVE counts as in flight. Python skips the check only when
+ * that peer's heartbeat is within 5 s, so the two differ only for a peer
+ * that has held EXCLUSIVE silently for longer, and the check never denies.
+ */
+function aWriteIsInFlight(deps: PreEditDeps, artifactId: string, agentId: string): boolean {
+  for (const [peer, state] of deps.registry.getStateMap(artifactId)) {
+    if (peer !== agentId && state === MESIState.EXCLUSIVE) return true;
+  }
+  return false;
+}
+
+/**
+ * Python `_recorded_content_missing_from_disk` (#205): the recorded version
+ * when the file on disk no longer holds the content the coordinator recorded
+ * and the caller's own recent commit does not explain it; else null.
+ */
+function recordedContentMissingFromDisk(deps: PreEditDeps, artifact: Artifact | null, agentId: string): number | null {
+  // The acquire writes grants and notices only, so the row read before it is current.
+  if (artifact === null || !holdsContentClaim(artifact.content_hash)) return null;
+  // Checked first: the caller's own commit explains a differing disk, so the read is wasted.
+  if (isRecentSelfCommitLag(artifact, agentId, nowUnix())) return null;
+  const diskHash = hashRegularFile(join(deps.policy.get().coordinatorRoot, artifact.name));
+  return diskHash === null || diskHash === artifact.content_hash ? null : artifact.version;
+}
 
 interface PreEditBody {
   session_id?: unknown;
@@ -134,6 +171,7 @@ export async function handlePreEdit(
   // R7: name the incumbent by its agent id.
   const holderSessionId = holder !== null ? holder.agentId : null;
   const holderAcquiredAt = holder?.grantedAtTick ?? null;
+  const peerWriteInFlight = aWriteIsInFlight(deps, artifactId, agentId);
 
   // Acquire EXCLUSIVE — invalidates any peers in M/E/S + writes pending
   // notices for those who held M/E (peers in S don't get a notice).
@@ -147,6 +185,18 @@ export async function handlePreEdit(
     });
     return;
   }
+
+  // #205: only an admitted editor is told, and the check never denies.
+  const outOfBandVersion = peerWriteInFlight
+    ? null
+    : recordedContentMissingFromDisk(deps, existing, agentId);
+  const finish = (result: object): Record<string, unknown> => {
+    if (outOfBandVersion === null) return withReground(result);
+    return withReground({
+      ...attachPreToolUseContext(result as Record<string, unknown>, outOfBandChangeNotice(path, outOfBandVersion)),
+      disk_differs: true,
+    });
+  };
 
   // Pop any pending notices for THIS session — they accumulated from prior
   // preemptions before this pre-edit. Bounded and rendered by the one shared
@@ -171,7 +221,7 @@ export async function handlePreEdit(
       collisionResp.hookSpecificOutput.additionalContext =
         noticeText + "\n\n" + collisionResp.hookSpecificOutput.additionalContext;
     }
-    writeJson(res, 200, withReground(collisionResp));
+    writeJson(res, 200, finish(collisionResp));
     return;
   }
 
@@ -181,7 +231,7 @@ export async function handlePreEdit(
     writeJson(
       res,
       200,
-      withReground({
+      finish({
         ok: true,
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
@@ -193,7 +243,7 @@ export async function handlePreEdit(
     return;
   }
 
-  writeJson(res, 200, withReground({ ok: true }));
+  writeJson(res, 200, finish({ ok: true }));
 }
 
 export async function preEditRoute(
