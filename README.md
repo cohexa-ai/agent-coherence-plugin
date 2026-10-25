@@ -19,7 +19,7 @@ The design bias: surface stale state to the agent itself via `additionalContext`
 
 ## What it does
 
-Watches tracked artifacts (CLAUDE.md, AGENTS.md, `DECISIONS.md`, `docs/specs/`, `docs/plans/`, `docs/brainstorms/`, `plan.md` / `task.md` / `spec.md`) across:
+Watches tracked artifacts (CLAUDE.md, AGENTS.md, `DECISIONS.md` on the Node backend, `docs/specs/`, `docs/plans/`, `docs/brainstorms/`, `plan.md` / `task.md` / `spec.md`) across:
 
 - Agent View ✓
 - Multi-terminal (multiple `claude` processes in the same workspace) ✓
@@ -219,7 +219,7 @@ What happens when a strict + tracked artifact is read stale:
 
 **A strict path stays strict while the coordinator runs.** An `ignored.yaml` entry never takes it out of strict mode, `/agent-coherence:untrack` refuses an entry that covers it (`agent-coherence-untrack` exits 3 and writes nothing), and a track or untrack never drops a strict pattern the running coordinator holds. To stop enforcing a path, remove its entry from `.coherence/strict_mode.yaml` and restart the coordinator: stop it with `kill "$(head -n 1 .coherence/server.pid)"` from the workspace root (it shuts down cleanly and removes `server.pid`), or let it stop by itself after 15 idle minutes, and the next hook starts a new one that reads the files again. Do not delete `server.pid` while the coordinator runs: that leaves it running with the old policy. At start-up the Node coordinator names any `ignored.yaml` entry that strict overrides in its log, `coordinator.log` in the plugin's data directory. On the Python backend this needs `agent-coherence` releases after 0.14.1.
 
-**Strict mode is operator opt-in per artifact. Never global.** A literal `**` in `strict_mode_paths` triggers a startup warning (the coordinator counts matching tracked artifacts; default threshold is 50). The plugin will never silently lock down a workspace.
+**Strict mode is operator opt-in, pattern by pattern.** It applies only to tracked paths, and a broad pattern reaches all of them: a strict `**`, or a `*` in a pattern without `**` (which matches across `/`; see the `tracked.yaml` row below), puts every tracked artifact in strict mode. Neither coordinator warns about a broad entry, so keep `strict_mode.yaml` entries as narrow as the files you mean to guard.
 
 For tool-class restrictions (`grep` → `rg`, no `python -c`, no `sudo`), the structurally stronger primitive is `permissions.deny` at the configuration layer. `agent-coherence-migrate-deny` (library v0.8.2+) is the security-hardened helper: STDOUT-only (never writes settings.json), symlink-contained (canonical-path containment check refuses files outside the workspace root), never invokes an LLM. Operator reviews the output and pastes into `.claude/settings.local.json`.
 
@@ -370,6 +370,7 @@ The plugin-shipped path requires a Claude Code platform change — tracked in [a
 | Issue | Impact | When it matters |
 |---|---|---|
 | Native Windows not supported | `fcntl` lock primitive is POSIX-only | Use WSL2 on Windows. v0.2.x ships an `os.O_EXCL` fallback. |
+| `DECISIONS.md` is a default tracked file on the Node coordinator only | The Python coordinator's defaults do not include it, so on a workspace it serves `DECISIONS.md` is untracked: a stale read gets no warning, a `strict_mode.yaml` entry for it is not enforced, and an untrack of it is never refused. `/status` reports 9 default patterns on Node and 8 on Python | On a Python-backend workspace that relies on it, add `- "DECISIONS.md"` to `.coherence/tracked.yaml`. Tracked in [#228](https://github.com/Cohexa-ai/agent-coherence-plugin/issues/228). |
 | `agent-coherence-migrate-deny` needs Python | The `permissions.deny` suggestion helper is not part of the zero-Python Node surface — and since fresh workspaces now default to Node, this is the one helper a default install cannot run | Install `agent-coherence` (Python) to run the migrate-deny helper, or hand-write the `permissions.deny` rules. All runtime hooks + strict mode work without Python on the Node backend. |
 | Hot `hook.secret` rotation not supported | v0.2 ships stop-rotate-restart procedure | If the secret is compromised, follow the troubleshooting row above. v0.2.x will add hot rotation. |
 | Bypass class: interpreters not in detector list | `ruby -e`, `node -e`, `perl -pe < file` can read tracked-strict artifacts | Operator-supplied `permissions.deny` rule per language. The `bash_path_detector` is intentionally curated; obfuscated bypass is documented as out-of-scope. |

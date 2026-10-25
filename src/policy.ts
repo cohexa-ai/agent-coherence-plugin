@@ -8,7 +8,9 @@
  *
  * Per KTD-L: DECISIONS.md is included in the default tracked set as of
  * v0.1.1 (operator-rulings append-only ledger pattern surfaced by
- * kcarriedo in anthropics/claude-code#59309).
+ * kcarriedo in anthropics/claude-code#59309). The Python coordinator's
+ * defaults do not include it, so it is a Node-only default; the README's
+ * Known limitations say so (#228).
  *
  * KTD-A.5 point 4: YAML file locking interop with the Python coordinator
  * requires fd-level POSIX flock(2), NOT proper-lockfile's sidecar-lock
