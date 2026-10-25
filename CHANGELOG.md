@@ -37,6 +37,10 @@ The canonical release-notes surface is [GitHub Releases](https://github.com/Cohe
 
 - **`/agent-coherence:track` and `/agent-coherence:untrack` say what happens when the CLI gets no paths.** They said argparse would error, which is true only of the Python console script (exit 2 with a usage message); the bundled Node CLI exits 1 with no output.
 
+### Internal
+
+- **The Node coordinator parses a policy glob in one place ([#213](https://github.com/Cohexa-ai/agent-coherence-plugin/issues/213)).** The regex a pattern with at most one `*` or `**` run is matched by is now built from the same tokens the linear matcher and the strict-coverage search read, as the Python coordinator builds its `**` regex, so a change to the glob syntax is made once. No pattern matches differently: over 1.7 million patterns, the new regex is byte-identical to the old one.
+
 ## [0.6.0] — 2026-10-13
 
 **On the built-in Node coordinator, strict mode no longer lets a session write a file it was just refused a read of, `/status` and hook messages stop publishing raw session ids and your absolute workspace path, and tracking a `*` glob can no longer empty a policy file; a Python-backend workspace gets these from `agent-coherence` releases after 0.14.1. The track and untrack commands escape what the coordinator sends and say why it refused a request, the status, track and untrack commands report refusals by exit code, and the hook client is ready for the caller principal that `agent-coherence` releases after 0.14.1 issue.**

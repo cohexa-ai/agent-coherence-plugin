@@ -683,25 +683,38 @@ function compileGlob(pattern: string): (path: string) => boolean {
   if (tokens.filter(isRun).length > REGEX_RUN_LIMIT) {
     return (path) => tokensMatch(tokens, path);
   }
-  const regex = globRegex(pattern);
+  const regex = globRegex(tokens);
   return (path) => regex.test(path);
 }
 
-/** The backtracking regex a pattern compiles to (exported for the differential test). */
-export function globRegex(pattern: string): RegExp {
-  return new RegExp("^" + patternToRegex(pattern) + "$");
+/** The backtracking regex `tokens` spell (exported for the differential test). */
+export function globRegex(tokens: ReadonlyArray<Token>): RegExp {
+  return new RegExp("^" + tokens.map(tokenRegex).join("") + "$");
+}
+
+function tokenRegex(token: Token): string {
+  switch (token.kind) {
+    case "any_run":
+      return ".*";
+    case "seg_run":
+      return "[^/]*";
+    case "seg_one":
+      return "[^/]";
+    case "lit":
+      return token.ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
 }
 
 // ----------------------------------------------------------------------
 // Glob tokens and their automaton
 //
-// The tokens spell exactly the language `patternToRegex` compiles a pattern
-// to: `**` is any run (a following `/` swallowed), `*` a run without `/`, `?`
-// one character but `/`, and every other character a literal, `[` included.
-// The regex has no flags, so its `.` stops at a line terminator, its `$`
-// matches only at the end, and it reads UTF-16 code units, as the automaton
-// does. Both the linear matcher and the strict-coverage search read them; a
-// differential test against the regex pins the mirror.
+// A pattern is parsed once, into tokens: `**` is any run (a following `/`
+// swallowed), `*` a run without `/`, `?` one character but `/`, and every
+// other character a literal, `[` included. The regex (`globRegex`), the linear
+// matcher and the strict-coverage search all read them. The regex has no
+// flags, so its `.` stops at a line terminator, its `$` matches only at the
+// end, and it reads UTF-16 code units, as the automaton does; a differential
+// test pins that the two agree.
 // ----------------------------------------------------------------------
 
 type Token =
@@ -981,34 +994,6 @@ function searchAlphabet(tokenLists: ReadonlyArray<ReadonlyArray<Token>>): Array<
 /** Order-preserving union: `first`, then what `second` adds. */
 function union(first: ReadonlyArray<string>, second: ReadonlyArray<string>): string[] {
   return [...new Set([...first, ...second])];
-}
-
-function patternToRegex(pattern: string): string {
-  const out: string[] = [];
-  let i = 0;
-  while (i < pattern.length) {
-    const c = pattern[i];
-    if (c === "*") {
-      if (i + 1 < pattern.length && pattern[i + 1] === "*") {
-        out.push(".*");
-        i += 2;
-        if (i < pattern.length && pattern[i] === "/") {
-          i += 1;
-        }
-      } else {
-        out.push("[^/]*");
-        i += 1;
-      }
-    } else if (c === "?") {
-      out.push("[^/]");
-      i += 1;
-    } else {
-      // Escape regex metacharacters.
-      out.push(c!.replace(/[.+^${}()|[\]\\]/g, "\\$&"));
-      i += 1;
-    }
-  }
-  return out.join("");
 }
 
 /**
