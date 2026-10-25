@@ -31,6 +31,7 @@ import { randomUUID } from "node:crypto";
 import { runPendingMigrations, SCHEMA_USER_VERSION } from "./migrations.js";
 import { MESIState, isValidTransition, isWriter } from "./states.js";
 import { checkSingleWriter, checkMonotonicVersion } from "./invariants.js";
+import { CoherenceError } from "./coherence_error.js";
 
 /** Per KTD-K REVISED: per-lock-acquisition retry budget, NOT per-transaction. */
 export const BUSY_TIMEOUT_MS = 1500;
@@ -382,7 +383,7 @@ export class ArtifactRegistry {
         if (peerId === agentId) continue;
         if (peerState === MESIState.INVALID) continue;
         if (!isValidTransition(peerState, MESIState.INVALID)) {
-          throw new Error(
+          throw new CoherenceError(
             `acquireExclusive: peer ${peerId} in ${peerState} cannot transition to INVALID`,
           );
         }
@@ -397,7 +398,7 @@ export class ArtifactRegistry {
       const priorAgentState = stateMap.get(agentId) ?? MESIState.INVALID;
       if (priorAgentState !== MESIState.EXCLUSIVE && priorAgentState !== MESIState.MODIFIED) {
         if (!isValidTransition(priorAgentState, MESIState.EXCLUSIVE)) {
-          throw new Error(
+          throw new CoherenceError(
             `acquireExclusive: ${agentId} transition ${priorAgentState}→EXCLUSIVE not allowed`,
           );
         }
@@ -466,7 +467,7 @@ export class ArtifactRegistry {
 
       const agentState = this.getAgentState(artifactId, agentId);
       if (agentState !== MESIState.EXCLUSIVE && agentState !== MESIState.MODIFIED) {
-        throw new Error(
+        throw new CoherenceError(
           `commit_not_allowed: agent=${agentId} artifact=${artifactId} state=${agentState ?? "INVALID"} ` +
             `(must be EXCLUSIVE or MODIFIED to commit)`,
         );
@@ -496,7 +497,7 @@ export class ArtifactRegistry {
         if (peerId === agentId) continue;
         if (peerState === MESIState.INVALID) continue;
         if (!isValidTransition(peerState, MESIState.INVALID)) {
-          throw new Error(
+          throw new CoherenceError(
             `commit: peer ${peerId} in ${peerState} cannot transition to INVALID`,
           );
         }
@@ -602,7 +603,7 @@ export class ArtifactRegistry {
       // caller with a mismatched version.
       const callerState = this.getAgentState(artifactId, agentId);
       if (callerState === MESIState.EXCLUSIVE || callerState === MESIState.MODIFIED) {
-        throw new Error(
+        throw new CoherenceError(
           `commit_cas_not_allowed agent=${agentId} artifact=${artifactId} ` +
             `state=${callerState} reason=occ_is_shared_or_invalid_only ` +
             `(use commit() for an EXCLUSIVE/MODIFIED holder)`,
@@ -650,7 +651,7 @@ export class ArtifactRegistry {
         if (peerId === agentId) continue;
         if (peerState === MESIState.INVALID) continue;
         if (!isValidTransition(peerState, MESIState.INVALID)) {
-          throw new Error(`commitCas: peer ${peerId} in ${peerState} cannot transition to INVALID`);
+          throw new CoherenceError(`commitCas: peer ${peerId} in ${peerState} cannot transition to INVALID`);
         }
         this.setAgentStateInternal(artifactId, peerId, peerState, MESIState.INVALID, nowTick, "commit_cas");
         invalidatedPeers.push(peerId);
@@ -664,7 +665,7 @@ export class ArtifactRegistry {
       const committerState = callerState ?? MESIState.INVALID;
       if (committerState !== MESIState.SHARED) {
         if (!isValidTransition(committerState, MESIState.SHARED)) {
-          throw new Error(
+          throw new CoherenceError(
             `commitCas: ${agentId} transition ${committerState}→SHARED not allowed`,
           );
         }
@@ -777,7 +778,7 @@ export class ArtifactRegistry {
         return;
       }
       if (!isValidTransition(priorState, MESIState.SHARED)) {
-        throw new Error(
+        throw new CoherenceError(
           `grantShared: ${agentId} transition ${priorState}→SHARED not allowed`,
         );
       }
@@ -874,7 +875,7 @@ export class ArtifactRegistry {
         return;
       }
       if (!isValidTransition(priorState, MESIState.INVALID)) {
-        throw new Error(
+        throw new CoherenceError(
           `invalidate: ${agentId} transition ${priorState}→INVALID not allowed`,
         );
       }

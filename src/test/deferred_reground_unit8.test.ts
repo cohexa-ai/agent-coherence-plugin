@@ -279,7 +279,7 @@ test("pending flag + untracked pre-read → delivered via envelope; next untrack
 
 test("no flag + untracked pre-read → byte-identical fast path with ZERO artifact-registry access (KTD6)", async () => {
   // The ArtifactRegistry is swapped for a proxy that explodes on ANY
-  // property access — a touched registry would 500 the request. Only the
+  // property access — a touched registry would answer the failure envelope. Only the
   // SessionRegistry's process-local peek is allowed on this path.
   const tmp = mkdtempSync(join(tmpdir(), "reground8-noreg-"));
   const realRegistry = new ArtifactRegistry(join(tmp, ".coherence", "state.db"));
@@ -632,7 +632,7 @@ test("pre-edit attach point: the UNTRACKED fast path delivers; next call byte-ma
 test("a rebuild failure AFTER the claim forfeits the delivery — the admit keeps its bytes (KD3)", async () => {
   // The claim is won, then `buildSessionStartContext` throws. R2 permits
   // at-most-once → zero, so the delivery is dropped rather than turning an
-  // otherwise-successful admit into a 500.
+  // otherwise-successful admit into a failure.
   const tmp = mkdtempSync(join(tmpdir(), "reground8-forfeit-"));
   mkdirSync(join(tmp, ".coherence"), { recursive: true });
   const realRegistry = new ArtifactRegistry(join(tmp, ".coherence", "state.db"));

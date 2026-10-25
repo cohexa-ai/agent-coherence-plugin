@@ -14,6 +14,7 @@
  *   on success=false release; `{ok: false, reason}` on protocol error.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { CoherenceError } from "../coherence_error.js";
 import {
   type HookDeps,
   writeJson,
@@ -87,7 +88,8 @@ export async function handlePostEdit(
     try {
       deps.registry.invalidate(artifactId, agentId, nowTick, "post_edit_failure");
     } catch (err) {
-      writeJson(res, 200, { ok: false, reason: (err as Error).message });
+      if (!(err instanceof CoherenceError)) throw err;
+      writeJson(res, 200, { ok: false, reason: err.message });
       return;
     }
     writeJson(res, 200, { ok: true, released: true });
@@ -98,7 +100,8 @@ export async function handlePostEdit(
   try {
     deps.registry.commit(artifactId, agentId, contentHash!, nowTick, null);
   } catch (err) {
-    writeJson(res, 200, { ok: false, reason: (err as Error).message });
+    if (!(err instanceof CoherenceError)) throw err;
+    writeJson(res, 200, { ok: false, reason: err.message });
     return;
   }
   writeJson(res, 200, { ok: true });
