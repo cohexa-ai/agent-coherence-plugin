@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/ensure-coordinator-dispatch"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/ensure-coordinator-dispatch\""
           }
         ]
       },

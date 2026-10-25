@@ -452,10 +452,36 @@ test("hooks.json: exactly two SessionStart entries — bootstrap shim first, hoo
   assert.equal(entries.length, 2);
   // Bootstrap shim stays first (it never reads stdin, so the pair is
   // parallel-safe); the compact re-grounding client is second.
-  assert.ok(entries[0]!.hooks[0]!.command.endsWith("/bin/ensure-coordinator-dispatch"));
+  assert.ok(entries[0]!.hooks[0]!.command.endsWith('/bin/ensure-coordinator-dispatch"'));
   const second = entries[1]!;
   assert.equal(second.matcher, undefined);
   assert.equal(second.hooks.length, 1);
   assert.equal(second.hooks[0]!.type, "command");
   assert.ok(second.hooks[0]!.command.endsWith('hook-client" session-start'));
+});
+
+test("hooks.json: every ${CLAUDE_PLUGIN_ROOT} path is double-quoted, so an install path with a space stays one word", () => {
+  const hooksJsonPath = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "hooks",
+    "hooks.json",
+  );
+  const parsed = JSON.parse(readFileSync(hooksJsonPath, "utf8")) as {
+    hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+  };
+  // Hook commands run through a shell. An unquoted placeholder splits at a
+  // space in the install path, the command is not found, and the clients'
+  // fail-open floor then leaves the plugin silently doing nothing.
+  const placeholder = "${CLAUDE_PLUGIN_ROOT}";
+  const commands = Object.entries(parsed.hooks).flatMap(([event, entries]) =>
+    entries.flatMap((entry) => entry.hooks.map((hook) => ({ event, command: hook.command }))),
+  );
+  const withPlaceholder = commands.filter(({ command }) => command.includes(placeholder));
+  assert.ok(withPlaceholder.length > 0, "no hooks.json command uses the placeholder; this check would pass vacuously");
+  const unquoted = withPlaceholder
+    .filter(({ command }) => command.split(placeholder).slice(0, -1).some((before) => !before.endsWith('"')))
+    .map(({ event, command }) => `${event}: ${command}`);
+  assert.deepEqual(unquoted, []);
 });
