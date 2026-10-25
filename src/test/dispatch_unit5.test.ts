@@ -5,35 +5,40 @@
  * The dispatcher itself is exercised with stubbed bootstrap scripts (we
  * assert WHICH bootstrap it selects, not the bootstrap's own behavior).
  */
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, cpSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { writeExecutable } from "./executable_fixture.js";
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
+// The stubs are written once for the whole file and each is run once as it
+// is written (`writeExecutable`), so no timed spawn below runs a file macOS
+// has not checked yet (#219). The tests only read them.
+const STUBS = mkdtempSync(join(tmpdir(), "dispatch5-stubs-"));
+after(() => rmSync(STUBS, { recursive: true, force: true }));
+
 /**
- * Build an isolated plugin-root copy whose ensure-coordinator{,-node} are
- * stubs that print which one ran. Returns the stub root.
+ * A plugin-root copy whose ensure-coordinator{,-node} are stubs that print
+ * which one ran.
  */
-function makeStubbedPluginRoot(): { root: string; cleanup: () => void } {
-  const root = mkdtempSync(join(tmpdir(), "dispatch5-"));
+const STUB_ROOT = ((): string => {
+  const root = join(STUBS, "plugin");
   mkdirSync(join(root, "bin"), { recursive: true });
   cpSync(join(PLUGIN_ROOT, "bin", "ensure-coordinator-dispatch"), join(root, "bin", "ensure-coordinator-dispatch"));
   for (const [name, marker] of [
     ["ensure-coordinator", "PYTHON-BOOTSTRAP"],
     ["ensure-coordinator-node", "NODE-BOOTSTRAP"],
   ] as const) {
-    const p = join(root, "bin", name);
-    writeFileSync(p, `#!/usr/bin/env bash\necho ${marker}\n`, "utf8");
-    chmodSync(p, 0o755);
+    writeExecutable(join(root, "bin", name), `#!/usr/bin/env bash\necho ${marker}\n`);
   }
   chmodSync(join(root, "bin", "ensure-coordinator-dispatch"), 0o755);
-  return { root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
-}
+  return root;
+})();
 
 function runDispatch(stubRoot: string, cwd: string, env: Record<string, string | undefined>) {
   return spawnSync("bash", [join(stubRoot, "bin", "ensure-coordinator-dispatch")], {
@@ -50,39 +55,38 @@ function runDispatch(stubRoot: string, cwd: string, env: Record<string, string |
  * of the Node actually running the suite. Returns a PATH that keeps
  * coreutils/git (/usr/bin:/bin) but resolves node/npm to the stubs.
  */
-function makeRuntimeStubPath(dir: string, nodeMajor: number): string {
-  const stubBin = join(dir, "stub-bin");
+function makeRuntimeStubPath(nodeMajor: number): string {
+  const stubBin = join(STUBS, `node-${nodeMajor}`);
   mkdirSync(stubBin, { recursive: true });
-  writeFileSync(join(stubBin, "node"), `#!/bin/sh\necho ${nodeMajor}\n`, "utf8");
-  writeFileSync(join(stubBin, "npm"), `#!/bin/sh\nexit 0\n`, "utf8");
-  chmodSync(join(stubBin, "node"), 0o755);
-  chmodSync(join(stubBin, "npm"), 0o755);
+  writeExecutable(join(stubBin, "node"), `#!/bin/sh\necho ${nodeMajor}\n`);
+  writeExecutable(join(stubBin, "npm"), `#!/bin/sh\nexit 0\n`);
   return `${stubBin}:/usr/bin:/bin`;
 }
 
+/** A Node with a better-sqlite3 prebuilt (24), and one without (23). */
+const NODE_24_PATH = makeRuntimeStubPath(24);
+const NODE_23_PATH = makeRuntimeStubPath(23);
+
 test("dispatcher: default on a FRESH workspace selects the Node bootstrap (SB-2 option x)", () => {
-  const { root, cleanup } = makeStubbedPluginRoot();
   const ws = mkdtempSync(join(tmpdir(), "dispatch5-ws-"));
   try {
     spawnSync("git", ["init", "-q"], { cwd: ws });
     // No .coherence/state.db → fresh install → the zero-Python default.
     // node stubbed to major 24 (a prebuilt ABI) so the runtime guard's
     // verdict does not depend on whichever Node runs this suite.
-    const r = spawnSync("/bin/bash", [join(root, "bin", "ensure-coordinator-dispatch")], {
+    const r = spawnSync("/bin/bash", [join(STUB_ROOT, "bin", "ensure-coordinator-dispatch")], {
       cwd: ws,
       encoding: "utf8",
-      env: { PATH: makeRuntimeStubPath(ws, 24), HOME: ws } as NodeJS.ProcessEnv,
+      env: { PATH: NODE_24_PATH, HOME: ws } as NodeJS.ProcessEnv,
       timeout: 10000,
     });
     assert.equal(r.stdout.trim(), "NODE-BOOTSTRAP");
   } finally {
-    cleanup();
     rmSync(ws, { recursive: true, force: true });
   }
 });
 
 test("dispatcher: GUARD (a) — an ESTABLISHED workspace (state.db present) stays on Python", () => {
-  const { root, cleanup } = makeStubbedPluginRoot();
   const ws = mkdtempSync(join(tmpdir(), "dispatch5-ws-"));
   try {
     spawnSync("git", ["init", "-q"], { cwd: ws });
@@ -92,16 +96,14 @@ test("dispatcher: GUARD (a) — an ESTABLISHED workspace (state.db present) stay
     // leave the workspace with NO coordinator — the exact silent degrade this
     // change removes. Existing installs must be untouched.
     writeFileSync(join(ws, ".coherence", "state.db"), "", "utf8");
-    const r = runDispatch(root, ws, {});
+    const r = runDispatch(STUB_ROOT, ws, {});
     assert.equal(r.stdout.trim(), "PYTHON-BOOTSTRAP");
   } finally {
-    cleanup();
     rmSync(ws, { recursive: true, force: true });
   }
 });
 
 test("dispatcher: GUARD (a) is default-only — an EXPLICIT node on an established workspace is honored", () => {
-  const { root, cleanup } = makeStubbedPluginRoot();
   const ws = mkdtempSync(join(tmpdir(), "dispatch5-ws-"));
   try {
     spawnSync("git", ["init", "-q"], { cwd: ws });
@@ -109,23 +111,21 @@ test("dispatcher: GUARD (a) is default-only — an EXPLICIT node on an establish
     writeFileSync(join(ws, ".coherence", "state.db"), "", "utf8");
     writeFileSync(join(ws, ".coherence", "coordinator_backend"), "node\n", "utf8");
     // Operator's explicit choice wins over the conservative default.
-    const r = runDispatch(root, ws, {});
+    const r = runDispatch(STUB_ROOT, ws, {});
     assert.equal(r.stdout.trim(), "NODE-BOOTSTRAP");
   } finally {
-    cleanup();
     rmSync(ws, { recursive: true, force: true });
   }
 });
 
 test("dispatcher: GUARD (b) — no node/npm on PATH falls back to Python instead of dead-ending", () => {
-  const { root, cleanup } = makeStubbedPluginRoot();
   const ws = mkdtempSync(join(tmpdir(), "dispatch5-ws-"));
   const emptyBin = mkdtempSync(join(tmpdir(), "dispatch5-nopath-"));
   try {
     spawnSync("git", ["init", "-q"], { cwd: ws });
     // PATH keeps coreutils/git but hides node+npm by pointing at a dir that
     // has neither; /usr/bin & /bin on macOS+CI carry git but not node.
-    const r = spawnSync("/bin/bash", [join(root, "bin", "ensure-coordinator-dispatch")], {
+    const r = spawnSync("/bin/bash", [join(STUB_ROOT, "bin", "ensure-coordinator-dispatch")], {
       cwd: ws,
       encoding: "utf8",
       env: { PATH: `${emptyBin}:/usr/bin:/bin`, HOME: ws } as NodeJS.ProcessEnv,
@@ -133,26 +133,23 @@ test("dispatcher: GUARD (b) — no node/npm on PATH falls back to Python instead
     });
     assert.equal(r.stdout.trim(), "PYTHON-BOOTSTRAP");
   } finally {
-    cleanup();
     rmSync(ws, { recursive: true, force: true });
     rmSync(emptyBin, { recursive: true, force: true });
   }
 });
 
 test("dispatcher: GUARD (b) — a Node major with no better-sqlite3 prebuilt (23) falls back to Python; explicit node is still honored", () => {
-  const { root, cleanup } = makeStubbedPluginRoot();
   const ws = mkdtempSync(join(tmpdir(), "dispatch5-ws-"));
   try {
     spawnSync("git", ["init", "-q"], { cwd: ws });
-    const path23 = makeRuntimeStubPath(ws, 23);
     // Fresh workspace + Node 23 (ABI 131 — better-sqlite3 12.10.0 dropped its
     // prebuilt): the zero-Python default cannot succeed (npm would fall back
     // to node-gyp, i.e. Python), so the guarded default takes the working
     // Python path and says why on stderr.
-    const fallback = spawnSync("/bin/bash", [join(root, "bin", "ensure-coordinator-dispatch")], {
+    const fallback = spawnSync("/bin/bash", [join(STUB_ROOT, "bin", "ensure-coordinator-dispatch")], {
       cwd: ws,
       encoding: "utf8",
-      env: { PATH: path23, HOME: ws } as NodeJS.ProcessEnv,
+      env: { PATH: NODE_23_PATH, HOME: ws } as NodeJS.ProcessEnv,
       timeout: 10000,
     });
     assert.equal(fallback.stdout.trim(), "PYTHON-BOOTSTRAP");
@@ -162,47 +159,42 @@ test("dispatcher: GUARD (b) — a Node major with no better-sqlite3 prebuilt (23
     // honored verbatim (the bootstrap's stage-0 preflight owns the loud error).
     mkdirSync(join(ws, ".coherence"), { recursive: true });
     writeFileSync(join(ws, ".coherence", "coordinator_backend"), "node\n", "utf8");
-    const explicit = spawnSync("/bin/bash", [join(root, "bin", "ensure-coordinator-dispatch")], {
+    const explicit = spawnSync("/bin/bash", [join(STUB_ROOT, "bin", "ensure-coordinator-dispatch")], {
       cwd: ws,
       encoding: "utf8",
-      env: { PATH: path23, HOME: ws } as NodeJS.ProcessEnv,
+      env: { PATH: NODE_23_PATH, HOME: ws } as NodeJS.ProcessEnv,
       timeout: 10000,
     });
     assert.equal(explicit.stdout.trim(), "NODE-BOOTSTRAP");
   } finally {
-    cleanup();
     rmSync(ws, { recursive: true, force: true });
   }
 });
 
 test("dispatcher: .coherence/coordinator_backend=node selects the Node bootstrap", () => {
-  const { root, cleanup } = makeStubbedPluginRoot();
   const ws = mkdtempSync(join(tmpdir(), "dispatch5-ws-"));
   try {
     spawnSync("git", ["init", "-q"], { cwd: ws });
     mkdirSync(join(ws, ".coherence"), { recursive: true });
     writeFileSync(join(ws, ".coherence", "coordinator_backend"), "node\n", "utf8");
-    const r = runDispatch(root, ws, {});
+    const r = runDispatch(STUB_ROOT, ws, {});
     assert.equal(r.stdout.trim(), "NODE-BOOTSTRAP");
   } finally {
-    cleanup();
     rmSync(ws, { recursive: true, force: true });
   }
 });
 
 test("dispatcher: env override beats the file; unknown values fall back to python", () => {
-  const { root, cleanup } = makeStubbedPluginRoot();
   const ws = mkdtempSync(join(tmpdir(), "dispatch5-ws-"));
   try {
     spawnSync("git", ["init", "-q"], { cwd: ws });
     mkdirSync(join(ws, ".coherence"), { recursive: true });
     writeFileSync(join(ws, ".coherence", "coordinator_backend"), "python\n", "utf8");
-    const env = runDispatch(root, ws, { COHERENCE_COORDINATOR_BACKEND: "node" });
+    const env = runDispatch(STUB_ROOT, ws, { COHERENCE_COORDINATOR_BACKEND: "node" });
     assert.equal(env.stdout.trim(), "NODE-BOOTSTRAP");
-    const unknown = runDispatch(root, ws, { COHERENCE_COORDINATOR_BACKEND: "cobol" });
+    const unknown = runDispatch(STUB_ROOT, ws, { COHERENCE_COORDINATOR_BACKEND: "cobol" });
     assert.equal(unknown.stdout.trim(), "PYTHON-BOOTSTRAP");
   } finally {
-    cleanup();
     rmSync(ws, { recursive: true, force: true });
   }
 });

@@ -30,6 +30,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { writeExecutable } from './executable_fixture.js';
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -556,8 +557,7 @@ function stubNpmScript(npmOutput: string, exitCode = 1): string {
 
 function runBootstrapWithFailingNpm(root: string, data: string, ws: string, npmOutput: string) {
   const stubBin = mkdtempSync(join(tmpdir(), 'provision-npmstub-'));
-  writeFileSync(join(stubBin, 'npm'), stubNpmScript(npmOutput));
-  chmodSync(join(stubBin, 'npm'), 0o755);
+  writeExecutable(join(stubBin, 'npm'), stubNpmScript(npmOutput));
   try {
     return spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
       cwd: ws,
@@ -598,8 +598,7 @@ test('a successful install is not reported as failed when the filter eats every 
     'npm http cache a@https://registry.npmjs.org/a 3ms (cache hit)',
     'npm http fetch GET 200 https://registry.npmjs.org/b 7ms',
   ].join('\n');
-  writeFileSync(join(stubBin, 'npm'), stubNpmScript(onlyFilteredLines, 0));
-  chmodSync(join(stubBin, 'npm'), 0o755);
+  writeExecutable(join(stubBin, 'npm'), stubNpmScript(onlyFilteredLines, 0));
   try {
     const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
       cwd: ws,
@@ -642,7 +641,7 @@ test('registry chatter is filtered from the display but kept for classification'
     { length: 40 },
     (_, i) => `npm http cache pkg${i}@https://registry.npmjs.org/pkg${i} 3ms (cache hit)`
   ).join('\n');
-  writeFileSync(
+  writeExecutable(
     join(stubBin, 'npm'),
     stubNpmScript(
       `${chatter}\n` +
@@ -651,7 +650,6 @@ test('registry chatter is filtered from the display but kept for classification'
         `npm error prebuild-install warn install No prebuilt binaries found (target=${process.versions.node} runtime=node arch=x64 libc= platform=linux)`
     )
   );
-  chmodSync(join(stubBin, 'npm'), 0o755);
   try {
     const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
       cwd: ws,
@@ -687,8 +685,7 @@ test('npm-failure hint says so when it could not capture the output at all', () 
   const root = makeStubRoot({});
   const { data, ws, cleanup } = makeDirs();
   const stubBin = mkdtempSync(join(tmpdir(), 'provision-npmstub-'));
-  writeFileSync(join(stubBin, 'npm'), `#!/usr/bin/env bash\necho "npm error boom"\nexit 1\n`);
-  chmodSync(join(stubBin, 'npm'), 0o755);
+  writeExecutable(join(stubBin, 'npm'), `#!/usr/bin/env bash\necho "npm error boom"\nexit 1\n`);
   try {
     const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
       cwd: ws,
@@ -883,8 +880,7 @@ test('STAGE 0: an unsupported Node major offers the Python backend only when the
     const root = makeStubRoot({});
     const { data, ws, cleanup } = makeDirs();
     const stubBin = mkdtempSync(join(tmpdir(), 'provision-nodestub-'));
-    writeFileSync(join(stubBin, 'node'), '#!/usr/bin/env bash\necho v23.11.0\n');
-    chmodSync(join(stubBin, 'node'), 0o755);
+    writeExecutable(join(stubBin, 'node'), '#!/usr/bin/env bash\necho v23.11.0\n');
     try {
       if (hadStore) {
         mkdirSync(join(ws, '.coherence'), { recursive: true });
