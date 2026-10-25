@@ -39,6 +39,26 @@ export function writeError(res: ServerResponse, status: number, message: string)
   writeJson(res, status, { error: message });
 }
 
+/** Python `HANDLER_FAILURE_REASON_PREFIX`; library clients match it as a prefix. */
+const HANDLER_FAILURE_REASON_PREFIX = "internal: ";
+
+/** `internal: <Type>`, Python's `type(exc).__name__` after the prefix; the message never reaches a body. */
+export function internalFailureLabel(err: unknown): string {
+  const name = err instanceof Error ? err.constructor.name : "Unknown";
+  return `${HANDLER_FAILURE_REASON_PREFIX}${name}`;
+}
+
+/**
+ * Python `_answer_handler_error`: a hook route whose work raised answers HTTP
+ * 200 `{ok: false, reason: "internal: <Type>"}` (#214). Only the type reaches
+ * the body; the message goes to the coordinator's log.
+ */
+export function writeHandlerFailure(res: ServerResponse, err: unknown): void {
+  process.stderr.write(`agent-coherence: hook handler failed: ${String(err)}\n`);
+  if (res.headersSent) return;
+  writeJson(res, 200, { ok: false, reason: internalFailureLabel(err) });
+}
+
 /**
  * Coordinator-side tick (epoch seconds). Centralized for parity with Python
  * coordinator's `time.time()` / 1.0s tick semantics, and so hook handlers

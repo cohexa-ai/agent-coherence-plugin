@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CoherenceError } from "../coherence_error.js";
 import { ArtifactRegistry } from "../registry.js";
 import { MESIState } from "../states.js";
 
@@ -117,12 +118,30 @@ test("commitCas rejects an EXCLUSIVE caller (D4: use commit()) — throws, NO mu
   try {
     const id = registry.resolveOrRegisterArtifact("plan.md", HASH_1);
     registry.acquireExclusive(id, AGENT_A, 60);
+    // A CoherenceError, so the hook answers its raw reason, not the failure envelope (#214).
     assert.throws(
       () => registry.commitCas(id, AGENT_A, 1, HASH_2, 100),
-      /commit_cas_not_allowed.*occ_is_shared_or_invalid_only/,
+      (err: unknown) =>
+        err instanceof CoherenceError && /commit_cas_not_allowed.*occ_is_shared_or_invalid_only/.test(err.message),
     );
     assert.equal(registry.getArtifactById(id)!.version, 1);
     assert.equal(registry.getAgentState(id, AGENT_A), MESIState.EXCLUSIVE);
+  } finally {
+    cleanup();
+  }
+});
+
+test("commit by a holder a peer preempted throws a CoherenceError, NO mutation (#214)", () => {
+  const { registry, cleanup } = makeRegistry();
+  try {
+    const id = registry.resolveOrRegisterArtifact("plan.md", HASH_1);
+    registry.acquireExclusive(id, AGENT_A, 60);
+    registry.acquireExclusive(id, AGENT_B, 61);
+    assert.throws(
+      () => registry.commit(id, AGENT_A, HASH_2, 100, null),
+      (err: unknown) => err instanceof CoherenceError && /^commit_not_allowed: agent=/.test(err.message),
+    );
+    assert.equal(registry.getArtifactById(id)!.version, 1);
   } finally {
     cleanup();
   }
@@ -146,10 +165,14 @@ test("commitCas admits an INVALID caller (parity: Python D4 allows S and I)", ()
   }
 });
 
-test("commitCas missing artifact → throws", () => {
+test("commitCas missing artifact → throws, and not as a refusal", () => {
   const { registry, cleanup } = makeRegistry();
   try {
-    assert.throws(() => registry.commitCas("f".repeat(32), AGENT_A, 1, HASH_2, 100), /not registered/);
+    // Python raises KeyError here, which answers the failure envelope (#214).
+    assert.throws(
+      () => registry.commitCas("f".repeat(32), AGENT_A, 1, HASH_2, 100),
+      (err: unknown) => err instanceof Error && !(err instanceof CoherenceError) && /not registered/.test(err.message),
+    );
   } finally {
     cleanup();
   }

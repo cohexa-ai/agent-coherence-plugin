@@ -18,6 +18,7 @@
  * unreachable on Node (see registry.commitCas docs).
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { CoherenceError } from "../coherence_error.js";
 import {
   type HookDeps,
   writeJson,
@@ -86,9 +87,10 @@ export async function handlePostEditCas(
       nowTickFn(),
     );
   } catch (err) {
-    // D4 M/E-caller rejection (and any registry error) → Python's
-    // CoherenceError wire shape: {ok:false, reason: str(exc)}.
-    writeJson(res, 200, { ok: false, reason: (err as Error).message });
+    // D4 M/E-caller rejection → Python's CoherenceError wire shape:
+    // {ok:false, reason: str(exc)}.
+    if (!(err instanceof CoherenceError)) throw err;
+    writeJson(res, 200, { ok: false, reason: err.message });
     return;
   }
 
