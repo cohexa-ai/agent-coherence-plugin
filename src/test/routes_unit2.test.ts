@@ -6,12 +6,12 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { ArtifactRegistry } from "../registry.js";
-import { PolicyRef } from "../policy.js";
+import { DEFAULT_TRACKED_PATTERNS, PolicyRef } from "../policy.js";
 import { SessionRegistry } from "../sessions.js";
 import { createServer } from "../server.js";
 
@@ -21,8 +21,12 @@ const SID_B = "55555555-5555-5555-8555-555555555555";
 const HASH_1 = "1".repeat(64);
 const HASH_2 = "2".repeat(64);
 
-async function makeServer() {
+async function makeServer(policyFiles: Record<string, string> = {}) {
   const tmp = mkdtempSync(join(tmpdir(), "unit2-test-"));
+  mkdirSync(join(tmp, ".coherence"), { recursive: true });
+  for (const [name, text] of Object.entries(policyFiles)) {
+    writeFileSync(join(tmp, ".coherence", name), text, "utf8");
+  }
   const registry = new ArtifactRegistry(join(tmp, ".coherence", "state.db"));
   const policy = PolicyRef.load(tmp);
   const sessions = new SessionRegistry();
@@ -48,6 +52,12 @@ async function makeServer() {
     });
     return { status: res.status, body: (await res.json()) as Record<string, unknown> };
   };
+  const get = async (path: string) => {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      headers: { Authorization: `Bearer ${SECRET}`, Host: "127.0.0.1" },
+    });
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
   const cleanup = () =>
     new Promise<void>((r) => {
       server.close(() => {
@@ -56,7 +66,7 @@ async function makeServer() {
         r();
       });
     });
-  return { registry, sessions, post, cleanup, root: tmp };
+  return { registry, sessions, post, get, cleanup, root: tmp };
 }
 
 // ---------------------------------------------------------------- pre-bash
@@ -282,6 +292,125 @@ test("policy/untrack: response key is `removed`; ignore wins over tracked", asyn
   }
 });
 
+// ------------------------------------------------- strict paths stay enforced
+// Cohexa-ai/agent-coherence#261: untracking a strict path put it on the
+// untracked fast path, where a CAS commit is accepted at any expected version
+// (a silent lost update). The untrack is refused instead, writing nothing.
+
+const STRICT_DATA = { "tracked.yaml": '- "data/**"\n', "strict_mode.yaml": '- "data/**"\n' };
+
+test("policy/untrack: an entry covering a strict path is refused with 409 untrack_strict_path and nothing is written", async () => {
+  const { post, cleanup, root } = await makeServer(STRICT_DATA);
+  try {
+    const r = await post("/policy/untrack", { paths: ["data/**", "notes.md"] });
+    assert.equal(r.status, 409);
+    assert.equal(typeof r.body.error, "string");
+    assert.deepEqual(
+      { ...r.body, error: "<prose>" },
+      {
+        ok: false,
+        error: "<prose>",
+        reason: "untrack_strict_path",
+        refused: [{ path: "data/**", strict_patterns: ["data/**"] }],
+        rejected: [],
+      },
+    );
+    // The whole request writes nothing, the non-strict notes.md included.
+    assert.equal(existsSync(join(root, ".coherence", "ignored.yaml")), false);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("policy/untrack: after a refused untrack the strict path is still enforced", async () => {
+  const { registry, post, cleanup } = await makeServer(STRICT_DATA);
+  try {
+    registry.resolveOrRegisterArtifact("data/a.json", HASH_1);
+    assert.equal((await post("/policy/untrack", { paths: ["data/a.json"] })).status, 409);
+    // Still tracked: a CAS at a version the coordinator never had conflicts,
+    // where the untracked fast path would answer {ok: true} at any version.
+    const cas = await post("/hooks/post-edit-cas", {
+      session_id: SID_A,
+      path: "data/a.json",
+      content_hash: HASH_2,
+      expected_version: 7,
+    });
+    assert.equal(cas.body.ok, false);
+    assert.equal(typeof cas.body.reason, "string");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("policy/untrack: a './'-led or dotted spelling of a strict path is refused like the plain one", async () => {
+  const { post, cleanup } = await makeServer({
+    "tracked.yaml": '- ".github/**"\n',
+    "strict_mode.yaml": '- ".github/*.yml"\n',
+  });
+  try {
+    for (const entry of ["./.github/ci.yml", "./.github/**", ".github/**", ".github/ci.yml"]) {
+      const r = await post("/policy/untrack", { paths: [entry] });
+      assert.equal(r.status, 409, entry);
+      assert.deepEqual(r.body.refused, [{ path: entry, strict_patterns: [".github/*.yml"] }], entry);
+    }
+    // A dotfile no strict pattern holds is untracked as before.
+    const env = await post("/policy/untrack", { paths: ["./.env"] });
+    assert.equal(env.status, 200);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("policy/track is never refused for a strict path; only the untrack of it is", async () => {
+  const { post, cleanup } = await makeServer(STRICT_DATA);
+  try {
+    const tracked = await post("/policy/track", { paths: ["data/a.json"] });
+    assert.equal(tracked.status, 200);
+    assert.deepEqual(tracked.body, { ok: true, added: ["data/a.json"], rejected: [] });
+    const untracked = await post("/policy/untrack", { paths: ["data/a.json"] });
+    assert.equal(untracked.status, 409);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("policy/untrack: a strict entry after a plain one is refused too, and nothing is written", async () => {
+  const { post, cleanup, root } = await makeServer(STRICT_DATA);
+  try {
+    const r = await post("/policy/untrack", { paths: ["notes.md", "data/a.json"] });
+    assert.equal(r.status, 409);
+    assert.deepEqual(r.body.refused, [{ path: "data/a.json", strict_patterns: ["data/**"] }]);
+    assert.equal(existsSync(join(root, ".coherence", "ignored.yaml")), false);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("policy/untrack: a refusal reports the request's invalid entries as rejected", async () => {
+  const { post, cleanup, root } = await makeServer(STRICT_DATA);
+  try {
+    const r = await post("/policy/untrack", { paths: ["../escape", "data/a.json"] });
+    assert.equal(r.status, 409);
+    assert.deepEqual(r.body.rejected, [{ path: "../escape", reason: "path contains '..' traversal" }]);
+    assert.deepEqual(r.body.refused, [{ path: "data/a.json", strict_patterns: ["data/**"] }]);
+    assert.equal(existsSync(join(root, ".coherence", "ignored.yaml")), false);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("policy/untrack: an entry that covers no strict path is untracked as before, beside live strict patterns", async () => {
+  const { post, cleanup } = await makeServer(STRICT_DATA);
+  try {
+    // notes/** reaches the default **/plan.md, which no strict pattern holds.
+    const r = await post("/policy/untrack", { paths: ["notes/**", "data.txt"] });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, { ok: true, removed: ["notes/**", "data.txt"], rejected: [] });
+  } finally {
+    await cleanup();
+  }
+});
+
 test("policy/untrack: a policy file that loads as no entries is refused with 400 and left as it was", async () => {
   // What an earlier unquoted write left behind. An append cannot make it load,
   // so answering success would report an entry that never takes effect.
@@ -321,6 +450,26 @@ test("policy/untrack and /track: a '*'-led glob keeps every earlier entry in for
     assert.deepEqual(r.body, { ok: true, removed: ["*.log"], rejected: [] });
     // Still ignored: the earlier untrack of notes.md survives the '*' entry.
     assert.deepEqual((await casOnNotes()).body, { ok: true });
+  } finally {
+    await cleanup();
+  }
+});
+
+// ---------------------------------------------------------------- /status
+
+test("/status: a policy file that loads as no entries counts as rejected (#192)", async () => {
+  const { get, cleanup } = await makeServer({ "tracked.yaml": "- data/**\n- *.md\n" });
+  try {
+    const r = await get("/status");
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body.policy_summary, {
+      coordinator_root: ".",
+      default_pattern_count: DEFAULT_TRACKED_PATTERNS.length,
+      user_added_pattern_count: 0,
+      ignored_pattern_count: 0,
+      strict_mode_pattern_count: 0,
+      rejected_pattern_count: 1,
+    });
   } finally {
     await cleanup();
   }

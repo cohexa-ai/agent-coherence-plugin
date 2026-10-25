@@ -17,6 +17,7 @@
  * the victim will see on their next hook.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { CoherenceError } from "../coherence_error.js";
 import { MESIState } from "../states.js";
 import {
   buildCollisionResponse,
@@ -139,9 +140,10 @@ export async function handlePreEdit(
   try {
     deps.registry.acquireExclusive(artifactId, agentId, nowTick);
   } catch (err) {
+    if (!(err instanceof CoherenceError)) throw err;
     writeJson(res, 200, {
       ok: false,
-      reason: (err as Error).message,
+      reason: err.message,
     });
     return;
   }

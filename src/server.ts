@@ -11,7 +11,9 @@
  * - Error envelope: `{"error": "<lowercase phrase>"}` — single key, no trailing punctuation
  * - HTTP status mapping: bad Host → 403; missing Bearer → 401; oversized body → 413;
  *   coordinator mid-shutdown → 503; unknown route → 404; unhandled → 500
- *   with `{"error": "internal: <ErrorName>"}` (class name leaks deliberately)
+ *   with `{"error": "internal: <ErrorName>"}` (class name leaks deliberately),
+ *   except a hook route, whose unhandled error answers 200 `{"ok": false,
+ *   "reason": "internal: <ErrorName>"}`, Python's failure envelope (#214)
  * - Field naming: snake_case for all coordinator-owned JSON keys; camelCase
  *   ONLY at the Claude Code hookSpecificOutput boundary (none of those yet
  *   in this commit)
@@ -23,7 +25,7 @@ import { verifyBearer, verifyHost } from "./auth.js";
 import type { ArtifactRegistry } from "./registry.js";
 import type { PolicyRef, PolicySummary } from "./policy.js";
 import type { SessionRegistry } from "./sessions.js";
-import { writeJson, writeError } from "./hooks/_common.js";
+import { writeJson, writeError, writeHandlerFailure, internalFailureLabel } from "./hooks/_common.js";
 import { preReadRoute } from "./hooks/pre_read.js";
 import { preEditRoute } from "./hooks/pre_edit.js";
 import { postEditRoute } from "./hooks/post_edit.js";
@@ -285,16 +287,16 @@ function handleStatus(req: IncomingMessage, res: ServerResponse, options: Server
 
 export function createServer(options: ServerOptions): Server {
   const server = createHttpServer((req, res) => {
-    // Top-level wrapper handles sync exceptions; async route handlers chain
-    // their own catch and forward to the same 500 envelope.
+    // Top-level wrapper handles sync exceptions; the policy routes chain
+    // their own catch to the same 500, as on the Python coordinator.
     const handle500 = (err: unknown): void => {
-      const name = err instanceof Error ? err.constructor.name : "Unknown";
       try {
-        writeError(res, 500, `internal: ${name}`);
+        writeError(res, 500, internalFailureLabel(err));
       } catch {
         // Response already started; nothing left to do.
       }
     };
+    const handleHookFailure = (err: unknown): void => writeHandlerFailure(res, err);
 
     try {
       if (!checkAuth(req, res, options.secret)) {
@@ -316,37 +318,37 @@ export function createServer(options: ServerOptions): Server {
         sessions: options.sessions,
       };
       if (path === "/hooks/pre-read") {
-        preReadRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handle500);
+        preReadRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handleHookFailure);
         return;
       }
       if (path === "/hooks/pre-edit") {
-        preEditRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handle500);
+        preEditRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handleHookFailure);
         return;
       }
       if (path === "/hooks/post-edit") {
-        postEditRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handle500);
+        postEditRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handleHookFailure);
         return;
       }
       if (path === "/hooks/session-stop") {
-        sessionStopRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handle500);
+        sessionStopRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handleHookFailure);
         return;
       }
       // SB-10 U6 — post-compaction re-grounding (Python coordinator parity).
       if (path === "/hooks/session-start") {
-        sessionStartRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handle500);
+        sessionStartRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handleHookFailure);
         return;
       }
       // Zero-Python Unit 2 routes (Python coordinator parity).
       if (path === "/hooks/pre-bash") {
-        preBashRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handle500);
+        preBashRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handleHookFailure);
         return;
       }
       if (path === "/hooks/pre-grep") {
-        preGrepRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handle500);
+        preGrepRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handleHookFailure);
         return;
       }
       if (path === "/hooks/post-edit-cas") {
-        postEditCasRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handle500);
+        postEditCasRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handleHookFailure);
         return;
       }
       if (path === "/policy/track") {

@@ -270,13 +270,20 @@ test("KTD-U: emitAllow refuses to convert a terminal denial class", () => {
 
 // -------------------------------------------------------- gate truth table
 
-async function makeStrictServer(strictPatterns: string[]) {
+async function makeStrictServer(strictPatterns: string[], ignoredPatterns: string[] = []) {
   const tmp = mkdtempSync(join(tmpdir(), "strict6-test-"));
   mkdirSync(join(tmp, ".coherence"), { recursive: true });
   if (strictPatterns.length > 0) {
     writeFileSync(
       join(tmp, ".coherence", "strict_mode.yaml"),
       strictPatterns.map((p) => `- ${p}`).join("\n") + "\n",
+      "utf8",
+    );
+  }
+  if (ignoredPatterns.length > 0) {
+    writeFileSync(
+      join(tmp, ".coherence", "ignored.yaml"),
+      ignoredPatterns.map((p) => `- ${JSON.stringify(p)}`).join("\n") + "\n",
       "utf8",
     );
   }
@@ -420,6 +427,28 @@ test("pre-edit strict gate is INVALID-only: first-time editor acquires; preempte
     await cleanup();
   }
 });
+
+for (const ignored of ["CLAUDE.md", "**"]) {
+  test(`strict wins over ignore: a strict path under an ignored ${ignored} is still denied when stale`, async () => {
+    // Cohexa-ai/agent-coherence#261: an ignore entry, however broad, put a
+    // strict path on the untracked fast path, where every hook admits.
+    const { registry, sessions, post, cleanup } = await makeStrictServer(["CLAUDE.md"], [ignored]);
+    try {
+      const id = registry.resolveOrRegisterArtifact("CLAUDE.md", HASH_1);
+      assert.equal((await post("/hooks/pre-edit", { session_id: SID_A, path: "CLAUDE.md" })).ok, true);
+      // Tracked, so the pre-edit took a write claim: the fast path takes none.
+      assert.equal(registry.getAgentState(id, sessionToAgentId(SID_A)), MESIState.EXCLUSIVE);
+      assert.equal((await post("/hooks/pre-edit", { session_id: SID_B, path: "CLAUDE.md" })).ok, true);
+      registry.commit(id, sessions.registerSession(SID_B), HASH_2, 30);
+
+      const denied = await post("/hooks/pre-edit", { session_id: SID_A, path: "CLAUDE.md" });
+      assert.equal(denied.ok, false);
+      assert.equal(decision(denied), "deny");
+    } finally {
+      await cleanup();
+    }
+  });
+}
 
 test("pre-bash strict short-circuit: strict stale path → deny with stale_paths", async () => {
   const { registry, sessions, post, cleanup } = await makeStrictServer(["CLAUDE.md"]);

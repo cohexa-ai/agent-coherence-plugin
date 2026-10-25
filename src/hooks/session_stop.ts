@@ -13,6 +13,7 @@
  *   repo-relative paths whose grants were released.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { CoherenceError } from "../coherence_error.js";
 import { MESIState } from "../states.js";
 import {
   type HookDeps,
@@ -82,10 +83,11 @@ export async function handleSessionStop(
       const art = deps.registry.getArtifactById(artifactId);
       if (art !== null) releasedPaths.push(art.name);
     } catch (err) {
-      // Failed-release on one artifact does NOT abort the loop — best-effort
+      // A refused release on one artifact does NOT abort the loop — best-effort
       // release of remaining held grants matters more than reporting one
-      // failure. Errors surface as warning in coordinator log; future v0.2
-      // strict accounting can promote this to per-artifact failure reporting.
+      // refusal. A store fault does: it answers the failure envelope rather
+      // than a clean release while the grant is still held (#214).
+      if (!(err instanceof CoherenceError)) throw err;
       process.stderr.write(
         `agent-coherence: session_stop invalidate failed for artifact=${artifactId}: ${String(err)}\n`,
       );
