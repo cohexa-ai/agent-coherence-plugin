@@ -8,7 +8,7 @@
  * Error envelope: `{error: "<lowercase phrase>"}` per KTD-B.3 C1.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { ArtifactRegistry } from "../registry.js";
+import type { Artifact, ArtifactRegistry } from "../registry.js";
 import type { PolicyRef } from "../policy.js";
 import type { SessionRegistry } from "../sessions.js";
 import { isValidSubagentId } from "../agent_id.js";
@@ -37,6 +37,29 @@ export function writeJson(res: ServerResponse, status: number, body: unknown): v
 
 export function writeError(res: ServerResponse, status: number, message: string): void {
   writeJson(res, status, { error: message });
+}
+
+/** Synthetic launch-gate sentinel hash — carries no content claim (Python `_F_SENTINEL_CONTENT_HASH`). */
+const F_SENTINEL_CONTENT_HASH = "f".repeat(64);
+/** Survivor #6 R2: self-commit → disk-flush lag window (Python `_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC`). */
+const SHARED_FOREIGN_DENY_LAG_WINDOW_SEC = 5.0;
+
+/** Python `coordinator_holds_content_claim`: an empty or sentinel recorded hash claims no bytes. */
+export function holdsContentClaim(recordedHash: string): boolean {
+  return recordedHash !== "" && recordedHash !== F_SENTINEL_CONTENT_HASH;
+}
+
+/**
+ * Python `_is_recent_self_commit_lag`: the caller committed this artifact in
+ * the last few seconds, so bytes on disk that differ may still be its own
+ * write landing. P1: compare the raw writer identity against the caller's
+ * composite agentId — NOT the session id the writer's agent id was derived
+ * from. SB-25 made that (now removed, R7) reverse lookup return a subagent's
+ * bare attribution id, so a session-string comparison never matched a
+ * subagent's own commit and its immediate self-re-read was wrongly denied.
+ */
+export function isRecentSelfCommitLag(artifact: Artifact, agentId: string, now: number): boolean {
+  return artifact.last_writer_id === agentId && now - artifact.updated_at <= SHARED_FOREIGN_DENY_LAG_WINDOW_SEC;
 }
 
 /** Python `HANDLER_FAILURE_REASON_PREFIX`; library clients match it as a prefix. */
