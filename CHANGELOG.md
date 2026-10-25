@@ -46,6 +46,8 @@ The canonical release-notes surface is [GitHub Releases](https://github.com/Cohe
 
 ### Internal
 
+- **The dispatcher and bin-shim tests no longer fail when the whole suite runs on a busy Mac ([#219](https://github.com/Cohexa-ai/agent-coherence-plugin/issues/219)).** Each test wrote stub executables (bootstraps, a fake `node`, a fake console script) and ran them for the first time inside a 10 s or 5 s spawn timeout. macOS checks an executable the first time it runs, and while the suite runs in parallel those checks queue, so a first run took over 3 s and a test failed at its timeout; Linux, and so CI, does no such check. Every test that writes an executable and runs it directly now writes it through one helper that runs it once, untimed, as it is written; the dispatcher tests write their stubs once per file; and the bin-shim tests run each of this repo's shims once before timing it, since a fresh checkout or worktree writes those files anew too. Under the same load each dispatcher test takes about 0.2 s instead of 3 to 8 s. The spawn timeouts are unchanged.
+
 - **The Node coordinator parses a policy glob in one place ([#213](https://github.com/Cohexa-ai/agent-coherence-plugin/issues/213)).** The regex a pattern with at most one `*` or `**` run is matched by is now built from the same tokens the linear matcher and the strict-coverage search read, as the Python coordinator builds its `**` regex, so a change to the glob syntax is made once. No pattern matches differently: over 1.7 million patterns, the new regex is byte-identical to the old one.
 
 ## [0.6.0] — 2026-10-13
