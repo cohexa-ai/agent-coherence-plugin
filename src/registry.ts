@@ -5,10 +5,12 @@
  * v0.1.1 Unit 1 (this commit) lands ONLY the constructor + close():
  * - Open Database at <workspace>/.coherence/state.db
  * - Set PRAGMA journal_mode = WAL (concurrent reader safety)
- * - Set PRAGMA busy_timeout = 1500ms per KTD-K REVISED ordering rule
- *   (busy_timeout is per-lock-acquisition, NOT per-transaction; multi-statement
- *   transactions accumulate budget; 2× lock-acquisitions × 1500ms = 3s ceiling
- *   stays under the 4s handler watchdog with 1s safety margin)
+ * - Set PRAGMA busy_timeout = 1500ms
+ *   (busy_timeout is per-lock-acquisition, NOT per-transaction: a request
+ *   that opens several write transactions can wait 1500ms at each. A pre-edit
+ *   on a path never seen before opens up to three: seeding the artifact, the
+ *   grant, and the notice drain. No handler watchdog bounds the total, and
+ *   each wait blocks the event loop.)
  * - Run pending migrations (empty list in Unit 1; Unit 2 fills)
  * - Provide close() for graceful shutdown
  *

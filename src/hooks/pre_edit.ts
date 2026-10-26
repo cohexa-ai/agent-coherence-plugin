@@ -259,11 +259,12 @@ export async function handlePreEdit(
   if (holder !== null) {
     const collisionResp = buildCollisionResponse(
       holderSessionId ?? "<unknown>",
-      // granted_at_tick is seconds since some epoch; for the warning prose
-      // use Unix-ts equivalent. Python uses the artifact's updated_at field
-      // (RIGHTness: that's when the grant was stamped); we approximate via
-      // holder.grantedAtTick which is monotonic seconds. For warn-only this
-      // is acceptable; v0.2 may want stricter semantics.
+      // granted_at_tick is wall-clock Unix seconds (Date.now() floored at
+      // the grant), the scale nowUnix() uses, so the warning prose can show
+      // it as is. Python uses the artifact's updated_at field (RIGHTness:
+      // that's when the grant was stamped); we approximate via
+      // holder.grantedAtTick, the start of the holder's continuous hold. For
+      // warn-only this is acceptable; v0.2 may want stricter semantics.
       holderAcquiredAt ?? nowUnix(),
       path,
     );
