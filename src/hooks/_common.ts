@@ -13,6 +13,7 @@ import type { PolicyRef } from "../policy.js";
 import type { SessionRegistry } from "../sessions.js";
 import { isValidSubagentId } from "../agent_id.js";
 import {
+  isReclaimNotice,
   preemptionNoticeText,
   shortSessionId,
   PREEMPTION_NOTICE_OVERFLOW_LINE_TEMPLATE,
@@ -284,11 +285,13 @@ export function drainNoticeText(deps: HookDeps, agentId: string): string | null 
     // survived a restart used to render "<unknown>".
     return {
       artifactPath: art?.name ?? "<unknown-artifact>",
+      preempterAgentId: n.preempterAgentId,
       preempterAgentShort: shortSessionId(n.preempterAgentId),
       preemptedAtUnixTs: n.preemptedAtUnixTs,
     };
   });
-  let text = preemptionNoticeText(rendered, all.length);
+  const queueHasReclaim = all.some((n) => isReclaimNotice(n.preempterAgentId));
+  let text = preemptionNoticeText(rendered, all.length, queueHasReclaim);
   const overflow = all.length - verbatim.length;
   if (overflow > 0) {
     text += "\n" + PREEMPTION_NOTICE_OVERFLOW_LINE_TEMPLATE.replace("{count}", String(overflow));

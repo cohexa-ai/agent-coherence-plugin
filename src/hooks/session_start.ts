@@ -33,6 +33,7 @@ import { sessionToAgentId } from "../agent_id.js";
 import {
   emitSessionStart,
   fmt,
+  isReclaimNotice,
   preemptionNoticeText,
   shortSessionId,
   SESSION_START_HEADER,
@@ -223,8 +224,8 @@ export function buildSessionStartContext(
         return {
           artifactPath: artifactNameById.get(n.artifactId) ?? "<unknown-artifact>",
           // Raw preempter id, not the resolved session: the prose builder
-          // matches it against the sweep-reclamation sentinel so a coordinator
-          // sweep is named as such rather than rendered as a peer session.
+          // matches it against the reclamation preempter so a reclaim is
+          // named as such rather than rendered as a peer session.
           preempterAgentId: n.preempterAgentId,
           // R7: the agent id, not a session id recovered from it.
           preempterAgentShort: shortSessionId(n.preempterAgentId),
@@ -232,6 +233,7 @@ export function buildSessionStartContext(
         };
       }),
       notices.length,
+      notices.some((n) => isReclaimNotice(n.preempterAgentId)),
     );
     const noticeOverflow = notices.length - verbatimNotices.length;
     if (noticeOverflow > 0) {
