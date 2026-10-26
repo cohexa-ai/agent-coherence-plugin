@@ -545,7 +545,7 @@ export function preemptionNoticeText(
   const lines = notices.map((n) => {
     const at = pythonIsoUtc(n.preemptedAtUnixTs);
     return isReclaimNotice(n.preempterAgentId)
-      ? `  • ${n.artifactPath} reclaimed at ${at}: held ${MAX_HOLD_SEC / 60} minutes or more while another agent asked for it`
+      ? `  • ${n.artifactPath} reclaimed at ${at}: held ${MAX_HOLD_SEC / 60} minutes or more while another agent asked for it; read the file again before editing it`
       : `  • ${n.artifactPath} preempted by agent ${n.preempterAgentShort} at ${at}`;
   });
   return `${preemptionIntro(totalCount, queueHasReclaim)}\n${lines.join("\n")}`;

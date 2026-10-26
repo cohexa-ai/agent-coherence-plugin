@@ -50,7 +50,8 @@ test("a reclaim reads as a reclaim after the hold limit, under a neutral intro",
   assert.ok(bullet!.startsWith("  • plan.md "), bullet);
   assert.ok(bullet!.includes(`${MAX_HOLD_SEC / 60} minutes or more`), bullet);
   assert.ok(bullet!.includes(ISO), bullet);
-  assert.doesNotMatch(bullet!, /preempted by agent/);
+  assert.ok(bullet!.endsWith("; read the file again before editing it"), bullet);
+  assert.doesNotMatch(bullet!, /preempted by agent|restore|retry/);
 });
 
 test("a mixed queue gets one neutral intro and one bullet of each kind", () => {

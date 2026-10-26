@@ -357,6 +357,30 @@ test("a grant held 30 minutes is reclaimed: plain admit, reclaim record, one log
   }
 });
 
+test("session start sets the neutral intro when the queue's only reclaim sits past the verbatim cap", async () => {
+  const s = await makeServer();
+  try {
+    const agentA = sessionToAgentId(SID_A);
+    const T = 1_000_000;
+    const reclaimedId = s.registry.resolveOrRegisterArtifact("reclaimed.md", HASH_1);
+    s.registry.acquireExclusive(reclaimedId, agentA, T);
+    s.registry.acquireExclusiveIfUnheld(reclaimedId, sessionToAgentId(SID_B), T + 1800);
+    // Three newer ordinary preemptions fill the three verbatim slots.
+    for (const [i, path] of ["a.md", "b.md", "c.md"].entries()) {
+      const id = s.registry.resolveOrRegisterArtifact(path, HASH_1);
+      s.registry.acquireExclusive(id, agentA, T + 1801);
+      s.registry.acquireExclusive(id, sessionToAgentId(SID_C), T + 1802 + i);
+    }
+    const r = await s.request("/hooks/session-start", { session_id: SID_A });
+    const text = String((r.body.hookSpecificOutput as Record<string, unknown>).additionalContext);
+    assert.ok(text.includes("⚠ 4 of your EXCLUSIVE grants were revoked:"), text);
+    assert.doesNotMatch(text, /silently/);
+    assert.equal(text.split("preempted by agent").length - 1, 3);
+  } finally {
+    await s.cleanup();
+  }
+});
+
 test("after reclaiming an EXCLUSIVE holder the admit skips the disk check; after a MODIFIED one it reports disk_differs", async () => {
   for (const holderCommitted of [false, true]) {
     const s = await makeServer();
