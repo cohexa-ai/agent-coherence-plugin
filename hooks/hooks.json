@@ -83,7 +83,7 @@
     ],
     "SubagentStop": [
       {
-        "_comment": "SB-25 Unit 4: release the SUBAGENT identity's uncommitted grants when it stops. The subcommand requires the payload's agent_id (validated against the subagent-id charset) - absent OR malformed means no-op {}, never a parent release. Backstop: the Python coordinator's heartbeat/idle sweep reclaims a grant if SubagentStop is missed; the Node coordinator has no sweep yet, so on the Node backend a missed SubagentStop holds the grant until coordinator restart (tracked follow-up).",
+        "_comment": "Release the SUBAGENT identity's write grants (EXCLUSIVE or MODIFIED) when it stops. The subcommand requires the payload's agent_id (validated against the subagent-id charset) - absent OR malformed means no-op {}, never a parent release. Backstop: the Python coordinator's heartbeat/idle sweep reclaims a grant if SubagentStop is missed. The Node coordinator has no sweep: a missed SubagentStop leaves the subagent's grant held until a session-stop or a failed post-edit for that identity releases it, an ordinary pre-edit displaces it, or an opted-in pre-edit (if_unheld: true) 1800 s or more after its grant reclaims it. A parent's Stop does not release it.",
         "hooks": [
           {
             "type": "command",

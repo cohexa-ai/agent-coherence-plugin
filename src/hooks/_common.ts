@@ -13,6 +13,7 @@ import type { PolicyRef } from "../policy.js";
 import type { SessionRegistry } from "../sessions.js";
 import { isValidSubagentId } from "../agent_id.js";
 import {
+  hasReclaimNotice,
   preemptionNoticeText,
   shortSessionId,
   PREEMPTION_NOTICE_OVERFLOW_LINE_TEMPLATE,
@@ -269,8 +270,24 @@ export const ADMIT_NOTICE_VERBATIM_CAP = 3;
  *     "still surface on your next tracked-file operation" a true sentence
  *     rather than the false one a render-only cap would print.
  */
-export function drainNoticeText(deps: HookDeps, agentId: string): string | null {
-  const all = deps.registry.popPendingNoticesForAgent(agentId, ADMIT_NOTICE_VERBATIM_CAP);
+export function drainNoticeText(
+  deps: HookDeps,
+  agentId: string,
+  /**
+   * True for an opted-in pre-edit, which already holds its grant when it
+   * drains. If the pop finds the store busy, its BEGIN failed before any
+   * DELETE, so the notices are still queued: the admit goes out without them
+   * instead of a failure answer for a grant that landed.
+   */
+  admitOnBusy = false,
+): string | null {
+  let all: ReturnType<HookDeps["registry"]["popPendingNoticesForAgent"]>;
+  try {
+    all = deps.registry.popPendingNoticesForAgent(agentId, ADMIT_NOTICE_VERBATIM_CAP);
+  } catch (err) {
+    if (admitOnBusy && isSqliteBusy(err)) return null;
+    throw err;
+  }
   if (all.length === 0) return null;
   // Same slice, same order, as the DELETE consumed — the list is newest-first
   // and neither side re-sorts it.
@@ -284,16 +301,31 @@ export function drainNoticeText(deps: HookDeps, agentId: string): string | null 
     // survived a restart used to render "<unknown>".
     return {
       artifactPath: art?.name ?? "<unknown-artifact>",
+      preempterAgentId: n.preempterAgentId,
       preempterAgentShort: shortSessionId(n.preempterAgentId),
       preemptedAtUnixTs: n.preemptedAtUnixTs,
     };
   });
-  let text = preemptionNoticeText(rendered, all.length);
+  let text = preemptionNoticeText(rendered, all.length, hasReclaimNotice(all));
   const overflow = all.length - verbatim.length;
   if (overflow > 0) {
     text += "\n" + PREEMPTION_NOTICE_OVERFLOW_LINE_TEMPLATE.replace("{count}", String(overflow));
   }
   return text;
+}
+
+/**
+ * better-sqlite3's busy error, matched by its exact code, as
+ * `resolveOrRegisterArtifact` matches its constraint code. The extended busy
+ * codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`) are deliberately
+ * not matched: only a held `BEGIN IMMEDIATE` has been observed here.
+ */
+function isSqliteBusy(err: unknown): boolean {
+  return typeof err === "object" && err !== null && "code" in err && err.code === "SQLITE_BUSY";
+}
+
+export function assertNever(x: never): never {
+  throw new Error(`unhandled outcome variant: ${JSON.stringify(x)}`);
 }
 
 /** One SHARED grant a Bash / Grep command earns on one tracked path. */

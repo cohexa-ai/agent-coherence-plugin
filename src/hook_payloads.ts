@@ -16,6 +16,7 @@
  * Per KTD-13: NEVER include content bytes, content hashes, or diff text
  * in the response surface. Stale-read summary is structural metadata only.
  */
+import { MAX_HOLD_SEC, RECLAMATION_PREEMPTER_ID } from "./acquire_or_fail.js";
 
 export interface StaleSummary {
   path: string;
@@ -516,6 +517,8 @@ export function editCollisionWarning(
 export function preemptionNoticeText(
   notices: ReadonlyArray<{
     artifactPath: string;
+    /** The notice row's full preempter id; a reclaim is told apart by it. */
+    preempterAgentId?: string;
     preempterAgentShort: string;
     preemptedAtUnixTs: number;
   }>,
@@ -531,17 +534,41 @@ export function preemptionNoticeText(
    * rendering only `ADMIT_NOTICE_VERBATIM_CAP` of it.
    */
   totalCount: number = notices.length,
+  /**
+   * Whether the WHOLE pending queue holds a reclaim, not just the slice
+   * rendered: a reclaim past the verbatim cap still makes "silently revoked
+   * by another session" untrue, so a capped caller passes it explicitly.
+   */
+  queueHasReclaim: boolean = hasReclaimNotice(notices),
 ): string {
   if (notices.length === 0) return "";
-  const lines = notices.map(
-    (n) =>
-      `  • ${n.artifactPath} preempted by agent ${n.preempterAgentShort} at ${pythonIsoUtc(n.preemptedAtUnixTs)}`,
-  );
-  const intro =
-    totalCount === 1
-      ? "⚠ Your EXCLUSIVE grant on this artifact was silently revoked by another session:"
-      : `⚠ ${totalCount} of your EXCLUSIVE grants were silently revoked by other sessions:`;
-  return `${intro}\n${lines.join("\n")}`;
+  const lines = notices.map((n) => {
+    const at = pythonIsoUtc(n.preemptedAtUnixTs);
+    return isReclaimNotice(n.preempterAgentId)
+      ? `  • ${n.artifactPath} reclaimed at ${at}: held ${MAX_HOLD_SEC / 60} minutes or more while another agent asked for it; read the file again before editing it`
+      : `  • ${n.artifactPath} preempted by agent ${n.preempterAgentShort} at ${at}`;
+  });
+  return `${preemptionIntro(totalCount, queueHasReclaim)}\n${lines.join("\n")}`;
+}
+
+function isReclaimNotice(preempterAgentId: string | undefined): boolean {
+  return preempterAgentId === RECLAMATION_PREEMPTER_ID;
+}
+
+/** Whether any notice in `notices` is a reclaim; callers that render a capped slice pass the whole queue. */
+export function hasReclaimNotice(notices: ReadonlyArray<{ preempterAgentId?: string }>): boolean {
+  return notices.some((n) => isReclaimNotice(n.preempterAgentId));
+}
+
+function preemptionIntro(totalCount: number, queueHasReclaim: boolean): string {
+  if (queueHasReclaim) {
+    return totalCount === 1
+      ? "⚠ Your EXCLUSIVE grant on this artifact was revoked:"
+      : `⚠ ${totalCount} of your EXCLUSIVE grants were revoked:`;
+  }
+  return totalCount === 1
+    ? "⚠ Your EXCLUSIVE grant on this artifact was silently revoked by another session:"
+    : `⚠ ${totalCount} of your EXCLUSIVE grants were silently revoked by other sessions:`;
 }
 
 export function buildStaleResponse(summary: StaleSummary): StaleResponse {
