@@ -32,6 +32,11 @@ import { runPendingMigrations, SCHEMA_USER_VERSION } from "./migrations.js";
 import { MESIState, isValidTransition, isWriter } from "./states.js";
 import { checkSingleWriter, checkMonotonicVersion } from "./invariants.js";
 import { CoherenceError } from "./coherence_error.js";
+import {
+  MAX_HOLD_SEC,
+  RECLAIM_MAX_HOLD_TRIGGER,
+  RECLAMATION_PREEMPTER_ID,
+} from "./acquire_or_fail.js";
 
 /** Per KTD-K REVISED: per-lock-acquisition retry budget, NOT per-transaction. */
 export const BUSY_TIMEOUT_MS = 1500;
@@ -81,6 +86,19 @@ export type CasOutcome =
       currentVersion: number;
     }
   | { kind: "corruption"; currentVersion: number };
+
+/**
+ * Result of the opted-in acquire (`acquireExclusiveIfUnheld`), returned
+ * (never thrown) so the pre-edit route maps each kind to its wire body:
+ * - other_holder → `{ok: false, reason: "other_holder", holder_agent_id}`,
+ *                  naming the holder read inside the deciding transaction
+ * - granted      → the ordinary admit; `reclaimed` names a holder the call
+ *                  took the grant from after `MAX_HOLD_SEC`, so the route can
+ *                  log it
+ */
+export type UnheldAcquireOutcome =
+  | { kind: "granted"; reclaimed: { agentId: string; heldForSec: number } | null }
+  | { kind: "other_holder"; holderAgentId: string };
 
 /**
  * One (artifact, agent) row as the session-start walk needs it: the MESI
@@ -418,6 +436,57 @@ export class ArtifactRegistry {
 
       this.db.exec("COMMIT");
       return invalidatedPeers;
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Rollback failure non-recoverable; surface original error.
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The opted-in acquire: grant EXCLUSIVE to `agentId` only if no other agent
+   * holds the artifact for writing, deciding the check and the grant in ONE
+   * BEGIN IMMEDIATE so a second process's grant can never land between them.
+   *
+   * - Another agent in M/E for less than `MAX_HOLD_SEC`, or with no recorded
+   *   grant tick → COMMIT with no writes and return it as the holder.
+   * - Another agent in M/E for `MAX_HOLD_SEC` or more → reclaim it in this
+   *   same transaction, then grant.
+   * - Otherwise grant: SHARED readers go INVALID with no notice, and the
+   *   caller's own M/E is kept.
+   *
+   * `acquireExclusive` is untouched, so a request that does not opt in
+   * still displaces an opted-in holder.
+   */
+  acquireExclusiveIfUnheld(
+    artifactId: string,
+    agentId: string,
+    nowTick: number,
+  ): UnheldAcquireOutcome {
+    if (!this.hasArtifact(artifactId)) {
+      throw new Error(`acquireExclusiveIfUnheld: artifact ${artifactId} not registered`);
+    }
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const holder = this.otherWriterInTxn(artifactId, agentId);
+      let reclaimed: { agentId: string; heldForSec: number } | null = null;
+      if (holder !== null) {
+        const heldForSec = holder.grantedAtTick === null ? null : nowTick - holder.grantedAtTick;
+        if (heldForSec === null || heldForSec < MAX_HOLD_SEC) {
+          // A refusal writes nothing: COMMIT, never ROLLBACK, keeps it one BEGIN.
+          this.db.exec("COMMIT");
+          return { kind: "other_holder", holderAgentId: holder.agentId };
+        }
+        this.reclaimInTxn(artifactId, holder.agentId, nowTick);
+        reclaimed = { agentId: holder.agentId, heldForSec };
+      }
+      this.grantUnheldInTxn(artifactId, agentId, nowTick);
+      this.db.exec("COMMIT");
+      return { kind: "granted", reclaimed };
     } catch (err) {
       try {
         this.db.exec("ROLLBACK");
@@ -894,6 +963,72 @@ export class ArtifactRegistry {
   // ------------------------------------------------------------------
   // Internal helpers (called within BEGIN IMMEDIATE from public methods)
   // ------------------------------------------------------------------
+
+  /** One other agent holding the artifact in M or E, read on this transaction. */
+  private otherWriterInTxn(
+    artifactId: string,
+    agentId: string,
+  ): { agentId: string; grantedAtTick: number | null } | null {
+    const row = this.db
+      .prepare(
+        `SELECT agent_id, granted_at_tick FROM agent_states
+         WHERE artifact_id = ? AND agent_id != ? AND state IN (?, ?)
+         LIMIT 1`,
+      )
+      .get(artifactId, agentId, MESIState.MODIFIED, MESIState.EXCLUSIVE) as
+      | { agent_id: string; granted_at_tick: number | null }
+      | undefined;
+    return row === undefined ? null : { agentId: row.agent_id, grantedAtTick: row.granted_at_tick };
+  }
+
+  /**
+   * Take the grant from a holder past `MAX_HOLD_SEC`: INVALID, the reclaim
+   * record Python's sweep writes, and a notice naming the reclamation
+   * preempter. The record is its own UPDATE so `setAgentStateInternal`,
+   * which every ordinary release runs, stays unchanged.
+   */
+  private reclaimInTxn(artifactId: string, holderId: string, nowTick: number): void {
+    const priorState = this.getAgentState(artifactId, holderId) ?? MESIState.INVALID;
+    this.setAgentStateInternal(
+      artifactId,
+      holderId,
+      priorState,
+      MESIState.INVALID,
+      nowTick,
+      RECLAIM_MAX_HOLD_TRIGGER,
+    );
+    this.db
+      .prepare(
+        `UPDATE agent_states SET last_reclaim_trigger = ?, last_reclaim_tick = ?
+         WHERE artifact_id = ? AND agent_id = ?`,
+      )
+      .run(RECLAIM_MAX_HOLD_TRIGGER, nowTick, artifactId, holderId);
+    this.upsertPendingNotice(holderId, artifactId, RECLAMATION_PREEMPTER_ID, nowTick);
+  }
+
+  /**
+   * The opted-in grant body. It reads the state map after any reclaim and
+   * sets only SHARED readers INVALID, with no notice: a writer left standing
+   * is never displaced here, so the closing `checkSingleWriter` sees it and
+   * rolls the transaction back.
+   */
+  private grantUnheldInTxn(artifactId: string, agentId: string, nowTick: number): void {
+    const stateMap = this.getStateMap(artifactId);
+    for (const [peerId, peerState] of stateMap) {
+      if (peerId === agentId || peerState !== MESIState.SHARED) continue;
+      this.setAgentStateInternal(artifactId, peerId, peerState, MESIState.INVALID, nowTick, "write");
+    }
+    const prior = stateMap.get(agentId) ?? MESIState.INVALID;
+    if (prior !== MESIState.EXCLUSIVE && prior !== MESIState.MODIFIED) {
+      if (!isValidTransition(prior, MESIState.EXCLUSIVE)) {
+        throw new CoherenceError(
+          `acquireExclusiveIfUnheld: ${agentId} transition ${prior}→EXCLUSIVE not allowed`,
+        );
+      }
+      this.setAgentStateInternal(artifactId, agentId, prior, MESIState.EXCLUSIVE, nowTick, "write");
+    }
+    checkSingleWriter(this.getStateMap(artifactId));
+  }
 
   /**
    * UPSERT agent_states with granted_at_tick + last_reclaim slot bookkeeping
