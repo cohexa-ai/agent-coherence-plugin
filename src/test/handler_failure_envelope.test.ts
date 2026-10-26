@@ -168,6 +168,13 @@ const STUBBED_ROUTES: Array<{
     registered: true,
   },
   {
+    name: "opted-in pre-edit's acquire",
+    method: "acquireExclusiveIfUnheld",
+    path: "/hooks/pre-edit",
+    body: { session_id: SID_A, path: "CLAUDE.md", if_unheld: true },
+    registered: true,
+  },
+  {
     name: "post-edit's release on success=false",
     method: "invalidate",
     path: "/hooks/post-edit",

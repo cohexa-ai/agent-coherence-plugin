@@ -20,6 +20,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { CoherenceError } from "../coherence_error.js";
 import {
+  assertNever,
   type HookDeps,
   writeJson,
   writeError,
@@ -124,11 +125,6 @@ export async function handlePostEditCas(
       // silently-dropped HTTP response.
       return assertNever(outcome);
   }
-}
-
-/** Compile-time exhaustiveness marker; unreachable at runtime. */
-function assertNever(x: never): never {
-  throw new Error(`unhandled CasOutcome variant: ${JSON.stringify(x)}`);
 }
 
 /** Parse + dispatch helper for use from server.ts. */

@@ -5,22 +5,28 @@
  * EXCLUSIVE per KTD-1 single-writer + KTD-9 collision surfacing.
  *
  * Wire shape per KTD-B / KTD-B.3 C3:
- * - Request: `{session_id, path}`
+ * - Request: `{session_id, path, if_unheld?}`
  * - Response: `{ok: true}` on clean acquire; `{ok: true, hookSpecificOutput: {...}}`
  *   with collision warning if another session held M/E; `disk_differs: true`
  *   with the out-of-band notice when the file on disk no longer holds the
  *   recorded content (#205); `{ok: false, reason}` on protocol error
  *   (single-writer violation propagated).
+ * - Opted in (`if_unheld` is exactly JSON `true`): `{ok: false, reason:
+ *   "other_holder", holder_agent_id}` while another agent holds the path for
+ *   writing, in that key order; otherwise an admit that never carries a
+ *   collision warning. Any other `if_unheld` value is an ordinary request.
  *
  * Note on collision detection ordering: the Python handler peeks `exclusiveHolder`
  * BEFORE calling `write()` (which would invalidate the holder). We mirror this:
  * snapshot the holder identity first so the response can name them, THEN call
  * `acquireExclusive` which silently revokes their grant + writes a pending notice
- * the victim will see on their next hook.
+ * the victim will see on their next hook. An opted-in request skips the peek:
+ * its own decision names any holder, and its admit displaces no writer.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Artifact } from "../registry.js";
 import { join } from "node:path";
+import { OTHER_HOLDER_REASON } from "../acquire_or_fail.js";
 import { CoherenceError } from "../coherence_error.js";
 import { hashRegularFile } from "../disk_content.js";
 import { MESIState } from "../states.js";
@@ -32,6 +38,7 @@ import {
   type StaleSummary,
 } from "../hook_payloads.js";
 import {
+  assertNever,
   drainNoticeText,
   holdsContentClaim,
   isRecentSelfCommitLag,
@@ -79,6 +86,43 @@ function recordedContentMissingFromDisk(deps: PreEditDeps, artifact: Artifact | 
 interface PreEditBody {
   session_id?: unknown;
   path?: unknown;
+  if_unheld?: unknown;
+}
+
+/**
+ * The opted-in acquire: check and grant in one registry transaction. Answers
+ * the refusal itself and returns false; returns true when the caller now
+ * holds the grant. A holder reclaimed after `MAX_HOLD_SEC` is logged once,
+ * after the transaction committed.
+ */
+function acquireIfUnheld(
+  res: ServerResponse,
+  deps: PreEditDeps,
+  ids: { artifactId: string; agentId: string; nowTick: number },
+): boolean {
+  const outcome = deps.registry.acquireExclusiveIfUnheld(ids.artifactId, ids.agentId, ids.nowTick);
+  switch (outcome.kind) {
+    case "other_holder":
+      // Key order is the cross-runtime contract: ok, reason, holder_agent_id.
+      writeJson(res, 200, {
+        ok: false,
+        reason: OTHER_HOLDER_REASON,
+        holder_agent_id: outcome.holderAgentId,
+      });
+      return false;
+    case "granted":
+      if (outcome.reclaimed !== null) {
+        // No raw path: a path may hold a newline, and coordinator.log is shared
+        // by every workspace of one plugin install.
+        process.stderr.write(
+          `agent-coherence: reclaimed artifact=${ids.artifactId} holder=${outcome.reclaimed.agentId} ` +
+            `held=${outcome.reclaimed.heldForSec}s for=${ids.agentId}\n`,
+        );
+      }
+      return true;
+    default:
+      return assertNever(outcome);
+  }
 }
 
 export async function handlePreEdit(
@@ -96,6 +140,8 @@ export async function handlePreEdit(
   }
   const sessionId: string = body.session_id;
   const path: string = body.path;
+  // Only JSON `true` opts in; "true", 1 and the rest are ordinary requests.
+  const optedIn = body.if_unheld === true;
 
   // SB-10 U8 (KTD6): the allow-attach seam — runs after every deny
   // decision; strict-deny and refusal bodies pass through untouched.
@@ -166,8 +212,8 @@ export async function handlePreEdit(
   }
 
   // Collision detection: snapshot exclusive holder BEFORE acquireExclusive
-  // (the acquire silently revokes their grant).
-  const holder = deps.registry.exclusiveHolder(artifactId, agentId);
+  // (the acquire silently revokes their grant). Skipped when opted in.
+  const holder = optedIn ? null : deps.registry.exclusiveHolder(artifactId, agentId);
   // R7: name the incumbent by its agent id.
   const holderSessionId = holder !== null ? holder.agentId : null;
   const holderAcquiredAt = holder?.grantedAtTick ?? null;
@@ -176,7 +222,11 @@ export async function handlePreEdit(
   // Acquire EXCLUSIVE — invalidates any peers in M/E/S + writes pending
   // notices for those who held M/E (peers in S don't get a notice).
   try {
-    deps.registry.acquireExclusive(artifactId, agentId, nowTick);
+    if (optedIn) {
+      if (!acquireIfUnheld(res, deps, { artifactId, agentId, nowTick })) return;
+    } else {
+      deps.registry.acquireExclusive(artifactId, agentId, nowTick);
+    }
   } catch (err) {
     if (!(err instanceof CoherenceError)) throw err;
     writeJson(res, 200, {
@@ -201,7 +251,7 @@ export async function handlePreEdit(
   // Pop any pending notices for THIS session — they accumulated from prior
   // preemptions before this pre-edit. Bounded and rendered by the one shared
   // drain in _common.ts, which deletes only what it renders.
-  const noticeText = drainNoticeText(deps, agentId);
+  const noticeText = drainNoticeText(deps, agentId, optedIn);
 
   // If we silently preempted someone in M/E, surface a collision warning.
   // Per Python convention: permissionDecision stays "allow" in v0.1.1 warn-only;
