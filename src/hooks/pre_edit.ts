@@ -90,36 +90,29 @@ interface PreEditBody {
 }
 
 /**
- * The opted-in acquire: check and grant in one registry transaction. Answers
- * the refusal itself and returns false; returns true when the caller now
- * holds the grant. A holder reclaimed after `MAX_HOLD_SEC` is logged once,
- * after the transaction committed.
+ * The opted-in acquire: check and grant in one registry transaction. Returns
+ * the refusal body to send, or null when the caller now holds the grant.
  */
 function acquireIfUnheld(
-  res: ServerResponse,
   deps: PreEditDeps,
-  ids: { artifactId: string; agentId: string; nowTick: number },
-): boolean {
-  const outcome = deps.registry.acquireExclusiveIfUnheld(ids.artifactId, ids.agentId, ids.nowTick);
+  acquisition: { artifactId: string; agentId: string; nowTick: number },
+): Record<string, unknown> | null {
+  const { artifactId, agentId, nowTick } = acquisition;
+  const outcome = deps.registry.acquireExclusiveIfUnheld(artifactId, agentId, nowTick);
   switch (outcome.kind) {
     case "other_holder":
       // Key order is the cross-runtime contract: ok, reason, holder_agent_id.
-      writeJson(res, 200, {
-        ok: false,
-        reason: OTHER_HOLDER_REASON,
-        holder_agent_id: outcome.holderAgentId,
-      });
-      return false;
+      return { ok: false, reason: OTHER_HOLDER_REASON, holder_agent_id: outcome.holderAgentId };
     case "granted":
       if (outcome.reclaimed !== null) {
         // No raw path: a path may hold a newline, and coordinator.log is shared
         // by every workspace of one plugin install.
         process.stderr.write(
-          `agent-coherence: reclaimed artifact=${ids.artifactId} holder=${outcome.reclaimed.agentId} ` +
-            `held=${outcome.reclaimed.heldForSec}s for=${ids.agentId}\n`,
+          `agent-coherence: reclaimed artifact=${artifactId} holder=${outcome.reclaimed.agentId} ` +
+            `held=${outcome.reclaimed.heldForSec}s for=${agentId}\n`,
         );
       }
-      return true;
+      return null;
     default:
       return assertNever(outcome);
   }
@@ -140,7 +133,6 @@ export async function handlePreEdit(
   }
   const sessionId: string = body.session_id;
   const path: string = body.path;
-  // Only JSON `true` opts in; "true", 1 and the rest are ordinary requests.
   const optedIn = body.if_unheld === true;
 
   // SB-10 U8 (KTD6): the allow-attach seam — runs after every deny
@@ -212,18 +204,23 @@ export async function handlePreEdit(
   }
 
   // Collision detection: snapshot exclusive holder BEFORE acquireExclusive
-  // (the acquire silently revokes their grant). Skipped when opted in.
+  // (the acquire silently revokes their grant).
   const holder = optedIn ? null : deps.registry.exclusiveHolder(artifactId, agentId);
   // R7: name the incumbent by its agent id.
   const holderSessionId = holder !== null ? holder.agentId : null;
   const holderAcquiredAt = holder?.grantedAtTick ?? null;
   const peerWriteInFlight = aWriteIsInFlight(deps, artifactId, agentId);
 
-  // Acquire EXCLUSIVE — invalidates any peers in M/E/S + writes pending
-  // notices for those who held M/E (peers in S don't get a notice).
+  // Acquire EXCLUSIVE. An ordinary request invalidates any peers in M/E/S and
+  // writes pending notices for those who held M/E (peers in S don't get a
+  // notice); an opted-in one is refused instead while another agent holds M/E.
   try {
     if (optedIn) {
-      if (!acquireIfUnheld(res, deps, { artifactId, agentId, nowTick })) return;
+      const refusal = acquireIfUnheld(deps, { artifactId, agentId, nowTick });
+      if (refusal !== null) {
+        writeJson(res, 200, refusal);
+        return;
+      }
     } else {
       deps.registry.acquireExclusive(artifactId, agentId, nowTick);
     }

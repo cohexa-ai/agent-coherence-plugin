@@ -474,12 +474,12 @@ export class ArtifactRegistry {
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const holder = this.otherWriterInTxn(artifactId, agentId);
+      // Read on this connection, inside the open transaction.
+      const holder = this.exclusiveHolder(artifactId, agentId);
       let reclaimed: { agentId: string; heldForSec: number } | null = null;
       if (holder !== null) {
         const heldForSec = holder.grantedAtTick === null ? null : nowTick - holder.grantedAtTick;
         if (heldForSec === null || heldForSec < MAX_HOLD_SEC) {
-          // A refusal writes nothing: COMMIT, never ROLLBACK, keeps it one BEGIN.
           this.db.exec("COMMIT");
           return { kind: "other_holder", holderAgentId: holder.agentId };
         }
@@ -905,7 +905,8 @@ export class ArtifactRegistry {
   /**
    * Return (agent_id, granted_at_tick) of the current exclusive holder for an
    * artifact, excluding `excludeAgentId`. Returns null if no M∪E holder. Used
-   * by pre-edit collision detection.
+   * by pre-edit collision detection, and by `acquireExclusiveIfUnheld` inside
+   * its transaction.
    */
   exclusiveHolder(
     artifactId: string,
@@ -965,23 +966,6 @@ export class ArtifactRegistry {
   // ------------------------------------------------------------------
   // Internal helpers (called within BEGIN IMMEDIATE from public methods)
   // ------------------------------------------------------------------
-
-  /** One other agent holding the artifact in M or E, read on this transaction. */
-  private otherWriterInTxn(
-    artifactId: string,
-    agentId: string,
-  ): { agentId: string; grantedAtTick: number | null } | null {
-    const row = this.db
-      .prepare(
-        `SELECT agent_id, granted_at_tick FROM agent_states
-         WHERE artifact_id = ? AND agent_id != ? AND state IN (?, ?)
-         LIMIT 1`,
-      )
-      .get(artifactId, agentId, MESIState.MODIFIED, MESIState.EXCLUSIVE) as
-      | { agent_id: string; granted_at_tick: number | null }
-      | undefined;
-    return row === undefined ? null : { agentId: row.agent_id, grantedAtTick: row.granted_at_tick };
-  }
 
   /**
    * Take the grant from a holder past `MAX_HOLD_SEC`: INVALID, the reclaim

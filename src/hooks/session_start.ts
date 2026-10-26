@@ -33,7 +33,7 @@ import { sessionToAgentId } from "../agent_id.js";
 import {
   emitSessionStart,
   fmt,
-  isReclaimNotice,
+  hasReclaimNotice,
   preemptionNoticeText,
   shortSessionId,
   SESSION_START_HEADER,
@@ -233,7 +233,7 @@ export function buildSessionStartContext(
         };
       }),
       notices.length,
-      notices.some((n) => isReclaimNotice(n.preempterAgentId)),
+      hasReclaimNotice(notices),
     );
     const noticeOverflow = notices.length - verbatimNotices.length;
     if (noticeOverflow > 0) {

@@ -13,7 +13,7 @@ import type { PolicyRef } from "../policy.js";
 import type { SessionRegistry } from "../sessions.js";
 import { isValidSubagentId } from "../agent_id.js";
 import {
-  isReclaimNotice,
+  hasReclaimNotice,
   preemptionNoticeText,
   shortSessionId,
   PREEMPTION_NOTICE_OVERFLOW_LINE_TEMPLATE,
@@ -306,8 +306,7 @@ export function drainNoticeText(
       preemptedAtUnixTs: n.preemptedAtUnixTs,
     };
   });
-  const queueHasReclaim = all.some((n) => isReclaimNotice(n.preempterAgentId));
-  let text = preemptionNoticeText(rendered, all.length, queueHasReclaim);
+  let text = preemptionNoticeText(rendered, all.length, hasReclaimNotice(all));
   const overflow = all.length - verbatim.length;
   if (overflow > 0) {
     text += "\n" + PREEMPTION_NOTICE_OVERFLOW_LINE_TEMPLATE.replace("{count}", String(overflow));
@@ -321,11 +320,10 @@ export function drainNoticeText(
  * codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`) are deliberately
  * not matched: only a held `BEGIN IMMEDIATE` has been observed here.
  */
-export function isSqliteBusy(err: unknown): boolean {
+function isSqliteBusy(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && err.code === "SQLITE_BUSY";
 }
 
-/** Compile-time exhaustiveness marker for a `switch` over a result union; unreachable at runtime. */
 export function assertNever(x: never): never {
   throw new Error(`unhandled outcome variant: ${JSON.stringify(x)}`);
 }

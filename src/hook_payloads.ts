@@ -539,7 +539,7 @@ export function preemptionNoticeText(
    * rendered: a reclaim past the verbatim cap still makes "silently revoked
    * by another session" untrue, so a capped caller passes it explicitly.
    */
-  queueHasReclaim: boolean = notices.some((n) => isReclaimNotice(n.preempterAgentId)),
+  queueHasReclaim: boolean = hasReclaimNotice(notices),
 ): string {
   if (notices.length === 0) return "";
   const lines = notices.map((n) => {
@@ -551,16 +551,15 @@ export function preemptionNoticeText(
   return `${preemptionIntro(totalCount, queueHasReclaim)}\n${lines.join("\n")}`;
 }
 
-/** True when a notice row names the reclamation preempter, not a peer agent. */
-export function isReclaimNotice(preempterAgentId: string | undefined): boolean {
+function isReclaimNotice(preempterAgentId: string | undefined): boolean {
   return preempterAgentId === RECLAMATION_PREEMPTER_ID;
 }
 
-/**
- * The notice block's one intro line. A queue holding a reclaim drops "silently
- * … by another session", which a reclaim makes untrue; a queue without one
- * keeps the original bytes.
- */
+/** Whether any notice in `notices` is a reclaim; callers that render a capped slice pass the whole queue. */
+export function hasReclaimNotice(notices: ReadonlyArray<{ preempterAgentId?: string }>): boolean {
+  return notices.some((n) => isReclaimNotice(n.preempterAgentId));
+}
+
 function preemptionIntro(totalCount: number, queueHasReclaim: boolean): string {
   if (queueHasReclaim) {
     return totalCount === 1

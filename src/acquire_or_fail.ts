@@ -21,7 +21,6 @@ export const MAX_HOLD_SEC = 1800;
  */
 export const RECLAMATION_PREEMPTER_ID = "e91bfe9cc2855071bf958d64a2bde624";
 
-/** The `last_reclaim_trigger` recorded on a holder the opted-in acquire reclaims. */
 export const RECLAIM_MAX_HOLD_TRIGGER = "reclaim_max_hold";
 
 /** The refusal reason, the same value Python sends and `post-edit-cas` already uses. */
