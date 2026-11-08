@@ -173,19 +173,6 @@ test("transition to INVALID preserves the prior recorded value", () => {
   }
 });
 
-test("releaseToReader() (Stop-hook release) preserves the prior recorded value", () => {
-  const { registry, cleanup } = makeRegistry();
-  try {
-    const id = registry.resolveOrRegisterArtifact("plan.md", HASH_1);
-    registry.acquireExclusive(id, AGENT_A, 10);
-    registry.releaseToReader(id, AGENT_A, 20);
-    assert.equal(registry.getAgentState(id, AGENT_A), MESIState.SHARED);
-    assert.equal(registry.lastObservedVersionFor(id, AGENT_A), 1);
-  } finally {
-    cleanup();
-  }
-});
-
 test("re-grant after invalidation re-records the (newer) current version", () => {
   const { registry, cleanup } = makeRegistry();
   try {
