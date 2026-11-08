@@ -10,9 +10,19 @@
  * again.
  *
  * Wire shape per KTD-B / KTD-B.3 C3:
- * - Request: `{session_id}`
+ * - Request: `{session_id}`, plus `agent_id` for a subagent or a
+ *   `CoherentVolume` attempt, and an optional `ended: true` with which the
+ *   volume reports that attempt over (Cohexa-ai/agent-coherence#525).
  * - Response: `{ok: true, released_artifacts: ["plan.md", ...]}` listing the
  *   repo-relative paths whose grants were released.
+ *
+ * After the releases, an `ended` stop forgets the identity: its rows leave
+ * the store and its entry leaves the session maps, so `/status` stops
+ * listing it. A grant still held after the releases refuses the forget, and
+ * the identity keeps every row. Only the explicit flag ends an identity: a
+ * stopped subagent keeps its rows, because a SubagentStop can be blocked and
+ * the subagent resumed under the same id, and a deleted row would turn the
+ * deny of its stale edit into an admit.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { CoherenceError } from "../coherence_error.js";
@@ -31,6 +41,36 @@ export type SessionStopDeps = HookDeps;
 
 interface SessionStopBody {
   session_id?: unknown;
+  ended?: unknown;
+}
+
+/** The 400 text for a malformed `ended`, or null when it is absent or usable. */
+function endedError(body: SessionStopBody): string | null {
+  if (body.ended === undefined) return null;
+  if (typeof body.ended !== "boolean") return "ended must be a boolean";
+  // A parent Stop is a session between turns, never an end.
+  if (body.ended && !hasSubagentIdField(body as Record<string, unknown>)) {
+    return "ended requires agent_id";
+  }
+  return null;
+}
+
+/**
+ * Forget an ended identity. A refusal (it still holds a write grant) is
+ * logged and the stop answers as usual; a store fault propagates to the
+ * failure envelope, as in the release loop.
+ */
+function forgetEndedAgent(deps: SessionStopDeps, agentId: string): void {
+  try {
+    deps.registry.forgetAgent(agentId);
+  } catch (err) {
+    if (!(err instanceof CoherenceError)) throw err;
+    process.stderr.write(
+      `agent-coherence: session_stop kept the records of an ended agent: ${String(err)}\n`,
+    );
+    return;
+  }
+  deps.sessions.forget(agentId);
 }
 
 export async function handleSessionStop(
@@ -40,6 +80,11 @@ export async function handleSessionStop(
 ): Promise<void> {
   if (!isValidSessionId(body.session_id)) {
     writeError(res, 400, "missing session_id");
+    return;
+  }
+  const endedRefusal = endedError(body);
+  if (endedRefusal !== null) {
+    writeError(res, 400, endedRefusal);
     return;
   }
   const sessionId: string = body.session_id;
@@ -95,6 +140,9 @@ export async function handleSessionStop(
       );
     }
   }
+
+  // A release refused above left its grant held, so the forget refuses.
+  if (body.ended === true) forgetEndedAgent(deps, agentId);
 
   writeJson(res, 200, { ok: true, released_artifacts: releasedPaths });
 }

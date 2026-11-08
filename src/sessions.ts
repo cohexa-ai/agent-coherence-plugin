@@ -92,6 +92,19 @@ export class SessionRegistry {
   }
 
   /**
+   * Drop an ended identity from every map keyed or valued by its agent_id,
+   * after `ArtifactRegistry.forgetAgent` deleted its rows. The compact-pending
+   * flag is keyed by the parent session, which has not ended, so it stays.
+   */
+  forget(agentId: string): void {
+    for (const [cacheKey, cached] of this.bySessionId) {
+      if (cached === agentId) this.bySessionId.delete(cacheKey);
+    }
+    this.byAgentId.delete(agentId);
+    this.nameByAgentId.delete(agentId);
+  }
+
+  /**
    * SB-10 U6: the session's coherence agents as `{agentId, subagentName}`
    * pairs — the parent first (`subagentName: null`, derivable via uuid5
    * WITHOUT prior registration), then registered subagents sorted by agent
