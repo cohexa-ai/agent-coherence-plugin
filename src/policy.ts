@@ -35,9 +35,10 @@
  * is to restart the coordinator without its strict entry.
  */
 import { randomBytes } from "node:crypto";
-import { readFileSync, statSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
+import { writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { dump as yamlDump, load as yamlLoad, type YAMLException } from "js-yaml";
+import { NOT_REGULAR, readRegularFile } from "./disk_content.js";
 
 /** Mirror of Python coordinator_server.MAX_POLICY_PATHS_PER_REQUEST. */
 export const MAX_POLICY_PATHS_PER_REQUEST = 20;
@@ -438,6 +439,8 @@ export class PolicyRef {
  *   maps to 400. For the last two Python appends anyway, reporting success for
  *   an entry that never takes effect; for an unreadable file it also writes
  *   nothing but answers 500;
+ * - a symlink or anything else that is not a regular file counts as a file it
+ *   cannot read: it is never read through, renamed over or waited on (#248);
  * - byte cap → throws with Python's exact message
  *   (`policy YAML cap of 65536 bytes would be exceeded`) → route maps to 400.
  *
@@ -464,11 +467,23 @@ export function appendPolicyYaml(
   const name = policyFileName(yamlPath);
   let existing: string;
   try {
-    existing = readFileSync(yamlPath, "utf8");
+    existing = readRegularFile(yamlPath).toString("utf8");
   } catch (err) {
     // Only a missing file is empty. Reading any other failure as empty would
     // rename a file holding just the new entries over every pattern it had.
     const code = (err as NodeJS.ErrnoException).code;
+    // A link is never read through or renamed over, and a FIFO is never
+    // waited on: a read that blocked held this coordinator's only event
+    // loop, so it answered nothing, not even /health or SIGTERM (#248).
+    if (code === "ELOOP") {
+      throw new Error(
+        `${name} is a symlink; nothing was written. ` +
+          `Replace it with a copy of the file it names, or mount a directory at .coherence.`,
+      );
+    }
+    if (code === NOT_REGULAR) {
+      throw new Error(`${name} could not be read (not a regular file); nothing was written.`);
+    }
     if (code !== "ENOENT") {
       throw new Error(`${name} could not be read (${code ?? String(err)}); nothing was written.`);
     }
@@ -1441,22 +1456,25 @@ function describeNonString(item: unknown): string {
  * non-list top level → [] + logged WARNING + one rejected entry for the whole
  * file, under the name and reason the Python coordinator records (#192): the
  * warning reaches only the coordinator's log, and the rejected count on
- * /status is what tells an emptied file apart from no user patterns.
+ * /status is what tells an emptied file apart from no user patterns. A
+ * symlink is rejected the same way and never read (#251); anything else that
+ * is not a regular file, a FIFO among them, loads as [] without a word.
  */
 function loadYamlList(yamlPath: string, rejected: RejectedPattern[]): unknown[] {
-  let stat;
-  try {
-    stat = statSync(yamlPath);
-  } catch {
-    return [];
-  }
-  if (!stat.isFile()) return [];
-
   const name = policyFileName(yamlPath);
   let text: string;
   try {
-    text = readFileSync(yamlPath, "utf8");
+    text = readRegularFile(yamlPath).toString("utf8");
   } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR" || code === "EISDIR" || code === NOT_REGULAR) return [];
+    // A link is not read through (#251): a repository can commit one, and
+    // the file it names is not this workspace's policy.
+    if (code === "ELOOP") {
+      process.stderr.write(`agent-coherence: WARNING — ${yamlPath} is a symlink; it loads as no entries\n`);
+      rejected.push({ pattern: name, reason: "a symlink, so the file loads as no entries" });
+      return [];
+    }
     process.stderr.write(
       `agent-coherence: WARNING — could not read ${yamlPath}; it loads as no entries: ${String(err)}\n`,
     );

@@ -37,10 +37,8 @@ import {
 } from '../coherence_dir.js';
 import {
   START_TIMEOUT_MS,
-  type Coordinator,
-  publishedPid,
+  serving,
   startCoordinator,
-  waitFor,
   within,
 } from './coordinator_process_fixture.js';
 import { writeExecutable } from './executable_fixture.js';
@@ -277,15 +275,6 @@ test(
     );
   })
 );
-
-/** Wait until `coordinator` has published itself; it logs "spawned at" only once it has. */
-function serving(ws: string, coordinator: Coordinator): Promise<true> {
-  return waitFor('the coordinator to serve', () =>
-    publishedPid(ws) === coordinator.child.pid && /spawned at /.test(coordinator.stderr())
-      ? true
-      : null
-  );
-}
 
 test(
   'a serving coordinator writes no server.port',

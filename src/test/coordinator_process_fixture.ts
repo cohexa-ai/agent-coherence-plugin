@@ -73,3 +73,12 @@ export function publishedPid(ws: string): number | null {
   const [pid, port] = text.split('\n');
   return pid && port ? Number(pid) : null;
 }
+
+/** Wait until `coordinator` has published itself; it logs "spawned at" only once it has. */
+export function serving(ws: string, coordinator: Coordinator): Promise<true> {
+  return waitFor('the coordinator to serve', () =>
+    publishedPid(ws) === coordinator.child.pid && /spawned at /.test(coordinator.stderr())
+      ? true
+      : null
+  );
+}
