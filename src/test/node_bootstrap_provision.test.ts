@@ -765,6 +765,116 @@ test('the bootstrap refuses a linked server.pid or coordinator_backend before it
   }
 });
 
+/**
+ * A coordinator that serves at once and goes away on its own. With `linkTarget`
+ * it first plants a link to it at coordinator_backend: after the start check,
+ * before the backend stamp.
+ */
+function servingCoordinatorJs(linkTarget?: string): string {
+  return (
+    'import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";\n' +
+    'const dir = (process.env.AGENT_COHERENCE_WORKSPACE ?? process.cwd()) + "/.coherence";\n' +
+    'mkdirSync(dir, { recursive: true });\n' +
+    (linkTarget === undefined
+      ? ''
+      : `symlinkSync(${JSON.stringify(linkTarget)}, dir + "/coordinator_backend");\n`) +
+    'writeFileSync(dir + "/server.pid", `${process.pid}\\n0\\nbackend=node\\n`);\n' +
+    'setTimeout(() => {}, 20_000);\n'
+  );
+}
+
+/**
+ * A bin directory whose `mkdir`, once it has made `ws`/.coherence, plants a
+ * link to `linkTarget` at coordinator_backend: between the stamp's own test
+ * and its write.
+ */
+function mkdirThatPlants(ws: string, linkTarget: string): string {
+  const bin = mkdtempSync(join(tmpdir(), 'provision-mkdir-'));
+  const coherenceDir = join(ws, '.coherence');
+  writeExecutable(
+    join(bin, 'mkdir'),
+    '#!/usr/bin/env bash\n' +
+      '/bin/mkdir "$@" || exit\n' +
+      'for last in "$@"; do :; done\n' +
+      `if [ "\${last:-}" = ${JSON.stringify(coherenceDir)} ]; then\n` +
+      `  ln -s ${JSON.stringify(linkTarget)} ${JSON.stringify(join(coherenceDir, 'coordinator_backend'))}\n` +
+      'fi\n'
+  );
+  return bin;
+}
+
+test('the first-provision stamp follows no link planted after the start check, and waits on no FIFO', async () => {
+  // The stamp runs once a coordinator serves, seconds after the start check.
+  // Before, a dangling link at coordinator_backend by then had "node" written
+  // through it, creating the file it names, and a link to a FIFO held the
+  // session start until something read the FIFO.
+  const base = mkdtempSync(join(tmpdir(), 'provision-stamp-'));
+  const fifo = join(base, 'pipe');
+  makeFifo(fifo);
+  const rows = [
+    { where: 'a dangling link the coordinator plants as it starts', target: join(base, 'gone-1'), by: 'coordinator', fifos: [] },
+    { where: "a dangling link planted between the stamp's test and its write", target: join(base, 'gone-2'), by: 'mkdir', fifos: [] },
+    { where: 'a link to a FIFO the coordinator plants as it starts', target: fifo, by: 'coordinator', fifos: [fifo] },
+  ].map((row) => {
+    const root = makeStubRoot({
+      prebuiltDistJs: servingCoordinatorJs(row.by === 'coordinator' ? row.target : undefined),
+    });
+    const dirs = makeDirs();
+    const bin = row.by === 'mkdir' ? mkdirThatPlants(dirs.ws, row.target) : undefined;
+    return { ...row, ...dirs, root, bin, link: join(dirs.ws, '.coherence', 'coordinator_backend') };
+  });
+  const runs: Array<{ stderr: string }> = [];
+  try {
+    const before = rows.map((row) => entryAt(row.target));
+    const outcomes = rows.map(async (row) => {
+      const run = await runCommandBounded('bash', [join(row.root, 'bin', 'ensure-coordinator-node')], {
+        cwd: row.ws,
+        env: {
+          ...process.env,
+          PATH: row.bin === undefined ? process.env.PATH : `${row.bin}:${process.env.PATH ?? ''}`,
+          AGENT_COHERENCE_WORKSPACE: row.ws,
+          CLAUDE_PLUGIN_ROOT: row.root,
+          CLAUDE_PLUGIN_DATA: row.data,
+        } as NodeJS.ProcessEnv,
+        // The whole provision runs first; this only has to tell a finished
+        // start from one held on the FIFO.
+        timeoutMs: 60_000,
+        fifos: row.fifos,
+      });
+      runs.push(run);
+      return [
+        row.where,
+        {
+          timedOut: run.timedOut,
+          status: run.status,
+          spawned: /spawned Node coordinator \(pid=/.test(run.stderr),
+          link: entryAt(row.link),
+          target: entryAt(row.target),
+        },
+      ] as const;
+    });
+    const seen = Object.fromEntries(await Promise.all(outcomes));
+    assert.deepEqual(
+      seen,
+      Object.fromEntries(
+        rows.map((row, i) => [
+          row.where,
+          { timedOut: false, status: 0, spawned: true, link: `link to ${row.target}`, target: before[i] },
+        ])
+      ),
+      runs.map((run) => run.stderr).join('\n')
+    );
+  } finally {
+    for (const run of runs) killSpawned(run.stderr);
+    for (const row of rows) {
+      if (row.bin !== undefined) rmSync(row.bin, { recursive: true, force: true });
+      rmSync(row.root, { recursive: true, force: true });
+      row.cleanup();
+    }
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test('ABI STAMP: a successful provision records the running Node ABI', () => {
   const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
   const { data, ws, cleanup } = makeDirs();

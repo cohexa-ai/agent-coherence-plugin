@@ -556,10 +556,16 @@ pid_runs_coordinator() {
 # route to the Python bootstrap — one working session, then silent degrade
 # after reboot on exactly the zero-Python machines the Node default exists
 # for. An operator's existing selection file is never overwritten.
+#
+# The stamp runs seconds after the start check, so it writes only where
+# nothing is at the name: never through a link, dangling or not, and never
+# into a FIFO. Under set -C bash creates a missing file exclusively, which
+# follows no link planted since the test, and clobbers no regular file.
 stamp_node_backend() {
-  if [ "$workspace_had_state_db" = "0" ] && [ ! -f "${WORKSPACE}/.coherence/coordinator_backend" ]; then
+  local backend_file="${WORKSPACE}/.coherence/coordinator_backend"
+  if [ "$workspace_had_state_db" = "0" ] && [ ! -e "$backend_file" ] && [ ! -L "$backend_file" ]; then
     mkdir -p "${WORKSPACE}/.coherence"
-    echo "node" >"${WORKSPACE}/.coherence/coordinator_backend"
+    ( set -C; echo "node" >"$backend_file" ) 2>/dev/null || true
   fi
 }
 
