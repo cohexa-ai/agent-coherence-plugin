@@ -5,7 +5,9 @@
  * KTD-11: when a Claude Code session reaches end-of-turn (Stop hook), release
  * any uncommitted EXCLUSIVE/MODIFIED grants the session still holds. Without
  * this, abandoned mid-edit grants would block peer sessions for the full
- * crash-recovery timeout window (default 120s).
+ * crash-recovery timeout window (default 120s). The session keeps a read
+ * (SHARED) of each released file, so its next turn can read and edit it
+ * again.
  *
  * Wire shape per KTD-B / KTD-B.3 C3:
  * - Request: `{session_id}`
@@ -79,7 +81,7 @@ export async function handleSessionStop(
   const releasedPaths: string[] = [];
   for (const artifactId of heldArtifactIds) {
     try {
-      deps.registry.invalidate(artifactId, agentId, nowTick, "session_stop");
+      deps.registry.releaseToReader(artifactId, agentId, nowTick);
       const art = deps.registry.getArtifactById(artifactId);
       if (art !== null) releasedPaths.push(art.name);
     } catch (err) {
@@ -89,7 +91,7 @@ export async function handleSessionStop(
       // than a clean release while the grant is still held (#214).
       if (!(err instanceof CoherenceError)) throw err;
       process.stderr.write(
-        `agent-coherence: session_stop invalidate failed for artifact=${artifactId}: ${String(err)}\n`,
+        `agent-coherence: session_stop release failed for artifact=${artifactId}: ${String(err)}\n`,
       );
     }
   }
