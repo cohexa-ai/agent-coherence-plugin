@@ -52,7 +52,26 @@ export async function runBounded(
   args: string[],
   options: { timeoutMs: number; fifos: string[] }
 ): Promise<BoundedRun> {
-  const child = spawn(process.execPath, ['--input-type=module', '-e', script, ...args], {
+  return runCommandBounded(
+    process.execPath,
+    ['--input-type=module', '-e', script, ...args],
+    options
+  );
+}
+
+/**
+ * Run `command` with `args` as `runBounded` runs a script, in `cwd` with `env`
+ * when given. `status` is the exit code, or null when the child had not exited
+ * in time or a signal ended it.
+ */
+export async function runCommandBounded(
+  command: string,
+  args: string[],
+  options: { timeoutMs: number; fifos: string[]; cwd?: string; env?: NodeJS.ProcessEnv }
+): Promise<BoundedRun & { status: number | null }> {
+  const child = spawn(command, args, {
+    cwd: options.cwd,
+    env: options.env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
@@ -60,13 +79,17 @@ export async function runBounded(
   child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString('utf8')));
   child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString('utf8')));
   let timer: NodeJS.Timeout | undefined;
-  const exited = new Promise<boolean>((resolve) => child.once('close', () => resolve(false)));
-  const expired = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(true), options.timeoutMs);
+  const exited = new Promise<number | null>((resolve) =>
+    child.once('close', (code) => resolve(code))
+  );
+  const expired = new Promise<'running'>((resolve) => {
+    timer = setTimeout(() => resolve('running'), options.timeoutMs);
   });
   try {
-    const timedOut = await Promise.race([exited, expired]);
-    return { stdout, stderr, timedOut };
+    const outcome = await Promise.race([exited, expired]);
+    return outcome === 'running'
+      ? { stdout, stderr, timedOut: true, status: null }
+      : { stdout, stderr, timedOut: false, status: outcome };
   } finally {
     clearTimeout(timer);
     for (const fifo of options.fifos) releaseFifo(fifo);

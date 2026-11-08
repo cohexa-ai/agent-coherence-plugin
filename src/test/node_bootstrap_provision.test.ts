@@ -25,13 +25,17 @@ import {
   existsSync,
   readFileSync,
   renameSync,
+  lstatSync,
+  readlinkSync,
 } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeExecutable } from './executable_fixture.js';
+import { makeFifo, runCommandBounded } from './fifo_fixture.js';
 import { LOCK_MODULE_URL, holdPidFileLock, killAndWait } from './pid_lock_fixture.js';
+import { shimRefusal } from './shim_refusal_fixture.js';
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -666,6 +670,98 @@ test("an operator's existing coordinator_backend file is never overwritten by th
   } finally {
     rmSync(root, { recursive: true, force: true });
     cleanup();
+  }
+});
+
+// --- .coherence check (#251) -------------------------------------------------
+
+/**
+ * A start the check refuses lstats and lists only, so it answers in well under
+ * a second; this only has to tell it from a start held on a FIFO.
+ */
+const AT_ONCE_MS = 5_000;
+
+/** A coordinator that never serves and goes away on its own: for starts that must never spawn one. */
+const SHORT_LIVED_JS = 'setTimeout(() => {}, 20_000);\n';
+
+/** What is at `path`, without following a link there. */
+function entryAt(path: string): string {
+  let info;
+  try {
+    info = lstatSync(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+    throw err;
+  }
+  if (info.isSymbolicLink()) return `link to ${readlinkSync(path)}`;
+  if (info.isFIFO()) return 'FIFO';
+  return `file ${JSON.stringify(readFileSync(path, 'utf8'))}`;
+}
+
+test('the bootstrap refuses a linked server.pid or coordinator_backend before it reads, joins or writes anything', async () => {
+  // A repository can commit these links (cohexa-ai/agent-coherence#498).
+  // Before, the bootstrap joined the coordinator another workspace's pid file
+  // names, waited for good on a FIFO behind server.pid, and stamped the backend
+  // through a dangling link, creating the file it names.
+  const base = mkdtempSync(join(tmpdir(), 'provision-refused-'));
+  const theirs = join(base, 'other', '.coherence', 'server.pid');
+  mkdirSync(dirname(theirs), { recursive: true });
+  const fifo = join(base, 'pipe');
+  makeFifo(fifo);
+  // Only its own row releases the FIFO: a row that finished first must not let a held one go on.
+  const rows = [
+    { where: "server.pid linked to a serving coordinator's", name: 'server.pid', target: theirs, pinned: true, fifos: [] },
+    { where: 'server.pid linked to a FIFO', name: 'server.pid', target: fifo, pinned: true, fifos: [fifo] },
+    // Run as Claude Code runs it, in $PWD.
+    { where: 'a dangling coordinator_backend link', name: 'coordinator_backend', target: join(base, 'gone'), pinned: false, fifos: [] },
+  ].map((row) => {
+    const root = makeStubRoot({ prebuiltDistJs: SHORT_LIVED_JS });
+    const dirs = makeDirs();
+    mkdirSync(join(dirs.ws, '.coherence'));
+    const link = join(dirs.ws, '.coherence', row.name);
+    symlinkSync(row.target, link);
+    return { ...row, ...dirs, root, link };
+  });
+  // Another workspace's coordinator, serving.
+  const holder = await holdPidFileLock(theirs, { publish: 'PID\n4242\nbackend=node\n' });
+  try {
+    const before = rows.map((row) => entryAt(row.target));
+    const runs = rows.map(async (row) => {
+      const run = await runCommandBounded('bash', [join(row.root, 'bin', 'ensure-coordinator-node')], {
+        cwd: row.ws,
+        env: {
+          ...process.env,
+          AGENT_COHERENCE_WORKSPACE: row.pinned ? row.ws : undefined,
+          CLAUDE_PLUGIN_ROOT: row.root,
+          CLAUDE_PLUGIN_DATA: row.data,
+        } as NodeJS.ProcessEnv,
+        timeoutMs: AT_ONCE_MS,
+        fifos: row.fifos,
+      });
+      return [row.where, { ...run, link: entryAt(row.link), target: entryAt(row.target) }] as const;
+    });
+    const seen = Object.fromEntries(await Promise.all(runs));
+    assert.deepEqual(
+      seen,
+      Object.fromEntries(
+        rows.map((row, i) => [
+          row.where,
+          {
+            timedOut: false,
+            ...shimRefusal(`.coherence/${row.name}`, 'link'),
+            link: `link to ${row.target}`,
+            target: before[i],
+          },
+        ])
+      )
+    );
+  } finally {
+    await killAndWait(holder);
+    for (const row of rows) {
+      rmSync(row.root, { recursive: true, force: true });
+      row.cleanup();
+    }
+    rmSync(base, { recursive: true, force: true });
   }
 });
 
