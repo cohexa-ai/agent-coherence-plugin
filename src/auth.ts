@@ -16,13 +16,17 @@
  * v0.1 plan KTD-12 + v0.1.1 plan KTD-A.5 + KTD-K item ("Tighten ensure_secret
  * empty-file recovery branch") are the canonical references.
  */
-import { constants as fsConstants, openSync, readFileSync, writeSync, closeSync, mkdirSync } from "node:fs";
+import { constants as fsConstants, openSync, writeSync, closeSync, mkdirSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 import type { IncomingMessage } from "node:http";
+import { coherenceDirRefusalMessage } from "./coherence_dir.js";
+import { NOT_REGULAR, readStateFile } from "./disk_content.js";
 
 const SECRET_BYTES = 32;
 const SECRET_HEX_LEN = SECRET_BYTES * 2;
+/** More than any secret a coordinator writes: a larger hook.secret is malformed, not read whole. */
+export const MAX_SECRET_FILE_BYTES = 4096;
 const ALLOWED_HOSTS: ReadonlyArray<string> = ["localhost", "127.0.0.1"];
 
 const RECOVERY_MAX_ATTEMPTS = 5;
@@ -55,8 +59,24 @@ export function ensureSecret(coherenceDir: string): string {
       }
     }
 
-    // Read existing. If valid (correct length), return it.
-    const existing = readFileSync(path, "utf8").trim();
+    // Read existing. If valid (correct length), return it. Never through a
+    // link, which made the file it names this coordinator's bearer, and never
+    // blocking on a FIFO, which held the start (#251).
+    let existing = "";
+    try {
+      existing = readStateFile(coherenceDir, "hook.secret", MAX_SECRET_FILE_BYTES).toString("utf8").trim();
+    } catch (err) {
+      const { code, path: refused } = err as NodeJS.ErrnoException;
+      if (code === "ELOOP") {
+        throw new Error(coherenceDirRefusalMessage({ kind: "link", path: refused ?? path, more: 0 }, coherenceDir));
+      }
+      if (code === NOT_REGULAR) {
+        throw new Error(`ensureSecret: ${path} is not a regular file; remove it, then restart.`);
+      }
+      // Gone since the create failed, or too large to be a secret: both take
+      // the bounded retry below.
+      if (code !== "ENOENT" && code !== "EFBIG") throw err;
+    }
     if (existing.length === SECRET_HEX_LEN) {
       return existing;
     }

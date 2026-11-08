@@ -7,7 +7,8 @@
  *   coordinator writes 2 lines (`pid\nport\n`), the Node coordinator writes 3
  *   (`pid\nport\nbackend=node\n`) — the client must accept both and must
  *   NEVER depend on a `backend=` line existing.
- * - Bearer ← `<root>/.coherence/hook.secret`, trimmed, non-empty.
+ * - Bearer ← `<root>/.coherence/hook.secret`, trimmed, non-empty: a regular
+ *   file, never a link, in a `.coherence` that is no link either (#251).
  * - POST/GET to `http://127.0.0.1:{port}{path}` with `Authorization: Bearer`,
  *   `Host: 127.0.0.1`, JSON content type. Redirects are NOT followed (node:http
  *   doesn't follow them; the bearer never leaves the original request).
@@ -16,10 +17,13 @@
  *   null when not in a git repo or git is missing (caller degrades silently).
  */
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { request } from "node:http";
+import { MAX_SECRET_FILE_BYTES } from "./auth.js";
+import { coherenceDirRefusalMessage } from "./coherence_dir.js";
+import { NOT_REGULAR, readStateFile } from "./disk_content.js";
 
 export class CoordinatorUnavailable extends Error {}
 
@@ -103,20 +107,46 @@ export function readBackendFromPidFile(pidFilePath: string): string | null {
   return backend === '' ? null : backend;
 }
 
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 /** Read port + bearer from `<root>/.coherence/` or throw CoordinatorUnavailable. */
 export function resolveEndpoint(coordinatorRoot: string): CoordinatorEndpoint {
   const coherenceDir = join(coordinatorRoot, ".coherence");
   const pidFile = join(coherenceDir, "server.pid");
   const secretFile = join(coherenceDir, "hook.secret");
 
+  // #251: a linked .coherence is another directory's state, so its server.pid
+  // can name another workspace's coordinator and its hook.secret be that
+  // coordinator's bearer, and a FIFO there would hold this read. Checked
+  // before anything inside it is read.
+  if (isSymlink(coherenceDir)) {
+    throw new CoordinatorUnavailable(
+      coherenceDirRefusalMessage({ kind: "link", path: coherenceDir, more: 0 }, coherenceDir),
+    );
+  }
   const port = readPortFromPidFile(pidFile);
   if (port === null) {
     throw new CoordinatorUnavailable(`no coordinator running for this workspace (no port in ${pidFile})`);
   }
   let bearer: string;
   try {
-    bearer = readFileSync(secretFile, "utf8").trim();
-  } catch {
+    // Never through a link, which sent the file it names as the bearer, and
+    // never blocking on a FIFO, which held every hook and the CLIs.
+    bearer = readStateFile(coherenceDir, "hook.secret", MAX_SECRET_FILE_BYTES).toString("utf8").trim();
+  } catch (err) {
+    const { code, path: refused } = err as NodeJS.ErrnoException;
+    if (code === "ELOOP") {
+      throw new CoordinatorUnavailable(
+        coherenceDirRefusalMessage({ kind: "link", path: refused ?? secretFile, more: 0 }, coherenceDir),
+      );
+    }
+    if (code === NOT_REGULAR) throw new CoordinatorUnavailable(`${secretFile} is not a regular file`);
     throw new CoordinatorUnavailable(`coordinator authentication unavailable (missing ${secretFile})`);
   }
   if (bearer === "") {
