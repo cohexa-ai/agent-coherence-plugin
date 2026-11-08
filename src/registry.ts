@@ -929,8 +929,9 @@ export class ArtifactRegistry {
 
   /**
    * Release an agent's grant by transitioning to INVALID. Does NOT bump
-   * artifact.version — this is for Stop-hook cleanup of uncommitted grants
-   * per KTD-11. Mirrors Python `CoordinatorService.invalidate`.
+   * artifact.version. A holder's own release (Stop, a failed post-edit) goes
+   * through `releaseToReader` instead; this is for a caller that needs the
+   * INVALID end state. Mirrors Python `CoordinatorService.invalidate`.
    *
    * Safe to call on an agent that's already INVALID (no-op).
    */
@@ -952,6 +953,34 @@ export class ArtifactRegistry {
         );
       }
       this.setAgentStateInternal(artifactId, agentId, priorState, MESIState.INVALID, nowTick, trigger);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Rollback failure non-recoverable; surface original error.
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * A holder's own release (Stop, SubagentStop, a failed post-edit): no peer
+   * took anything, so an EXCLUSIVE or MODIFIED holder stays a reader, SHARED
+   * at the version it last observed. Does NOT bump artifact.version. Any
+   * other row is left as it is: a reader stays a reader, a copy a peer's
+   * acquire or commit made INVALID is never restored, and no row is created.
+   * The state is read and written in one transaction, so no peer's write can
+   * land between the two.
+   */
+  releaseToReader(artifactId: string, agentId: string, nowTick: number): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const priorState = this.getAgentState(artifactId, agentId);
+      if (priorState !== null && isWriter(priorState)) {
+        // `null` certifies no new read: the recorded observed version is kept.
+        this.setAgentStateInternal(artifactId, agentId, priorState, MESIState.SHARED, nowTick, "invalidate", null);
+      }
       this.db.exec("COMMIT");
     } catch (err) {
       try {

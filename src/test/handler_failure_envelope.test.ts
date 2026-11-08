@@ -176,7 +176,7 @@ const STUBBED_ROUTES: Array<{
   },
   {
     name: "post-edit's release on success=false",
-    method: "invalidate",
+    method: "releaseToReader",
     path: "/hooks/post-edit",
     body: { session_id: SID_A, path: "CLAUDE.md", success: false },
     holdsExclusive: true,
@@ -215,7 +215,7 @@ test("/hooks/session-stop: a release that raises answers the envelope, not a cle
   const { registry, sessions, request, cleanup } = await makeServer();
   try {
     const { artifactId, agentId } = holdExclusive(registry, sessions, SID_A);
-    failOn(registry, "invalidate", busyError());
+    failOn(registry, "releaseToReader", busyError());
     const r = await request("/hooks/session-stop", { session_id: SID_A });
     assert.equal(r.status, 200);
     assert.deepEqual(r.body, BUSY);

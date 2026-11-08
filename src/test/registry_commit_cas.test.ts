@@ -154,7 +154,7 @@ test("commitCas admits an INVALID caller (parity: Python D4 allows S and I)", ()
     // B acquires E (A → would-be INVALID victim), then B releases without commit.
     registry.grantShared(id, AGENT_A, 40);
     registry.acquireExclusive(id, AGENT_B, 60);
-    registry.invalidate(id, AGENT_B, 70, "session_stop");
+    registry.releaseToReader(id, AGENT_B, 70);
     // A is INVALID, version unchanged, no M/E holder → Python admits: WIN.
     assert.equal(registry.getAgentState(id, AGENT_A), MESIState.INVALID);
     const out = registry.commitCas(id, AGENT_A, 1, HASH_2, 100);

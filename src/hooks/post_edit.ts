@@ -2,8 +2,8 @@
  * POST /hooks/post-edit handler.
  *
  * Mirrors Python `_handle_post_edit` at coordinator_server.py:616 — commit
- * on success (bumps artifact.version), release on failure (invalidate
- * without version bump). Per KTD-1: PreToolUse Edit/Write acquires E;
+ * on success (bumps artifact.version), release on failure (the holder keeps
+ * a read, without version bump). Per KTD-1: PreToolUse Edit/Write acquires E;
  * PostToolUse Edit/Write commits or releases.
  *
  * Wire shape per KTD-B / KTD-B.3 C3:
@@ -84,9 +84,9 @@ export async function handlePostEdit(
   const artifactId = existing.id;
 
   if (!success) {
-    // Tool failure path — release the grant without bumping version.
+    // Tool failure path — release the grant to a read without bumping version.
     try {
-      deps.registry.invalidate(artifactId, agentId, nowTick, "post_edit_failure");
+      deps.registry.releaseToReader(artifactId, agentId, nowTick);
     } catch (err) {
       if (!(err instanceof CoherenceError)) throw err;
       writeJson(res, 200, { ok: false, reason: err.message });

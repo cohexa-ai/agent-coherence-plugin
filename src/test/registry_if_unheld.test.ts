@@ -278,7 +278,7 @@ test("the reclaim record survives a re-read and its invalidation, and clears on 
     f.registry.acquireExclusive(f.id, AGENT_A, T);
     f.registry.acquireExclusiveIfUnheld(f.id, AGENT_B, T + 1800);
     const reclaimed = { trigger: "reclaim_max_hold", tick: T + 1800 };
-    f.registry.invalidate(f.id, AGENT_B, T + 1801, "session_stop");
+    f.registry.releaseToReader(f.id, AGENT_B, T + 1801);
 
     f.registry.grantShared(f.id, AGENT_A, T + 1802);
     assert.deepEqual(reclaimSlot(f.raw, f.id, AGENT_A), reclaimed);
@@ -303,10 +303,10 @@ test("ordinary releases never write a reclaim record", () => {
     f.registry.acquireExclusive(f.id, AGENT_A, T);
     f.registry.acquireExclusive(f.id, AGENT_C, T + 1); // A displaced by an ordinary acquire
     assert.deepEqual(reclaimSlot(f.raw, f.id, AGENT_A), empty);
-    f.registry.invalidate(f.id, AGENT_C, T + 2, "session_stop");
+    f.registry.releaseToReader(f.id, AGENT_C, T + 2);
     assert.deepEqual(reclaimSlot(f.raw, f.id, AGENT_C), empty);
     f.registry.acquireExclusive(f.id, AGENT_B, T + 3);
-    f.registry.invalidate(f.id, AGENT_B, T + 4, "post_edit_failure");
+    f.registry.releaseToReader(f.id, AGENT_B, T + 4);
     assert.deepEqual(reclaimSlot(f.raw, f.id, AGENT_B), empty);
     assertStoreInvariants(f.raw);
   } finally {
