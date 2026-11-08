@@ -7,13 +7,13 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import fs, {
   chmodSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -327,7 +327,13 @@ test(
       mkdirSync(coherenceDir);
       // The bytes 78 ff. Decoded to a string the name re-encodes as 78 ef bf bd,
       // which no lstat finds: only a name kept as bytes keeps the FIFO in view.
-      execFileSync('sh', ['-c', 'mkfifo "$(printf \'x\\377\')"'], { cwd: coherenceDir });
+      // Some mkfifo(1) builds refuse an argument that is not UTF-8, so the FIFO is
+      // made under an ASCII name and renamed to the bytes, which a Buffer path keeps.
+      makeFifo(join(coherenceDir, 'fifo'));
+      renameSync(
+        Buffer.from(join(coherenceDir, 'fifo')),
+        Buffer.concat([Buffer.from(`${coherenceDir}/`), Buffer.from([0x78, 0xff])])
+      );
       assert.deepEqual(readdirSync(coherenceDir, { encoding: 'buffer' }), [
         Buffer.from([0x78, 0xff]),
       ]);
