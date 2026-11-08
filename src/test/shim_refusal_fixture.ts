@@ -55,7 +55,7 @@ export function shimRefusal(name: string, kind: ShimRefusalKind): ShimAnswer {
   const why = `${name} ${REASONS[kind].what}`;
   const fix = fixFor(name, kind);
   const answer = {
-    systemMessage: `agent-coherence is off for this session: ${why}. ${fix}`,
+    systemMessage: `agent-coherence started no coordinator for this session: ${why}. ${fix}`,
     hookSpecificOutput: {
       hookEventName: 'SessionStart',
       // Only what the shim knows: a coordinator already running for the

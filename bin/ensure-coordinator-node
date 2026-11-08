@@ -94,7 +94,7 @@ refuse_coherence_dir() {   # 0 = refused (JSON printed), 1 = go on
     *) why="$name is a FIFO, socket or device"; fix="Remove it, then start a new session." ;;
   esac
   echo "agent-coherence: not starting the coordinator: $why. $fix" >&2
-  printf '{"systemMessage":"agent-coherence is off for this session: %s. %s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"agent-coherence did not start a coordinator at this session start, because %s. Hooks may still answer from a coordinator already running for this workspace: treat any warning or deny they give as real, and do not assume edits are coordinated otherwise. Tell the user."}}\n' "$why" "$fix" "$why"
+  printf '{"systemMessage":"agent-coherence started no coordinator for this session: %s. %s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"agent-coherence did not start a coordinator at this session start, because %s. Hooks may still answer from a coordinator already running for this workspace: treat any warning or deny they give as real, and do not assume edits are coordinated otherwise. Tell the user."}}\n' "$why" "$fix" "$why"
   return 0
 }
 # <<< coherence-dir-check
