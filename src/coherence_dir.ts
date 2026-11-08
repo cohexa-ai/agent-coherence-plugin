@@ -55,34 +55,59 @@ export function checkCoherenceDir(coherenceDir: string): CoherenceDirRefusal | n
   };
 }
 
+type EntryKind = 'link' | 'special' | null;
+
 function offendingEntries(coherenceDir: string): { links: Buffer[]; specials: Buffer[] } {
   const links: Buffer[] = [];
   const specials: Buffer[] = [];
+  for (const { name, kind } of classifiedEntries(coherenceDir)) {
+    if (kind === 'link') links.push(name);
+    else if (kind === 'special') specials.push(name);
+  }
+  return { links: links.sort(Buffer.compare), specials: specials.sort(Buffer.compare) };
+}
+
+/** Each entry directly inside `coherenceDir` and what it is; none once `coherenceDir` is gone. */
+function classifiedEntries(coherenceDir: string): Array<{ name: Buffer; kind: EntryKind }> {
   // Buffer names: on Linux a name that is not UTF-8 would decode to a string no lstat can find.
   let entries: Dirent<Buffer>[];
   try {
     entries = readdirSync(coherenceDir, { withFileTypes: true, encoding: 'buffer' });
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { links, specials };
-    throw err;
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    // On a file system that reports no entry type the listing lstats each
+    // entry itself, so one entry removed meanwhile fails all of it. Listing
+    // the names alone touches no entry: its ENOENT is .coherence itself.
+    return namesOnly(coherenceDir).map((name) => ({ name, kind: lstatKind(coherenceDir, name) }));
   }
-  for (const entry of entries) {
-    const kind = entryKind(coherenceDir, entry);
-    if (kind === 'link') links.push(entry.name);
-    else if (kind === 'special') specials.push(entry.name);
-  }
-  return { links: links.sort(Buffer.compare), specials: specials.sort(Buffer.compare) };
+  return entries.map((entry) => ({ name: entry.name, kind: entryKind(coherenceDir, entry) }));
 }
 
-function entryKind(coherenceDir: string, entry: Dirent<Buffer>): 'link' | 'special' | null {
+function namesOnly(coherenceDir: string): Buffer[] {
+  try {
+    return readdirSync(coherenceDir, { encoding: 'buffer' });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+}
+
+function entryKind(coherenceDir: string, entry: Dirent<Buffer>): EntryKind {
   if (entry.isSymbolicLink()) return 'link';
   if (entry.isFile() || entry.isDirectory()) return null;
   // A FIFO, socket or device by its directory entry, or a file system that
-  // reports no type: lstat decides, and an entry gone since the listing (a
-  // policy file's temporary copy renamed away) is not counted.
+  // reports no type: lstat decides.
+  return lstatKind(coherenceDir, entry.name);
+}
+
+/**
+ * What lstat finds at `name`. An entry gone since the listing (a policy
+ * file's temporary copy renamed away) is not counted.
+ */
+function lstatKind(coherenceDir: string, name: Buffer): EntryKind {
   let info;
   try {
-    info = lstatSync(Buffer.concat([Buffer.from(`${coherenceDir}/`), entry.name]));
+    info = lstatSync(Buffer.concat([Buffer.from(`${coherenceDir}/`), name]));
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw err;

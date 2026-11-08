@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+import fs, {
   chmodSync,
   linkSync,
   mkdirSync,
@@ -16,6 +16,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -159,6 +160,66 @@ test(
     });
   }
 );
+
+type Listing = (path: string, options?: { withFileTypes?: boolean; encoding?: string }) => unknown;
+
+/**
+ * Runs `fn` with `readdirSync` replaced, for every module that imports it from
+ * node:fs, by what `stub` makes of the real one; then puts the real one back.
+ */
+function withListing(stub: (real: Listing) => Listing, fn: () => void): void {
+  const real = fs.readdirSync;
+  fs.readdirSync = stub(real as unknown as Listing) as unknown as typeof fs.readdirSync;
+  syncBuiltinESMExports();
+  try {
+    fn();
+  } finally {
+    fs.readdirSync = real;
+    syncBuiltinESMExports();
+  }
+}
+
+test('checkCoherenceDir still refuses a link when another entry vanishes while the listing reads entry types', () => {
+  // On a file system that reports no entry type, a listing with file types
+  // lstats each entry itself, so one entry removed in between (a stopping
+  // coordinator's state.db-shm) fails the whole listing with ENOENT while
+  // .coherence is still there. Only that entry is gone; the link is not.
+  withRoot((root, coherenceDir) => {
+    mkdirSync(coherenceDir);
+    writeFileSync(join(coherenceDir, 'tracked.yaml'), '');
+    symlinkSync(join(root, 'gone'), join(coherenceDir, 'state.db'));
+    const vanished = join(coherenceDir, 'state.db-shm');
+    const listing = (real: Listing): Listing => (path, options) => {
+      if (options?.withFileTypes) {
+        throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${vanished}'`), {
+          code: 'ENOENT',
+          syscall: 'lstat',
+          path: vanished,
+        });
+      }
+      // Names alone, the vanished one among them: listed, then gone before its lstat.
+      return [...(real(path, options) as Buffer[]), Buffer.from('state.db-shm')];
+    };
+    withListing(listing, () => {
+      assert.deepEqual(checkCoherenceDir(coherenceDir), refusal('link', join(coherenceDir, 'state.db')));
+    });
+  });
+});
+
+test('checkCoherenceDir passes a .coherence that is gone by the time it is listed', () => {
+  // A start then creates it as a real directory.
+  withRoot((root, coherenceDir) => {
+    mkdirSync(coherenceDir);
+    symlinkSync(join(root, 'gone'), join(coherenceDir, 'state.db'));
+    const listing = (real: Listing): Listing => (path, options) => {
+      rmSync(coherenceDir, { recursive: true, force: true });
+      return real(path, options);
+    };
+    withListing(listing, () => {
+      assert.equal(checkCoherenceDir(coherenceDir), null);
+    });
+  });
+});
 
 /** Generous for a loaded host: the child's own start-up counts against it, not only the check. */
 const CHILD_TIMEOUT_MS = 30_000;
