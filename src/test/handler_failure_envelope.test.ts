@@ -225,6 +225,56 @@ test("/hooks/session-stop: a release that raises answers the envelope, not a cle
   }
 });
 
+test("/hooks/session-stop and a failed /hooks/post-edit: a locked store keeps the grant, and a retry releases it to a read", async () => {
+  const { registry, sessions, request, cleanup, root } = await makeServer();
+  try {
+    const { artifactId, agentId } = holdExclusive(registry, sessions, SID_A);
+    const failedEdit = { session_id: SID_A, path: "CLAUDE.md", success: false };
+    await whileStoreLocked(root, async () => {
+      assert.deepEqual((await request("/hooks/session-stop", { session_id: SID_A })).body, BUSY);
+      assert.deepEqual((await request("/hooks/post-edit", failedEdit)).body, BUSY);
+    });
+    assert.equal(registry.getAgentState(artifactId, agentId), MESIState.EXCLUSIVE);
+
+    assert.deepEqual((await request("/hooks/post-edit", failedEdit)).body, { ok: true, released: true });
+    assert.equal(registry.getAgentState(artifactId, agentId), MESIState.SHARED);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("/hooks/session-stop: a release that raises partway leaves earlier files read and later ones held, and the next stop finishes", async () => {
+  const { registry, sessions, request, cleanup } = await makeServer();
+  try {
+    const agentId = sessions.registerSession(SID_A);
+    const first = registry.resolveOrRegisterArtifact("a.md", HASH_1);
+    const second = registry.resolveOrRegisterArtifact("b.md", HASH_1);
+    registry.acquireExclusive(first, agentId, 10);
+    registry.acquireExclusive(second, agentId, 10);
+    const release = registry.releaseToReader.bind(registry);
+    Object.defineProperty(registry, "releaseToReader", {
+      configurable: true,
+      value: (artifactId: string, agent: string, nowTick: number) => {
+        if (artifactId === second) throw busyError();
+        release(artifactId, agent, nowTick);
+      },
+    });
+
+    assert.deepEqual((await request("/hooks/session-stop", { session_id: SID_A })).body, BUSY);
+    assert.equal(registry.getAgentState(first, agentId), MESIState.SHARED);
+    assert.equal(registry.getAgentState(second, agentId), MESIState.EXCLUSIVE);
+
+    Object.defineProperty(registry, "releaseToReader", { configurable: true, value: release });
+    assert.deepEqual((await request("/hooks/session-stop", { session_id: SID_A })).body, {
+      ok: true,
+      released_artifacts: ["b.md"],
+    });
+    assert.equal(registry.getAgentState(second, agentId), MESIState.SHARED);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("/hooks/post-edit and /hooks/pre-edit: a registry row it cannot read answers the envelope, not a refusal (#214)", async () => {
   const { registry, sessions, request, cleanup, root } = await makeServer();
   try {

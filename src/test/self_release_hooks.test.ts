@@ -7,6 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,6 +54,12 @@ async function makeServer() {
     });
     return (await res.json()) as Record<string, unknown>;
   };
+  const get = async (path: string) => {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      headers: { Authorization: `Bearer ${SECRET}`, Host: "127.0.0.1" },
+    });
+    return (await res.json()) as Record<string, unknown>;
+  };
   const cleanup = () =>
     new Promise<void>((r) => {
       server.close(() => {
@@ -61,7 +68,7 @@ async function makeServer() {
         r();
       });
     });
-  return { registry, sessions, post, cleanup };
+  return { registry, sessions, post, get, cleanup, root: tmp };
 }
 
 type Server = Awaited<ReturnType<typeof makeServer>>;
@@ -150,6 +157,64 @@ test("SubagentStop leaves the subagent a reader and the parent's rows untouched"
       content_hash: HASH_2,
     });
     assert.deepEqual(read, { status: "fresh" });
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("after a Stop, /status lists the session as a reader of the file it released", async () => {
+  const s = await makeServer();
+  try {
+    await editAndCommit(s, { session_id: SID_A, path: STRICT }, HASH_2);
+    await s.post("/hooks/session-stop", { session_id: SID_A });
+
+    const status = await s.get("/status");
+    const rows = status.sessions as Array<{ agent_id: string; states: Record<string, string> }>;
+    const mine = rows.find((row) => row.agent_id === sessionToAgentId(SID_A));
+    assert.deepEqual(mine?.states, { [STRICT]: MESIState.SHARED });
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("after a Stop, a shell read and a grep of the session's own strict file are fresh", async () => {
+  const s = await makeServer();
+  try {
+    await editAndCommit(s, { session_id: SID_A, path: STRICT }, HASH_2);
+    await s.post("/hooks/session-stop", { session_id: SID_A });
+
+    assert.deepEqual(await s.post("/hooks/pre-bash", { session_id: SID_A, command: `cat ${STRICT}` }), {
+      status: "fresh",
+    });
+    assert.deepEqual(await s.post("/hooks/pre-grep", { session_id: SID_A, search_root: "" }), { status: "fresh" });
+    assert.equal(stateOf(s, STRICT, sessionToAgentId(SID_A)), MESIState.SHARED);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("an edit that reached the disk but never committed reads as a change outside the coordinator after a Stop", async () => {
+  const s = await makeServer();
+  try {
+    s.registry.resolveOrRegisterArtifact(STRICT, HASH_1);
+    assert.equal((await s.post("/hooks/pre-edit", { session_id: SID_A, path: STRICT })).ok, true);
+    // The edit lands on disk; its post-edit never reaches the coordinator.
+    const bytes = "edited by session A\n";
+    writeFileSync(join(s.root, STRICT), bytes, "utf8");
+    const diskHash = createHash("sha256").update(bytes).digest("hex");
+    assert.deepEqual(await s.post("/hooks/session-stop", { session_id: SID_A }), {
+      ok: true,
+      released_artifacts: [STRICT],
+    });
+
+    const read = await s.post("/hooks/pre-read", { session_id: SID_A, path: STRICT, content_hash: diskHash });
+    const reason = denyReason(read);
+    assert.match(reason, /^Stale read denied: plan\.md on disk no longer matches v1, /);
+    assert.ok(reason.includes("Do not restore or overwrite plan.md"), reason);
+    const edit = await s.post("/hooks/pre-edit", { session_id: SID_A, path: STRICT });
+    assert.equal(edit.ok, true);
+    assert.equal(edit.disk_differs, true);
+    assert.equal(stateOf(s, STRICT, sessionToAgentId(SID_A)), MESIState.EXCLUSIVE);
   } finally {
     await s.cleanup();
   }

@@ -23,6 +23,7 @@ interface Fixture {
   registry: ArtifactRegistry;
   id: string;
   raw: Database;
+  dbPath: string;
   cleanup: () => void;
 }
 
@@ -36,6 +37,7 @@ function makeFixture(): Fixture {
     registry,
     id,
     raw,
+    dbPath,
     cleanup: () => {
       raw.close();
       registry.close();
@@ -86,6 +88,41 @@ test("a MODIFIED holder's release leaves it SHARED at the version it committed",
     assert.equal(f.registry.lastObservedVersionFor(f.id, AGENT_A), 2);
     assert.equal(f.registry.getArtifactById(f.id)!.version, 2);
   } finally {
+    f.cleanup();
+  }
+});
+
+test("a peer's write cannot land between the release reading the holder's row and writing it", () => {
+  const f = makeFixture();
+  const peer = new BetterSqlite3(f.dbPath, { timeout: 0 });
+  try {
+    f.registry.acquireExclusive(f.id, AGENT_A, 10);
+    // Right after the release reads A's row, another connection tries to make
+    // A's copy stale. Read inside the release's transaction, it must be refused.
+    const peerWrites: Array<"landed" | "refused"> = [];
+    const read = f.registry.getAgentState.bind(f.registry);
+    Object.defineProperty(f.registry, "getAgentState", {
+      configurable: true,
+      value: (artifactId: string, agentId: string) => {
+        const state = read(artifactId, agentId);
+        try {
+          peer
+            .prepare(`UPDATE agent_states SET state = 'INVALID' WHERE artifact_id = ? AND agent_id = ?`)
+            .run(artifactId, agentId);
+          peerWrites.push("landed");
+        } catch {
+          peerWrites.push("refused");
+        }
+        return state;
+      },
+    });
+
+    f.registry.releaseToReader(f.id, AGENT_A, 20);
+
+    assert.deepEqual(peerWrites, ["refused"]);
+    assert.equal(read(f.id, AGENT_A), MESIState.SHARED);
+  } finally {
+    peer.close();
     f.cleanup();
   }
 });
