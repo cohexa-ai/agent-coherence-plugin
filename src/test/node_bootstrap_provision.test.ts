@@ -25,13 +25,17 @@ import {
   existsSync,
   readFileSync,
   renameSync,
+  lstatSync,
+  readlinkSync,
 } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeExecutable } from './executable_fixture.js';
+import { makeFifo, runCommandBounded } from './fifo_fixture.js';
 import { LOCK_MODULE_URL, holdPidFileLock, killAndWait } from './pid_lock_fixture.js';
+import { shimRefusal } from './shim_refusal_fixture.js';
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -666,6 +670,214 @@ test("an operator's existing coordinator_backend file is never overwritten by th
   } finally {
     rmSync(root, { recursive: true, force: true });
     cleanup();
+  }
+});
+
+// --- .coherence check (#251) -------------------------------------------------
+
+/**
+ * A start the check refuses lstats and lists only, so it answers in well under
+ * a second; this only has to tell it from a start held on a FIFO.
+ */
+const AT_ONCE_MS = 5_000;
+
+/** A coordinator that never serves and goes away on its own: for starts that must never spawn one. */
+const SHORT_LIVED_JS = 'setTimeout(() => {}, 20_000);\n';
+
+/** What is at `path`, without following a link there. */
+function entryAt(path: string): string {
+  let info;
+  try {
+    info = lstatSync(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+    throw err;
+  }
+  if (info.isSymbolicLink()) return `link to ${readlinkSync(path)}`;
+  if (info.isFIFO()) return 'FIFO';
+  return `file ${JSON.stringify(readFileSync(path, 'utf8'))}`;
+}
+
+test('the bootstrap refuses a linked server.pid, coordinator_backend, state.db or .coherence before it reads, joins or writes anything', async () => {
+  // A repository can commit these links (cohexa-ai/agent-coherence#498).
+  // Before, the bootstrap joined the coordinator another workspace's pid file
+  // names, waited for good on a FIFO behind server.pid, and stamped the backend
+  // through a dangling link, creating the file it names.
+  const base = mkdtempSync(join(tmpdir(), 'provision-refused-'));
+  const theirs = join(base, 'other', '.coherence', 'server.pid');
+  mkdirSync(dirname(theirs), { recursive: true });
+  const fifo = join(base, 'pipe');
+  makeFifo(fifo);
+  const store = join(base, 'store');
+  writeFileSync(store, 'theirs');
+  // Only its own row releases the FIFO: a row that finished first must not let a held one go on.
+  const rows = [
+    { where: "server.pid linked to a serving coordinator's", entry: '.coherence/server.pid', target: theirs, pinned: true, fifos: [] },
+    { where: 'server.pid linked to a FIFO', entry: '.coherence/server.pid', target: fifo, pinned: true, fifos: [fifo] },
+    // Run as Claude Code runs it, in $PWD.
+    { where: 'a dangling coordinator_backend link', entry: '.coherence/coordinator_backend', target: join(base, 'gone'), pinned: false, fifos: [] },
+    // Its way out moves the store's -wal and -shm with it.
+    { where: 'a linked state.db', entry: '.coherence/state.db', target: store, pinned: true, fifos: [] },
+    // Its way out is a real directory, not a copy of a file.
+    { where: 'a dangling .coherence link', entry: '.coherence', target: join(base, 'gone-dir'), pinned: true, fifos: [] },
+  ].map((row) => {
+    const root = makeStubRoot({ prebuiltDistJs: SHORT_LIVED_JS });
+    const dirs = makeDirs();
+    const link = join(dirs.ws, row.entry);
+    mkdirSync(dirname(link), { recursive: true });
+    symlinkSync(row.target, link);
+    return { ...row, ...dirs, root, link };
+  });
+  // Another workspace's coordinator, serving.
+  const holder = await holdPidFileLock(theirs, { publish: 'PID\n4242\nbackend=node\n' });
+  try {
+    const before = rows.map((row) => entryAt(row.target));
+    const runs = rows.map(async (row) => {
+      const run = await runCommandBounded('bash', [join(row.root, 'bin', 'ensure-coordinator-node')], {
+        cwd: row.ws,
+        env: {
+          ...process.env,
+          AGENT_COHERENCE_WORKSPACE: row.pinned ? row.ws : undefined,
+          CLAUDE_PLUGIN_ROOT: row.root,
+          CLAUDE_PLUGIN_DATA: row.data,
+        } as NodeJS.ProcessEnv,
+        timeoutMs: AT_ONCE_MS,
+        fifos: row.fifos,
+      });
+      return [row.where, { ...run, link: entryAt(row.link), target: entryAt(row.target) }] as const;
+    });
+    const seen = Object.fromEntries(await Promise.all(runs));
+    assert.deepEqual(
+      seen,
+      Object.fromEntries(
+        rows.map((row, i) => [
+          row.where,
+          {
+            timedOut: false,
+            ...shimRefusal(row.entry, 'link'),
+            link: `link to ${row.target}`,
+            target: before[i],
+          },
+        ])
+      )
+    );
+  } finally {
+    await killAndWait(holder);
+    for (const row of rows) {
+      rmSync(row.root, { recursive: true, force: true });
+      row.cleanup();
+    }
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A coordinator that serves at once and goes away on its own. With `linkTarget`
+ * it first plants a link to it at coordinator_backend: after the start check,
+ * before the backend stamp.
+ */
+function servingCoordinatorJs(linkTarget?: string): string {
+  return (
+    'import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";\n' +
+    'const dir = (process.env.AGENT_COHERENCE_WORKSPACE ?? process.cwd()) + "/.coherence";\n' +
+    'mkdirSync(dir, { recursive: true });\n' +
+    (linkTarget === undefined
+      ? ''
+      : `symlinkSync(${JSON.stringify(linkTarget)}, dir + "/coordinator_backend");\n`) +
+    'writeFileSync(dir + "/server.pid", `${process.pid}\\n0\\nbackend=node\\n`);\n' +
+    'setTimeout(() => {}, 20_000);\n'
+  );
+}
+
+/**
+ * A bin directory whose `mkdir`, once it has made `ws`/.coherence, plants a
+ * link to `linkTarget` at coordinator_backend: between the stamp's own test
+ * and its write.
+ */
+function mkdirThatPlants(ws: string, linkTarget: string): string {
+  const bin = mkdtempSync(join(tmpdir(), 'provision-mkdir-'));
+  const coherenceDir = join(ws, '.coherence');
+  writeExecutable(
+    join(bin, 'mkdir'),
+    '#!/usr/bin/env bash\n' +
+      '/bin/mkdir "$@" || exit\n' +
+      'for last in "$@"; do :; done\n' +
+      `if [ "\${last:-}" = ${JSON.stringify(coherenceDir)} ]; then\n` +
+      `  ln -s ${JSON.stringify(linkTarget)} ${JSON.stringify(join(coherenceDir, 'coordinator_backend'))}\n` +
+      'fi\n'
+  );
+  return bin;
+}
+
+test('the first-provision stamp follows no link planted after the start check, and waits on no FIFO', async () => {
+  // The stamp runs once a coordinator serves, seconds after the start check.
+  // Before, a dangling link at coordinator_backend by then had "node" written
+  // through it, creating the file it names, and a link to a FIFO held the
+  // session start until something read the FIFO.
+  const base = mkdtempSync(join(tmpdir(), 'provision-stamp-'));
+  const fifo = join(base, 'pipe');
+  makeFifo(fifo);
+  const rows = [
+    { where: 'a dangling link the coordinator plants as it starts', target: join(base, 'gone-1'), by: 'coordinator', fifos: [] },
+    { where: "a dangling link planted between the stamp's test and its write", target: join(base, 'gone-2'), by: 'mkdir', fifos: [] },
+    { where: 'a link to a FIFO the coordinator plants as it starts', target: fifo, by: 'coordinator', fifos: [fifo] },
+  ].map((row) => {
+    const root = makeStubRoot({
+      prebuiltDistJs: servingCoordinatorJs(row.by === 'coordinator' ? row.target : undefined),
+    });
+    const dirs = makeDirs();
+    const bin = row.by === 'mkdir' ? mkdirThatPlants(dirs.ws, row.target) : undefined;
+    return { ...row, ...dirs, root, bin, link: join(dirs.ws, '.coherence', 'coordinator_backend') };
+  });
+  const runs: Array<{ stderr: string }> = [];
+  try {
+    const before = rows.map((row) => entryAt(row.target));
+    const outcomes = rows.map(async (row) => {
+      const run = await runCommandBounded('bash', [join(row.root, 'bin', 'ensure-coordinator-node')], {
+        cwd: row.ws,
+        env: {
+          ...process.env,
+          PATH: row.bin === undefined ? process.env.PATH : `${row.bin}:${process.env.PATH ?? ''}`,
+          AGENT_COHERENCE_WORKSPACE: row.ws,
+          CLAUDE_PLUGIN_ROOT: row.root,
+          CLAUDE_PLUGIN_DATA: row.data,
+        } as NodeJS.ProcessEnv,
+        // The whole provision runs first; this only has to tell a finished
+        // start from one held on the FIFO.
+        timeoutMs: 60_000,
+        fifos: row.fifos,
+      });
+      runs.push(run);
+      return [
+        row.where,
+        {
+          timedOut: run.timedOut,
+          status: run.status,
+          spawned: /spawned Node coordinator \(pid=/.test(run.stderr),
+          link: entryAt(row.link),
+          target: entryAt(row.target),
+        },
+      ] as const;
+    });
+    const seen = Object.fromEntries(await Promise.all(outcomes));
+    assert.deepEqual(
+      seen,
+      Object.fromEntries(
+        rows.map((row, i) => [
+          row.where,
+          { timedOut: false, status: 0, spawned: true, link: `link to ${row.target}`, target: before[i] },
+        ])
+      ),
+      runs.map((run) => run.stderr).join('\n')
+    );
+  } finally {
+    for (const run of runs) killSpawned(run.stderr);
+    for (const row of rows) {
+      if (row.bin !== undefined) rmSync(row.bin, { recursive: true, force: true });
+      rmSync(row.root, { recursive: true, force: true });
+      row.cleanup();
+    }
+    rmSync(base, { recursive: true, force: true });
   }
 });
 

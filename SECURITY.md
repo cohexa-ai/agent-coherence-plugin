@@ -11,7 +11,7 @@ distribution surface (Claude Code plugin marketplace vs. PyPI).
 
 The plugin runs a lazy-spawned local HTTP coordinator at `127.0.0.1:<port>`
 under `<repo>/.coherence/`. The trust boundary is **single-OS-user,
-single-host workstation**. Within that boundary, two adversaries are
+single-host workstation**. Within that boundary, three adversaries are
 explicitly modeled (see also `src/auth.ts` top docstring, which is the
 authoritative source for the auth design):
 
@@ -43,6 +43,54 @@ layer rejects on Host header alone before the auth check runs.
 like `attacker.example.com`) returns 401 before token comparison. This is
 the standard defense for local HTTP services exposed to a browser-capable
 machine.
+
+### Adversary 3 — a repository you clone
+
+Whoever wrote a repository you clone, or an archive you unpack. They run no
+code, but they choose every path in the tree, and a clone checks out entries
+under `.coherence/` like any others, so `.coherence` itself, or any file in
+it, can arrive as a symbolic link. A session start and the coordinator used
+to read and write through such a link: a start could keep its state in a
+directory outside the workspace, overwrite or create the file a link names,
+take that file's bytes as the bearer secret, join the coordinator a linked
+`server.pid` names, or block on a FIFO a link names, which held the session
+start or a hook until it timed out.
+
+**Mitigation**: before it reads or writes anything under `.coherence`, the
+session start (`bin/ensure-coordinator-dispatch` on either backend, and
+`bin/ensure-coordinator-node`) checks that `.coherence` is absent or a real
+directory, and that nothing directly inside it is a symbolic link, a FIFO, a
+socket or a device. The Node coordinator makes the same check at start
+(`src/coherence_dir.ts`, called from `src/coordinator.ts`) before it creates,
+locks or writes anything. Both only test file types and list the directory:
+they open no file there, so nothing they find can block them. A refused
+session start starts no coordinator and tells you and the model so, and a
+refused coordinator exits with status 2. A directory mounted at
+`.coherence` is a real directory and passes. For a link made after the
+check:
+
+- the coordinator, the hook client and the CLIs read `hook.secret` without
+  following a link, without blocking and from a regular file only, and the
+  hook client refuses a `.coherence` that is a link before it reads anything
+  inside it;
+- the coordinator reads the policy files the same way (`src/disk_content.ts`),
+  so a track or untrack over a linked policy file answers HTTP 400, and a
+  linked policy file loads as no entries;
+- the coordinator creates `.gitignore`, and the first Node-backend session on
+  a fresh workspace writes `coordinator_backend`, only where nothing is at
+  that name.
+
+Not covered:
+
+- A repository that commits regular files under `.coherence`. That is out of
+  scope here.
+- A link made after the check while a coordinator runs, for example by a
+  checkout. The reads above refuse one where they apply, and the next start
+  refuses the workspace; nothing looks for one in between.
+- A link at the workspace root or above it. Only `.coherence` and the entries
+  directly inside it are checked.
+- The read of `.coherence/server.pid` by the hook client and the CLIs, which
+  start no coordinator. It still follows a link there.
 
 ### Out of scope
 
@@ -98,6 +146,11 @@ The coordinator's state directory is `<repo>/.coherence/`. Contents:
 | `server.pid` | Coordinator process discovery | default | Port + PID of the lazy-spawned coordinator |
 | `tracked.yaml` | User-committed opt-in patterns | default | Glob patterns: path globs with `**`, Python `fnmatch` without (see the README) |
 | `ignored.yaml` | User-committed opt-out patterns | default | Glob patterns, as `tracked.yaml` |
+
+`.coherence` must be a real directory (a directory mounted there is fine),
+and none of these files, nor anything else directly inside it, may be a
+symbolic link, a FIFO, a socket or a device: a session start refuses the
+workspace otherwise (see Adversary 3).
 
 **Content-hash-only invariant**: `state.db` stores SHA-256 content
 hashes, never file bytes. A read attacker who exfiltrates `state.db` learns

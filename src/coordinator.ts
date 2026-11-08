@@ -21,10 +21,11 @@
  *   - /status three-tier (KTD-K)
  *   - hook handler routes (Unit 3)
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { hostname } from "node:os";
 import { ensureSecret } from "./auth.js";
+import { checkCoherenceDir, coherenceDirRefusalMessage, EXIT_REFUSED } from "./coherence_dir.js";
 import { createServer, BIND_HOST } from "./server.js";
 import { ArtifactRegistry } from "./registry.js";
 import { PolicyRef } from "./policy.js";
@@ -36,7 +37,6 @@ interface Workspace {
   root: string;
   coherenceDir: string;
   pidFile: string;
-  portFile: string;
   databasePath: string;
 }
 
@@ -47,7 +47,6 @@ function resolveWorkspace(): Workspace {
     root,
     coherenceDir,
     pidFile: join(coherenceDir, "server.pid"),
-    portFile: join(coherenceDir, "server.port"),
     databasePath: join(coherenceDir, "state.db"),
   };
 }
@@ -68,11 +67,6 @@ function readFileOrNull(path: string): string | null {
   }
 }
 
-function writePortFile(portFile: string, port: number): void {
-  // Mirror Python coordinator's <workspace>/.coherence/server.port (single-line port).
-  writeFileSync(portFile, `${port}\n`, { mode: 0o600 });
-}
-
 function logInfo(message: string): void {
   // Stderr-only logging per Claude Code hook conventions; stdout is reserved
   // for hook response JSON (when invoked as a hook command). The coordinator
@@ -88,6 +82,15 @@ async function main(): Promise<void> {
   const version = readPackageVersion();
   const workspace = resolveWorkspace();
 
+  // #251: before anything below creates, locks or writes under .coherence.
+  // Each of those follows a link, so a repository that commits one there
+  // would choose where they land; a refused start changes nothing.
+  const refusal = checkCoherenceDir(workspace.coherenceDir);
+  if (refusal !== null) {
+    logInfo(coherenceDirRefusalMessage(refusal, workspace.coherenceDir));
+    process.exitCode = EXIT_REFUSED;
+    return;
+  }
   mkdirSync(workspace.coherenceDir, { recursive: true, mode: 0o700 });
   // #217: one coordinator per workspace. Locked before anything else here
   // touches the workspace, so a start that loses leaves the store and the
@@ -111,10 +114,13 @@ async function main(): Promise<void> {
   // state.db (MESI state + agent UUIDs), hook.secret (a credential), or
   // server.pid. Mirrors lifecycle._ensure_coherence_dir in the library's
   // Python coordinator. Idempotent — only write if missing so operator
-  // customizations are never clobbered.
+  // customizations are never clobbered. "wx" creates it exclusively, which
+  // also fails on a link, dangling or not, planted since the check above.
   const gitignorePath = join(workspace.coherenceDir, ".gitignore");
-  if (!existsSync(gitignorePath)) {
-    writeFileSync(gitignorePath, "*\n", { mode: 0o600 });
+  try {
+    writeFileSync(gitignorePath, "*\n", { mode: 0o600, flag: "wx" });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
   }
   const secret = ensureSecret(workspace.coherenceDir);
 
@@ -149,9 +155,8 @@ async function main(): Promise<void> {
   });
 
   // What this coordinator published, once it has: on shutdown an unlocked
-  // coordinator touches the files only while they are still these.
+  // coordinator touches server.pid only while it still holds this.
   let publishedPidFile: string | null = null;
-  let publishedPortFile: string | null = null;
 
   // Bind to ephemeral port on loopback. Per KTD-A.5 + Open Questions:
   // BIND_HOST = "127.0.0.1" is a code-level invariant; no operator override.
@@ -173,11 +178,9 @@ async function main(): Promise<void> {
       // Through the locked descriptor: the lock is on this inode.
       publishedPidFile = pidFileContent(process.pid, port, "node");
       rewritePidFile(pidLock.fd, publishedPidFile);
-      writePortFile(workspace.portFile, port);
-      publishedPortFile = `${port}\n`;
     } catch (err) {
       process.stderr.write(
-        `agent-coherence-coordinator: fatal: failed to write pid/port file: ${String(err)}\n`,
+        `agent-coherence-coordinator: fatal: failed to write pid file: ${String(err)}\n`,
       );
       process.exit(1);
     }
@@ -186,16 +189,16 @@ async function main(): Promise<void> {
     logInfo(`workspace=${workspace.root}; pid_file=${workspace.pidFile}`);
   });
 
-  // Graceful shutdown. Drops the port from server.pid and removes server.port
-  // so peer hook clients see no stale references; closes the HTTP server
+  // Graceful shutdown. Drops the port from server.pid so peer hook clients
+  // see no stale reference; closes the HTTP server
   // (in-flight requests get drained by Node's default close-on-idle behavior
   // — Unit 5 lands the explicit in-flight semaphore drain per KTD-I).
   // A locked server.pid stays: the lock is on its inode, and the next
   // coordinator must lock the same file (#217). Its port goes before the exit
   // releases the lock, as on the Python coordinator, so a start that takes
-  // the lock next finds no port to dial. Unlocked, both files are removed as
-  // before #217, and only while they still hold what this coordinator wrote:
-  // they may be another coordinator's.
+  // the lock next finds no port to dial. Unlocked, server.pid is removed as
+  // before #217, and only while it still holds what this coordinator wrote:
+  // it may be another coordinator's.
   const shutdown = (signal: NodeJS.Signals): void => {
     logInfo(`shutting down on ${signal}`);
     const holdsLock = pidLock.state === "held";
@@ -211,15 +214,6 @@ async function main(): Promise<void> {
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
           logInfo(`unlink pidFile failed: ${String(err)}`);
-        }
-      }
-    }
-    if (publishedPortFile !== null && (holdsLock || readFileOrNull(workspace.portFile) === publishedPortFile)) {
-      try {
-        unlinkSync(workspace.portFile);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-          logInfo(`unlink portFile failed: ${String(err)}`);
         }
       }
     }
