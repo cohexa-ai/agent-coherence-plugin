@@ -7,11 +7,13 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs, {
   chmodSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -189,19 +191,24 @@ test('checkCoherenceDir still refuses a link when another entry vanishes while t
     writeFileSync(join(coherenceDir, 'tracked.yaml'), '');
     symlinkSync(join(root, 'gone'), join(coherenceDir, 'state.db'));
     const vanished = join(coherenceDir, 'state.db-shm');
-    const listing = (real: Listing): Listing => (path, options) => {
-      if (options?.withFileTypes) {
-        throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${vanished}'`), {
-          code: 'ENOENT',
-          syscall: 'lstat',
-          path: vanished,
-        });
-      }
-      // Names alone, the vanished one among them: listed, then gone before its lstat.
-      return [...(real(path, options) as Buffer[]), Buffer.from('state.db-shm')];
-    };
+    const listing =
+      (real: Listing): Listing =>
+      (path, options) => {
+        if (options?.withFileTypes) {
+          throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${vanished}'`), {
+            code: 'ENOENT',
+            syscall: 'lstat',
+            path: vanished,
+          });
+        }
+        // Names alone, the vanished one among them: listed, then gone before its lstat.
+        return [...(real(path, options) as Buffer[]), Buffer.from('state.db-shm')];
+      };
     withListing(listing, () => {
-      assert.deepEqual(checkCoherenceDir(coherenceDir), refusal('link', join(coherenceDir, 'state.db')));
+      assert.deepEqual(
+        checkCoherenceDir(coherenceDir),
+        refusal('link', join(coherenceDir, 'state.db'))
+      );
     });
   });
 });
@@ -211,10 +218,12 @@ test('checkCoherenceDir passes a .coherence that is gone by the time it is liste
   withRoot((root, coherenceDir) => {
     mkdirSync(coherenceDir);
     symlinkSync(join(root, 'gone'), join(coherenceDir, 'state.db'));
-    const listing = (real: Listing): Listing => (path, options) => {
-      rmSync(coherenceDir, { recursive: true, force: true });
-      return real(path, options);
-    };
+    const listing =
+      (real: Listing): Listing =>
+      (path, options) => {
+        rmSync(coherenceDir, { recursive: true, force: true });
+        return real(path, options);
+      };
     withListing(listing, () => {
       assert.equal(checkCoherenceDir(coherenceDir), null);
     });
@@ -300,6 +309,38 @@ test(
       });
       for (const row of rows)
         assert.ok(row.ms < AT_ONCE_MS, `${row.name}: the check took ${row.ms} ms`);
+    });
+  }
+);
+
+test(
+  'checkCoherenceDir refuses a FIFO whose name is not UTF-8',
+  {
+    skip:
+      process.platform === 'linux'
+        ? false
+        : 'only a Linux file system takes a name that is not UTF-8',
+  },
+  async () => {
+    await withRootAsync(async (root) => {
+      const coherenceDir = join(root, '.coherence');
+      mkdirSync(coherenceDir);
+      // The bytes 78 ff. Decoded to a string the name re-encodes as 78 ef bf bd,
+      // which no lstat finds: only a name kept as bytes keeps the FIFO in view.
+      execFileSync('sh', ['-c', 'mkfifo "$(printf \'x\\377\')"'], { cwd: coherenceDir });
+      assert.deepEqual(readdirSync(coherenceDir, { encoding: 'buffer' }), [
+        Buffer.from([0x78, 0xff]),
+      ]);
+      // In a child: a check that opened the FIFO would block there, not here.
+      const run = await runBounded(
+        CHECK_CASES_SCRIPT,
+        [compiledModuleUrl('coherence_dir.js'), JSON.stringify([['FIFO', coherenceDir]])],
+        { timeoutMs: CHILD_TIMEOUT_MS, fifos: [] }
+      );
+      assert.equal(run.timedOut, false, `the check blocked: ${run.stderr}`);
+      const row = JSON.parse(run.stdout) as { refusal: unknown };
+      const name = Buffer.from([0x78, 0xff]).toString('utf8');
+      assert.deepEqual(row.refusal, refusal('special', join(coherenceDir, name)));
     });
   }
 );

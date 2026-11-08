@@ -408,22 +408,21 @@ test(
   withBase(async (base) => {
     const recorder = await startRecorder();
     try {
-      const fifo = join(base, 'pipe');
-      makeFifo(fifo);
+      // Each row has its own FIFO, released only by its own run: a row that
+      // finished first must not let the other's hook, held on it, go on.
       const cases = (['a FIFO', 'a link to a FIFO'] as const).map((name, index) => {
         const root = join(base, String(index));
         const secret = join(workspaceWith(root, recorder.port, OURS), 'hook.secret');
         rmSync(secret);
-        if (name === 'a FIFO') makeFifo(secret);
-        else symlinkSync(fifo, secret);
-        return { name, root, secret };
+        const fifo = name === 'a FIFO' ? secret : join(root, 'pipe');
+        makeFifo(fifo);
+        if (name !== 'a FIFO') symlinkSync(fifo, secret);
+        return { name, root, fifo };
       });
       // A hook that opened the FIFO would wait for a writer until it is
       // released, which happens only after the bound.
       const runs = await Promise.all(
-        cases.map(({ root, secret }) =>
-          runPreRead(root, { timeoutMs: AT_ONCE_MS, fifos: [secret, fifo] })
-        )
+        cases.map(({ root, fifo }) => runPreRead(root, { timeoutMs: AT_ONCE_MS, fifos: [fifo] }))
       );
       assert.deepEqual(
         {

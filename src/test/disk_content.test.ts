@@ -8,7 +8,6 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -102,10 +101,24 @@ test("hashRegularFile: null for a missing path, a directory, or a symlink at the
   });
 });
 
-test("hashRegularFile: a FIFO answers null without blocking", { skip: process.platform === "win32" }, () => {
-  withDir((dir) => {
-    execFileSync("mkfifo", [join(dir, "pipe")]);
-    assert.equal(hashRegularFile(join(dir, "pipe")), null);
+/** hashRegularFile on the path given, its answer printed as JSON. */
+const HASH_SCRIPT =
+  "const [moduleUrl, path] = process.argv.slice(1);\n" +
+  "const { hashRegularFile } = await import(moduleUrl);\n" +
+  "process.stdout.write(JSON.stringify(hashRegularFile(path)));\n";
+
+test("hashRegularFile: a FIFO answers null without blocking", { skip: process.platform === "win32" }, async () => {
+  await withDirAsync(async (dir) => {
+    const fifo = join(dir, "pipe");
+    makeFifo(fifo);
+    // In a child: an open that blocks here would park this whole test runner,
+    // and every state-file read shares this open's flags.
+    const run = await runBounded(HASH_SCRIPT, [compiledModuleUrl("disk_content.js"), fifo], {
+      timeoutMs: CHILD_TIMEOUT_MS,
+      fifos: [fifo],
+    });
+    assert.equal(run.timedOut, false, `the hash blocked on the FIFO ${run.stderr}`);
+    assert.equal(run.stdout, "null");
   });
 });
 

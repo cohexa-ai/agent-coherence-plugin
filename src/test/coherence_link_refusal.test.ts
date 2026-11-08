@@ -29,7 +29,7 @@ import {
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   EXIT_REFUSED,
   coherenceDirRefusalMessage,
@@ -37,13 +37,16 @@ import {
 } from '../coherence_dir.js';
 import {
   START_TIMEOUT_MS,
+  pidFileOf,
   serving,
   startCoordinator,
+  waitFor,
   within,
+  type Coordinator,
 } from './coordinator_process_fixture.js';
 import { writeExecutable } from './executable_fixture.js';
 import { makeFifo, releaseFifo } from './fifo_fixture.js';
-import { killAndWait } from './pid_lock_fixture.js';
+import { holdPidFileLock, killAndWait } from './pid_lock_fixture.js';
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -327,6 +330,62 @@ test(
       assert.deepEqual([stateOf(portFile), stateOf(gitignore)], before, 'after it stopped');
     } finally {
       await killAndWait(coordinator.child);
+    }
+  })
+);
+
+/**
+ * A module the coordinator loads first (`--import`). The coordinator makes
+ * .coherence right after its start check passes; this creates the file named
+ * by AGENT_COHERENCE_TEST_CHECKED when it does, and changes nothing else.
+ */
+const CHECK_PASSED_SIGNAL =
+  "import fs from 'node:fs';\n" +
+  "import { syncBuiltinESMExports } from 'node:module';\n" +
+  'const signal = process.env.AGENT_COHERENCE_TEST_CHECKED;\n' +
+  'const mkdirSync = fs.mkdirSync;\n' +
+  'fs.mkdirSync = function (path, options) {\n' +
+  '  const made = mkdirSync.call(this, path, options);\n' +
+  "  if (String(path).endsWith('/.coherence')) fs.writeFileSync(signal, '');\n" +
+  '  return made;\n' +
+  '};\n' +
+  'syncBuiltinESMExports();\n';
+
+test(
+  'a coordinator creates .gitignore only where nothing is, so a link made after its start check is not followed',
+  withBase(async (base) => {
+    const ws = join(base, 'ws');
+    const coherenceDir = join(ws, '.coherence');
+    mkdirSync(coherenceDir, { recursive: true });
+    const outside = join(base, 'outside');
+    mkdirSync(outside);
+    const target = join(outside, 'created-by-gitignore');
+    const gitignore = join(coherenceDir, '.gitignore');
+    const checked = join(base, 'checked');
+    const released = join(base, 'released');
+    const signalModule = join(base, 'check-passed-signal.mjs');
+    writeFileSync(signalModule, CHECK_PASSED_SIGNAL);
+    // Held, the lock keeps the start waiting after its check and before it
+    // writes .gitignore: the window in which a checkout can plant a link.
+    const holder = await holdPidFileLock(pidFileOf(ws), { exitWhen: released });
+    let coordinator: Coordinator | undefined;
+    try {
+      coordinator = startCoordinator(ws, {
+        NODE_OPTIONS: `--import=${pathToFileURL(signalModule).href}`,
+        AGENT_COHERENCE_TEST_CHECKED: checked,
+      });
+      await waitFor('the start check to pass', () => (existsSync(checked) ? true : null));
+      symlinkSync(target, gitignore);
+      writeFileSync(released, '');
+      await serving(ws, coordinator);
+      assert.deepEqual(
+        { gitignore: stateOf(gitignore), target: stateOf(target) },
+        { gitignore: `link to ${target}`, target: 'absent' },
+        coordinator.stderr()
+      );
+    } finally {
+      if (coordinator !== undefined) await killAndWait(coordinator.child);
+      await killAndWait(holder);
     }
   })
 );
