@@ -112,6 +112,8 @@ First-time experience: on your first Read of a tracked file in a workspace, you'
 
 A file your session edited in an earlier turn, with nothing changed since, reads as fresh and can be edited again. At the end of every turn the plugin releases the session's write grant on each file it edited, committed edits included, and the session keeps a read (SHARED) of each one. On the Python backend this needs an `agent-coherence` release after 0.15.0; with 0.15.0 or earlier, the session's first read of such a file in a later turn is reported stale, as the Library compatibility note below describes.
 
+One exception in warn mode: a session can still edit a file another session changed since its last read. If that edit fails or its turn ends, the session keeps a read of the file's current version although it never read that version, so its next Read of the file is fresh and no stale warning is shown. Strict mode denies that edit, so the session's copy stays stale and its next Read is denied.
+
 Easiest way to test end-to-end: open two terminals in the same repo (sections [Quick example](#quick-example) above).
 
 ## Install
@@ -188,12 +190,16 @@ After install, restart any running `claude` sessions in your workspace so the ne
 >   stops, and after a failed `Edit` or `Write`, the coordinator releases the
 >   write grants that session or subagent holds. On the Node backend, and with
 >   a release after 0.15.0, the session keeps a read (SHARED) of each released
->   file, so on its next turn it reads and edits the file as before. With
->   0.15.0 or earlier the release takes the file from the session: its next
->   read of the file is reported stale, as if its grant had been revoked (with
->   0.14.1 or earlier, the warning names your own session as the writer), and
->   in strict mode that read and an `Edit` of the file are denied until the
->   session recovers as described in [Strict mode](#strict-mode).
+>   file, so on its next turn it reads and edits the file as before. In warn
+>   mode a session can still edit a file another session changed since its
+>   last read; if that edit fails or its turn ends, the session keeps a read
+>   of the current version, so its next Read is fresh and no stale warning is
+>   shown. Strict mode denies that edit. With 0.15.0 or earlier the release
+>   takes the file from the session: its next read of the file is reported
+>   stale, as if its grant had been revoked (with 0.14.1 or earlier, the
+>   warning names your own session as the writer), and in strict mode that
+>   read and an `Edit` of the file are denied until the session recovers as
+>   described in [Strict mode](#strict-mode).
 >
 > Upgrading the library later needs no plugin change. Plugin 0.5.0 also keeps
 > working against a later library, but its hook client never claims a
@@ -250,7 +256,7 @@ A Claude Code subagent (spawned via the Task tool) runs under its **parent's** `
 
 - **Sibling collision** — two subagents of the same parent editing the same tracked artifact now collide (previously a silent lost update).
 - **Attribution** — a subagent's commit is credited to the subagent in a peer's stale-read warning. Only the Python backend's `/status` shows the subagent as `claude-session-<sid>:subagent-<aid>`, keeping the parent linkage visible: at the operator tier (`?detail=full` with the `Coherence-Local-Operator: true` header), and with `agent-coherence` 0.13.0 through 0.14.1 at the default tier too (earlier releases have no subagent identity). The Node backend's `/status` reports every session's `agent_name` as `null`.
-- **Scoped release** — the `SubagentStop` hook releases *only* that subagent's write grants, never the parent's. That means every EXCLUSIVE or MODIFIED grant it holds, including on files it edited and committed. The subagent keeps a read (SHARED) of each released file, so its next read of such a file is fresh while nothing has changed the file since. On the Python backend this needs an `agent-coherence` release after 0.15.0; with 0.15.0 or earlier, that read is reported stale. A stop payload with an absent `agent_id` is a normal parent stop; a present-but-malformed one is refused (no-op), never a parent-scoped release.
+- **Scoped release** — the `SubagentStop` hook releases *only* that subagent's write grants, never the parent's. That means every EXCLUSIVE or MODIFIED grant it holds, including on files it edited and committed. The subagent keeps a read (SHARED) of each released file, so its next read of such a file is fresh while nothing has changed the file since. In warn mode a subagent can still edit a file another session changed since its last read; if that edit fails or the subagent stops, the subagent keeps a read of the current version, so its next read is fresh and no stale warning is shown. Strict mode denies that edit. On the Python backend this needs an `agent-coherence` release after 0.15.0; with 0.15.0 or earlier, that read is reported stale. A stop payload with an absent `agent_id` is a normal parent stop; a present-but-malformed one is refused (no-op), never a parent-scoped release.
 
 This is **additive and fail-open**: if a hook payload carries no `agent_id`, the identity resolves to the parent exactly as before — nothing regresses for main-thread or single-session work. It is enforced identically on both coordinator backends.
 
@@ -277,7 +283,7 @@ The coordinator creates `.coherence/` at your repo root automatically. Inside it
 
 ## How it works
 
-A lazy-spawned local HTTP coordinator at the parent repo root (`<repo>/.coherence/`) wraps a SQLite-WAL state store implementing the MESI cache-coherence protocol. Plugin hooks are **command-type** (not HTTP-type — Claude Code v2.1.131's hooks.json schema validator rejects URLs containing env-var templates at load time); each hook invokes the `bin/hook-client` shim (Node client preferred, Python `agent-coherence-hook-client` fallback) which reads `.coherence/server.pid` for the port + `.coherence/hook.secret` for the bearer token, then POSTs the hook payload to the coordinator. On a workspace the Python coordinator serves, the Node hook client also claims a caller principal for the session once, and sends it with every hook. PreToolUse fires for every `Read`, `Edit`, `Write`, `Bash`, `Grep`; PostToolUse commits writes and triggers peer invalidations; At end of turn, Stop releases every EXCLUSIVE or MODIFIED grant the session holds, including the grant on a file it edited and committed during the turn, and the session keeps a read (SHARED) of each of those files, so its next turn can read and edit them again (on the Python backend, with an `agent-coherence` release after 0.15.0); read grants it already held are left alone; SubagentStop does the same for a stopped subagent's own grants (see [subagent identity](#subagents-and-composite-identity)). All HTTP traffic is `127.0.0.1`-bound. Coordinator idle-shuts after 15 minutes; SQLite state rehydrates on next spawn.
+A lazy-spawned local HTTP coordinator at the parent repo root (`<repo>/.coherence/`) wraps a SQLite-WAL state store implementing the MESI cache-coherence protocol. Plugin hooks are **command-type** (not HTTP-type — Claude Code v2.1.131's hooks.json schema validator rejects URLs containing env-var templates at load time); each hook invokes the `bin/hook-client` shim (Node client preferred, Python `agent-coherence-hook-client` fallback) which reads `.coherence/server.pid` for the port + `.coherence/hook.secret` for the bearer token, then POSTs the hook payload to the coordinator. On a workspace the Python coordinator serves, the Node hook client also claims a caller principal for the session once, and sends it with every hook. PreToolUse fires for every `Read`, `Edit`, `Write`, `Bash`, `Grep`; PostToolUse commits writes and triggers peer invalidations; At end of turn, Stop releases every EXCLUSIVE or MODIFIED grant the session holds, including the grant on a file it edited and committed during the turn, and the session keeps a read (SHARED) of each of those files, so its next turn can read and edit them again (on the Python backend, with an `agent-coherence` release after 0.15.0); read grants it already held are left alone; SubagentStop does the same for a stopped subagent's own grants (see [subagent identity](#subagents-and-composite-identity)). In warn mode a session can still edit a file another session changed since its last read; if that edit fails or its turn ends, the session keeps a read of the current version, so its next Read is fresh and no stale warning is shown. Strict mode denies that edit. All HTTP traffic is `127.0.0.1`-bound. Coordinator idle-shuts after 15 minutes; SQLite state rehydrates on next spawn.
 
 ## Architecture
 

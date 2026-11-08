@@ -209,6 +209,35 @@ test("after the release, a peer's edit with no commit leaves the session denied 
   }
 });
 
+test("a successful edit reported after the same session's failed edit is refused, naming the caller SHARED", async () => {
+  const s = await makeServer();
+  try {
+    const artifactId = s.registry.resolveOrRegisterArtifact(STRICT, HASH_1);
+    const agentId = sessionToAgentId(SID_A);
+    // Two edits of one file in one turn; the failed one reports first.
+    assert.equal((await s.post("/hooks/pre-edit", { session_id: SID_A, path: STRICT })).ok, true);
+    assert.equal((await s.post("/hooks/pre-edit", { session_id: SID_A, path: STRICT })).ok, true);
+    const failed = await s.post("/hooks/post-edit", { session_id: SID_A, path: STRICT, success: false });
+    assert.deepEqual(failed, { ok: true, released: true });
+
+    const late = await s.post("/hooks/post-edit", {
+      session_id: SID_A,
+      path: STRICT,
+      success: true,
+      content_hash: HASH_2,
+    });
+    assert.deepEqual(late, {
+      ok: false,
+      reason:
+        `commit_not_allowed: agent=${agentId} artifact=${artifactId} state=SHARED ` +
+        `(must be EXCLUSIVE or MODIFIED to commit)`,
+    });
+    assert.equal(stateOf(s, STRICT, agentId), MESIState.SHARED);
+  } finally {
+    await s.cleanup();
+  }
+});
+
 test("a failed edit reported after a peer took the file and committed leaves the session denied", async () => {
   const s = await makeServer();
   try {
@@ -221,6 +250,80 @@ test("a failed edit reported after a peer took the file and committed leaves the
 
     const read = await s.post("/hooks/pre-read", { session_id: SID_A, path: STRICT, content_hash: HASH_2 });
     assert.match(denyReason(read), /^Stale read denied: plan\.md was updated by agent /);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+// ------------------------------------------------------------ warn mode admits an edit of a stale copy
+
+/**
+ * Session A reads `path` at v1, then B edits and commits it, so A's copy is
+ * stale (INVALID). Returns A's pre-edit answer.
+ */
+async function editAfterPeerCommit(s: Server, path: string): Promise<Record<string, unknown>> {
+  const read = await s.post("/hooks/pre-read", { session_id: SID_A, path, content_hash: HASH_1 });
+  assert.deepEqual(read, { status: "fresh" });
+  await editAndCommit(s, { session_id: SID_B, path }, HASH_2);
+  assert.equal(stateOf(s, path, sessionToAgentId(SID_A)), MESIState.INVALID);
+  return s.post("/hooks/pre-edit", { session_id: SID_A, path });
+}
+
+const UPDATED_BY_PEER = `Stale read denied: ${STRICT} was updated by agent `;
+
+// A known limit of warn mode: the admitted edit takes the write grant at the
+// current version, so releasing that grant leaves a read of the current
+// version and the stale-read warning A would have got is never shown.
+for (const [name, release] of [
+  [
+    "a failed edit",
+    async (s: Server) =>
+      assert.deepEqual(await s.post("/hooks/post-edit", { session_id: SID_A, path: WARN, success: false }), {
+        ok: true,
+        released: true,
+      }),
+  ],
+  [
+    "a Stop",
+    async (s: Server) =>
+      assert.deepEqual(await s.post("/hooks/session-stop", { session_id: SID_A }), {
+        ok: true,
+        released_artifacts: [WARN],
+      }),
+  ],
+] as const) {
+  test(`in warn mode, an edit of a copy a peer made stale is admitted, and after ${name} the next read is fresh`, async () => {
+    const s = await makeServer();
+    try {
+      const edit = await editAfterPeerCommit(s, WARN);
+      assert.equal(edit.ok, true);
+      assert.equal(stateOf(s, WARN, sessionToAgentId(SID_A)), MESIState.EXCLUSIVE);
+
+      await release(s);
+      assert.equal(stateOf(s, WARN, sessionToAgentId(SID_A)), MESIState.SHARED);
+      const read = await s.post("/hooks/pre-read", { session_id: SID_A, path: WARN, content_hash: HASH_2 });
+      assert.deepEqual(read, { status: "fresh" });
+    } finally {
+      await s.cleanup();
+    }
+  });
+}
+
+test("in strict mode, an edit of a copy a peer made stale is denied and the session stays stale", async () => {
+  const s = await makeServer();
+  try {
+    const edit = await editAfterPeerCommit(s, STRICT);
+    assert.equal(edit.ok, false);
+    assert.ok(denyReason(edit).startsWith(UPDATED_BY_PEER));
+    assert.equal(stateOf(s, STRICT, sessionToAgentId(SID_A)), MESIState.INVALID);
+
+    assert.deepEqual(await s.post("/hooks/session-stop", { session_id: SID_A }), {
+      ok: true,
+      released_artifacts: [],
+    });
+    assert.equal(stateOf(s, STRICT, sessionToAgentId(SID_A)), MESIState.INVALID);
+    const read = await s.post("/hooks/pre-read", { session_id: SID_A, path: STRICT, content_hash: HASH_2 });
+    assert.ok(denyReason(read).startsWith(UPDATED_BY_PEER));
   } finally {
     await s.cleanup();
   }
