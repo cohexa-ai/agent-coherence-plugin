@@ -1003,7 +1003,8 @@ export class ArtifactRegistry {
    * Refused with a `CoherenceError`, deleting nothing, while the identity
    * holds any EXCLUSIVE or MODIFIED row: its write grant stays visible to its
    * peers. A row that carries a reclaim record stays, as the record of who
-   * lost a grant to the reclaim; a store the Python coordinator also opens
+   * lost a grant to the reclaim, and is left INVALID, so the identity no
+   * longer counts as a reader; a store the Python coordinator also opens
    * can carry one from its sweep. A notice the identity caused is its
    * victim's and stays.
    */
@@ -1026,6 +1027,11 @@ export class ArtifactRegistry {
       const deleted = this.db
         .prepare(`DELETE FROM agent_states WHERE agent_id = ? AND last_reclaim_trigger IS NULL`)
         .run(agentId).changes;
+      // A kept reclaim row the identity read again is SHARED; an ended
+      // identity reads nothing, so it stays only as the record, not a reader.
+      this.db
+        .prepare(`UPDATE agent_states SET state = ? WHERE agent_id = ? AND state != ?`)
+        .run(MESIState.INVALID, agentId, MESIState.INVALID);
       this.db.prepare(`DELETE FROM heartbeats WHERE agent_id = ?`).run(agentId);
       this.db.prepare(`DELETE FROM pending_notices WHERE agent_id = ?`).run(agentId);
       this.db.exec("COMMIT");

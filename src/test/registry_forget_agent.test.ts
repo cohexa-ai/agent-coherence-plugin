@@ -192,3 +192,31 @@ test('a row that carries a reclaim record stays when its agent is forgotten', ()
     f.cleanup();
   }
 });
+
+test('a reclaim-record row the agent read again stays as INVALID, so the agent leaves the active list', () => {
+  const f = makeFixture();
+  try {
+    const reclaimed = f.registry.resolveOrRegisterArtifact('reclaimed.md', HASH_1);
+    f.registry.acquireExclusive(reclaimed, AGENT_A, 10);
+    const outcome = f.registry.acquireExclusiveIfUnheld(reclaimed, AGENT_B, 10 + MAX_HOLD_SEC);
+    assert.equal(outcome.kind, 'granted');
+    f.registry.grantShared(reclaimed, AGENT_A, 20 + MAX_HOLD_SEC);
+    assert.equal(f.registry.getAgentState(reclaimed, AGENT_A), MESIState.SHARED);
+
+    f.registry.forgetAgent(AGENT_A);
+
+    assert.deepEqual(
+      f.raw
+        .prepare(`SELECT state, last_reclaim_trigger, last_reclaim_tick FROM agent_states WHERE agent_id = ?`)
+        .get(AGENT_A),
+      {
+        state: MESIState.INVALID,
+        last_reclaim_trigger: RECLAIM_MAX_HOLD_TRIGGER,
+        last_reclaim_tick: 10 + MAX_HOLD_SEC,
+      }
+    );
+    assert.equal(f.registry.listActiveAgents().includes(AGENT_A), false);
+  } finally {
+    f.cleanup();
+  }
+});
