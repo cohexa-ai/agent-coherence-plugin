@@ -10,85 +10,28 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { holdPidFileLock, killAndWait, pythonFlockProbe } from "./pid_lock_fixture.js";
+import {
+  type Coordinator,
+  pidFileOf,
+  publishedPid,
+  startCoordinator,
+  waitFor,
+  within,
+} from "./coordinator_process_fixture.js";
 
-const COORDINATOR_JS = join(dirname(fileURLToPath(import.meta.url)), "..", "coordinator.js");
-const START_TIMEOUT_MS = 30_000;
-
-interface Coordinator {
-  child: ChildProcess;
-  stderr: () => string;
-  exited: Promise<number | null>;
-}
-
-function startCoordinator(ws: string, env: NodeJS.ProcessEnv = {}): Coordinator {
-  const child = spawn(process.execPath, [COORDINATOR_JS], {
-    cwd: ws,
-    env: { ...process.env, AGENT_COHERENCE_WORKSPACE: ws, ...env },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  let stderr = "";
-  child.stderr!.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-  const exited = new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code)));
-  return { child, stderr: () => stderr, exited };
-}
-
-function within<T>(what: string, promise: Promise<T>, timeoutMs = START_TIMEOUT_MS): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`timed out waiting for ${what}`)), timeoutMs);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-async function waitFor<T>(what: string, probe: () => T | null, timeoutMs = START_TIMEOUT_MS): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const value = probe();
-    if (value !== null) return value;
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
-function pidFileOf(ws: string): string {
-  return join(ws, ".coherence", "server.pid");
-}
-
-/** The pid server.pid publishes with a port, or null while none is published. */
-function publishedPid(ws: string): number | null {
-  let text: string;
-  try {
-    text = readFileSync(pidFileOf(ws), "utf8");
-  } catch {
-    return null;
-  }
-  const [pid, port] = text.split("\n");
-  return pid && port ? Number(pid) : null;
-}
-
-/**
- * server.pid's content once `pid` has published both files: server.pid names
- * it with a port, and server.port holds that same port. server.port is written
- * after server.pid, so a read between the two sees the old one.
- */
-function bothPublishedBy(ws: string, pid: number | undefined): string | null {
+/** server.pid's content once `pid` has published it with a port, or null before then. */
+function publishedWithPortBy(ws: string, pid: number | undefined): string | null {
   let pidText: string;
-  let portText: string;
   try {
     pidText = readFileSync(pidFileOf(ws), "utf8");
-    portText = readFileSync(join(ws, ".coherence", "server.port"), "utf8");
   } catch {
     return null;
   }
   const [publishedBy, port] = pidText.split("\n");
-  return Number(publishedBy) === pid && port && portText === `${port}\n` ? pidText : null;
+  return Number(publishedBy) === pid && port ? pidText : null;
 }
 
 function withWorkspace(
@@ -164,7 +107,7 @@ test(
     assert.equal(await within("the first coordinator to stop", first.exited), 0, first.stderr());
     assert.equal(readFileSync(pidFileOf(ws), "utf8"), `${first.child.pid}\n`);
     assert.equal(statSync(pidFileOf(ws)).ino, inode);
-    assert.equal(existsSync(join(ws, ".coherence", "server.port")), false);
+    assert.equal(existsSync(join(ws, ".coherence", "server.port")), false, "no coordinator writes server.port");
 
     const next = startCoordinator(ws);
     started.push(next);
@@ -233,21 +176,19 @@ test(
     mkdirSync(emptyBin);
     const first = startCoordinator(ws, { PATH: emptyBin });
     started.push(first);
-    await waitFor("the first coordinator to publish", () => bothPublishedBy(ws, first.child.pid));
+    await waitFor("the first coordinator to publish", () => publishedWithPortBy(ws, first.child.pid));
     assert.match(first.stderr(), /is not locked: neither perl nor flock\(1\) could lock it/);
     const second = startCoordinator(ws, { PATH: emptyBin });
     started.push(second);
-    const secondPidFile = await waitFor("the second coordinator to publish", () => bothPublishedBy(ws, second.child.pid));
-    const secondPortFile = `${secondPidFile.split("\n")[1]}\n`;
+    const secondPidFile = await waitFor("the second coordinator to publish", () => publishedWithPortBy(ws, second.child.pid));
 
     first.child.kill("SIGTERM");
     assert.equal(await within("the first coordinator to stop", first.exited), 0, first.stderr());
     assert.equal(readFileSync(pidFileOf(ws), "utf8"), secondPidFile);
-    assert.equal(readFileSync(join(ws, ".coherence", "server.port"), "utf8"), secondPortFile);
 
     second.child.kill("SIGTERM");
     assert.equal(await within("the second coordinator to stop", second.exited), 0, second.stderr());
     assert.equal(existsSync(pidFileOf(ws)), false, "an unlocked coordinator removes its own server.pid, as before #217");
-    assert.equal(existsSync(join(ws, ".coherence", "server.port")), false);
+    assert.equal(existsSync(join(ws, ".coherence", "server.port")), false, "no coordinator writes server.port");
   }),
 );
