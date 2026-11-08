@@ -64,8 +64,8 @@ socket or a device. The Node coordinator makes the same check at start
 (`src/coherence_dir.ts`, called from `src/coordinator.ts`) before it creates,
 locks or writes anything. Both only test file types and list the directory:
 they open no file there, so nothing they find can block them. A refused
-session start tells you and the model that coherence is off for the session,
-and a refused coordinator exits with status 2. A directory mounted at
+session start starts no coordinator and tells you and the model so, and a
+refused coordinator exits with status 2. A directory mounted at
 `.coherence` is a real directory and passes. For a link made after the
 check:
 

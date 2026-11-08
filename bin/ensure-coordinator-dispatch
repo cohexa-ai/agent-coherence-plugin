@@ -54,7 +54,8 @@
 #
 # Before any of that, and whatever selects the backend, the root's .coherence
 # is checked (coherence-dir-check below). A refused start runs neither
-# bootstrap: it prints SessionStart JSON saying coherence is off, and exits 0.
+# bootstrap: it prints SessionStart JSON saying it started no coordinator, and
+# exits 0.
 
 set -uo pipefail
 
@@ -102,9 +103,11 @@ coherence_dir_problem() {
 }
 # Refuses the start when $1/.coherence breaks the rule: one line on stderr, and
 # one SessionStart JSON object on stdout, so the user (systemMessage) and the
-# model (additionalContext) both learn that coherence is off. The caller then
-# exits 0, with nothing else on stdout: Claude Code reads a hook's stdout as
-# JSON only on exit 0, and shows a failing hook's stderr to the user alone.
+# model (additionalContext) both learn that this start started no coordinator.
+# The model is told only that: a coordinator already running for the workspace
+# still answers the hooks. The caller then exits 0, with nothing else on
+# stdout: Claude Code reads a hook's stdout as JSON only on exit 0, and shows a
+# failing hook's stderr to the user alone.
 refuse_coherence_dir() {   # 0 = refused (JSON printed), 1 = go on
   local found status name why fix
   found="$(coherence_dir_problem "$1/.coherence")"; status=$?
@@ -112,12 +115,19 @@ refuse_coherence_dir() {   # 0 = refused (JSON printed), 1 = go on
   # The name comes from the repository: keep JSON- and terminal-safe bytes only.
   name="$(printf '%s' "${found#"$1/"}" | LC_ALL=C tr -c 'A-Za-z0-9._/-' '?')"
   case "$status" in
-    1) why="$name is a symlink"; fix="Replace it with a copy of the file it names, or mount a directory at .coherence, then start a new session." ;;
+    # A linked .coherence names a directory, not a file; a copy of state.db
+    # alone loses the latest history its -wal and -shm hold.
+    1) why="$name is a symlink"
+       case "$name" in
+         .coherence) fix="Replace the link with a real directory and copy in the files you want to keep (move state.db together with its -wal and -shm), or mount a directory at .coherence, then start a new session." ;;
+         .coherence/state.db* | .coherence/workspace.db*) fix="Replace it with a copy of the file it names (move state.db together with its -wal and -shm), or mount a directory at .coherence, then start a new session." ;;
+         *) fix="Replace it with a copy of the file it names, or mount a directory at .coherence, then start a new session." ;;
+       esac ;;
     2) why="$name is not a directory"; fix="Move it aside, then start a new session." ;;
     *) why="$name is a FIFO, socket or device"; fix="Remove it, then start a new session." ;;
   esac
   echo "agent-coherence: not starting the coordinator: $why. $fix" >&2
-  printf '{"systemMessage":"agent-coherence is off for this session: %s. %s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"agent-coherence is OFF for this session: its coordinator was not started because %s. No hook will warn about a stale read or stop a conflicting edit. Tell the user, and do not assume edits are coordinated."}}\n' "$why" "$fix" "$why"
+  printf '{"systemMessage":"agent-coherence is off for this session: %s. %s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"agent-coherence did not start a coordinator at this session start, because %s. Hooks may still answer from a coordinator already running for this workspace: treat any warning or deny they give as real, and do not assume edits are coordinated otherwise. Tell the user."}}\n' "$why" "$fix" "$why"
   return 0
 }
 # <<< coherence-dir-check

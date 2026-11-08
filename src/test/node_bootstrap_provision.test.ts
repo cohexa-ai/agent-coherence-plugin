@@ -698,7 +698,7 @@ function entryAt(path: string): string {
   return `file ${JSON.stringify(readFileSync(path, 'utf8'))}`;
 }
 
-test('the bootstrap refuses a linked server.pid or coordinator_backend before it reads, joins or writes anything', async () => {
+test('the bootstrap refuses a linked server.pid, coordinator_backend, state.db or .coherence before it reads, joins or writes anything', async () => {
   // A repository can commit these links (cohexa-ai/agent-coherence#498).
   // Before, the bootstrap joined the coordinator another workspace's pid file
   // names, waited for good on a FIFO behind server.pid, and stamped the backend
@@ -708,17 +708,23 @@ test('the bootstrap refuses a linked server.pid or coordinator_backend before it
   mkdirSync(dirname(theirs), { recursive: true });
   const fifo = join(base, 'pipe');
   makeFifo(fifo);
+  const store = join(base, 'store');
+  writeFileSync(store, 'theirs');
   // Only its own row releases the FIFO: a row that finished first must not let a held one go on.
   const rows = [
-    { where: "server.pid linked to a serving coordinator's", name: 'server.pid', target: theirs, pinned: true, fifos: [] },
-    { where: 'server.pid linked to a FIFO', name: 'server.pid', target: fifo, pinned: true, fifos: [fifo] },
+    { where: "server.pid linked to a serving coordinator's", entry: '.coherence/server.pid', target: theirs, pinned: true, fifos: [] },
+    { where: 'server.pid linked to a FIFO', entry: '.coherence/server.pid', target: fifo, pinned: true, fifos: [fifo] },
     // Run as Claude Code runs it, in $PWD.
-    { where: 'a dangling coordinator_backend link', name: 'coordinator_backend', target: join(base, 'gone'), pinned: false, fifos: [] },
+    { where: 'a dangling coordinator_backend link', entry: '.coherence/coordinator_backend', target: join(base, 'gone'), pinned: false, fifos: [] },
+    // Its way out moves the store's -wal and -shm with it.
+    { where: 'a linked state.db', entry: '.coherence/state.db', target: store, pinned: true, fifos: [] },
+    // Its way out is a real directory, not a copy of a file.
+    { where: 'a dangling .coherence link', entry: '.coherence', target: join(base, 'gone-dir'), pinned: true, fifos: [] },
   ].map((row) => {
     const root = makeStubRoot({ prebuiltDistJs: SHORT_LIVED_JS });
     const dirs = makeDirs();
-    mkdirSync(join(dirs.ws, '.coherence'));
-    const link = join(dirs.ws, '.coherence', row.name);
+    const link = join(dirs.ws, row.entry);
+    mkdirSync(dirname(link), { recursive: true });
     symlinkSync(row.target, link);
     return { ...row, ...dirs, root, link };
   });
@@ -748,7 +754,7 @@ test('the bootstrap refuses a linked server.pid or coordinator_backend before it
           row.where,
           {
             timedOut: false,
-            ...shimRefusal(`.coherence/${row.name}`, 'link'),
+            ...shimRefusal(row.entry, 'link'),
             link: `link to ${row.target}`,
             target: before[i],
           },
