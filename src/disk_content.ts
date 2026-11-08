@@ -3,10 +3,8 @@
  * out-of-band change check (#205). Node port of the library's
  * `disk_content.hash_regular_file`.
  *
- * Its open is also the one reader for files under .coherence (#251): a
- * repository can commit a symlink or a FIFO there, so a read of state never
- * follows a link at the leaf, never blocks on a FIFO and accepts a regular
- * file only.
+ * Its open is also the one reader for files under .coherence (#251), where a
+ * repository can commit a symlink or a FIFO.
  */
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
@@ -38,21 +36,28 @@ export function hashRegularFile(path: string, maxBytes: number = DEFAULT_MAX_HAS
   try {
     if (size > maxBytes) return null;
     const hash = createHash("sha256");
-    // Sized to the file (one spare byte detects growth), not the cap: tracked files are small.
-    const buf = Buffer.allocUnsafe(Math.min(CHUNK_BYTES, size + 1));
-    let total = 0;
-    for (;;) {
-      const n = readSync(fd, buf, 0, buf.length, null);
-      if (n === 0) break;
-      total += n;
-      if (total > maxBytes) return null;
-      hash.update(buf.subarray(0, n));
-    }
-    return hash.digest("hex");
+    return drainWithin(fd, size, maxBytes, (chunk) => hash.update(chunk)) ? hash.digest("hex") : null;
   } catch {
     return null;
   } finally {
     closeSync(fd);
+  }
+}
+
+/**
+ * Reads `fd` to its end, handing each chunk to `sink`; false, with the rest
+ * left unread, once more than `maxBytes` came.
+ */
+function drainWithin(fd: number, size: number, maxBytes: number, sink: (chunk: Buffer) => void): boolean {
+  // Sized to the file (one spare byte detects growth), not the cap: tracked files are small.
+  const buf = Buffer.allocUnsafe(Math.min(CHUNK_BYTES, size + 1));
+  let total = 0;
+  for (;;) {
+    const n = readSync(fd, buf, 0, buf.length, null);
+    if (n === 0) return true;
+    total += n;
+    if (total > maxBytes) return false;
+    sink(buf.subarray(0, n));
   }
 }
 
@@ -63,7 +68,8 @@ function fileError(path: string, code: string, what: string): NodeJS.ErrnoExcept
   return Object.assign(new Error(`${path} ${what}`), { code, path });
 }
 
-function isSymlink(path: string): boolean {
+/** False when the lstat fails, as it does for a missing path. */
+export function isSymlink(path: string): boolean {
   try {
     return lstatSync(path).isSymbolicLink();
   } catch {
@@ -111,21 +117,24 @@ export function readRegularFile(path: string, maxBytes = Number.POSITIVE_INFINIT
   const tooBig = () => fileError(path, "EFBIG", `is larger than ${maxBytes} bytes`);
   try {
     if (size > maxBytes) throw tooBig();
-    const buf = Buffer.allocUnsafe(Math.min(CHUNK_BYTES, size + 1));
-    const chunks: Buffer[] = [];
+    let bytes = Buffer.allocUnsafe(size);
     let total = 0;
-    for (;;) {
-      const n = readSync(fd, buf, 0, buf.length, null);
-      if (n === 0) break;
-      total += n;
-      if (total > maxBytes) throw tooBig();
-      chunks.push(Buffer.from(buf.subarray(0, n)));
-    }
-    return Buffer.concat(chunks, total);
+    const within = drainWithin(fd, size, maxBytes, (chunk) => {
+      // Only a file that grew after the fstat outgrows it; doubling keeps that copy linear.
+      if (total + chunk.length > bytes.length) {
+        bytes = Buffer.concat([bytes.subarray(0, total)], 2 * (total + chunk.length));
+      }
+      total += chunk.copy(bytes, total);
+    });
+    if (!within) throw tooBig();
+    return bytes.subarray(0, total);
   } finally {
     closeSync(fd);
   }
 }
+
+/** More than any secret a coordinator writes: a larger hook.secret is malformed, not read whole. */
+export const MAX_SECRET_FILE_BYTES = 4096;
 
 /**
  * The bytes of `name` directly inside `coherenceDir`, read as readRegularFile

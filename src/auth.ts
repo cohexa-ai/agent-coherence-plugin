@@ -20,16 +20,15 @@ import { constants as fsConstants, openSync, writeSync, closeSync, mkdirSync } f
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 import type { IncomingMessage } from "node:http";
-import { coherenceDirRefusalMessage } from "./coherence_dir.js";
-import { NOT_REGULAR, readStateFile } from "./disk_content.js";
+import { linkRefusalMessage } from "./coherence_dir.js";
+import { MAX_SECRET_FILE_BYTES, NOT_REGULAR, readStateFile } from "./disk_content.js";
 
 const SECRET_BYTES = 32;
 const SECRET_HEX_LEN = SECRET_BYTES * 2;
-/** More than any secret a coordinator writes: a larger hook.secret is malformed, not read whole. */
-export const MAX_SECRET_FILE_BYTES = 4096;
 const ALLOWED_HOSTS: ReadonlyArray<string> = ["localhost", "127.0.0.1"];
 
 const RECOVERY_MAX_ATTEMPTS = 5;
+const RETRYABLE_SECRET_READ_CODES: ReadonlySet<string | undefined> = new Set(["ENOENT", "EFBIG"]);
 
 /**
  * Read existing hook.secret or atomically create a new one.
@@ -59,24 +58,8 @@ export function ensureSecret(coherenceDir: string): string {
       }
     }
 
-    // Read existing. If valid (correct length), return it. Never through a
-    // link, which made the file it names this coordinator's bearer, and never
-    // blocking on a FIFO, which held the start (#251).
-    let existing = "";
-    try {
-      existing = readStateFile(coherenceDir, "hook.secret", MAX_SECRET_FILE_BYTES).toString("utf8").trim();
-    } catch (err) {
-      const { code, path: refused } = err as NodeJS.ErrnoException;
-      if (code === "ELOOP") {
-        throw new Error(coherenceDirRefusalMessage({ kind: "link", path: refused ?? path, more: 0 }, coherenceDir));
-      }
-      if (code === NOT_REGULAR) {
-        throw new Error(`ensureSecret: ${path} is not a regular file; remove it, then restart.`);
-      }
-      // Gone since the create failed, or too large to be a secret: both take
-      // the bounded retry below.
-      if (code !== "ENOENT" && code !== "EFBIG") throw err;
-    }
+    // Read existing. If valid (correct length), return it.
+    const existing = readExistingSecret(coherenceDir, path);
     if (existing.length === SECRET_HEX_LEN) {
       return existing;
     }
@@ -94,6 +77,21 @@ export function ensureSecret(coherenceDir: string): string {
       `bounded O_EXCL retry exhausted after ${RECOVERY_MAX_ATTEMPTS} attempts. ` +
       `Resolution: stop all coordinator processes, remove the file, restart.`,
   );
+}
+
+/** The hook.secret already on disk, trimmed, or "" for a read the bounded retry takes. */
+function readExistingSecret(coherenceDir: string, path: string): string {
+  try {
+    return readStateFile(coherenceDir, "hook.secret", MAX_SECRET_FILE_BYTES).toString("utf8").trim();
+  } catch (err) {
+    const { code, path: refused } = err as NodeJS.ErrnoException;
+    if (code === "ELOOP") throw new Error(linkRefusalMessage(refused ?? path, coherenceDir));
+    if (code === NOT_REGULAR) {
+      throw new Error(`ensureSecret: ${path} is not a regular file; remove it, then restart.`);
+    }
+    if (!RETRYABLE_SECRET_READ_CODES.has(code)) throw err;
+    return "";
+  }
 }
 
 /** Constant-time Bearer token comparison. Returns false on any mismatch or malformed Authorization header. */

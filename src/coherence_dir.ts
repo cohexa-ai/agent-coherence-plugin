@@ -1,14 +1,12 @@
 /**
  * The start check (#251; cohexa-ai/agent-coherence#498): `.coherence` must be
- * absent or a real directory, and nothing directly inside it may be a symlink,
- * a FIFO, a socket or a device.
+ * absent or a real directory, one mounted there included, and nothing directly
+ * inside it may be a symlink, a FIFO, a socket or a device.
  *
  * A repository can commit a symlink there, and every start would then read or
  * write the file it names; a FIFO or a device can block an open. No
- * coordinator creates any of them. A directory mounted at `.coherence` is a
- * directory to lstat, so it passes, and so does a real subdirectory. The check
- * lstats and lists; it opens no file and runs no git, so nothing it finds can
- * block it.
+ * coordinator creates any of them. The check opens no file and runs no git, so
+ * nothing it finds can block it.
  *
  * The outcomes and the texts are the library's start check's, kept
  * byte-identical, so both coordinators refuse the same workspace in the same
@@ -29,7 +27,6 @@ export interface CoherenceDirRefusal {
   more: number;
 }
 
-/** The exit status of a refused start: the library coordinator's for a start it refuses. */
 export const EXIT_REFUSED = 2;
 
 /**
@@ -49,7 +46,6 @@ export function checkCoherenceDir(coherenceDir: string): CoherenceDirRefusal | n
   if (info.isSymbolicLink()) return { kind: 'link', path: coherenceDir, more: 0 };
   if (!info.isDirectory()) return { kind: 'not_a_directory', path: coherenceDir, more: 0 };
   const { links, specials } = offendingEntries(coherenceDir);
-  // Links first: a link is the refusal whatever else is there.
   const [first, ...rest] = links.length > 0 ? links : specials;
   if (first === undefined) return null;
   return {
@@ -101,6 +97,11 @@ export function coherenceDirRefusalMessage(
   coherenceDir: string
 ): string {
   return escapeNonprintable(refusalText(refusal, coherenceDir));
+}
+
+/** The line for a link at `path`: `coherenceDir` itself or an entry directly inside it. */
+export function linkRefusalMessage(path: string, coherenceDir: string): string {
+  return coherenceDirRefusalMessage({ kind: 'link', path, more: 0 }, coherenceDir);
 }
 
 // History lives across the store and its sidecars: a copy of state.db alone loses it.

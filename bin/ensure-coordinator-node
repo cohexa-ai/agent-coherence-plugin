@@ -557,10 +557,13 @@ pid_runs_coordinator() {
 # after reboot on exactly the zero-Python machines the Node default exists
 # for. An operator's existing selection file is never overwritten.
 #
-# The stamp runs seconds after the start check, so it writes only where
-# nothing is at the name: never through a link, dangling or not, and never
-# into a FIFO. Under set -C bash creates a missing file exclusively, which
-# follows no link planted since the test, and clobbers no regular file.
+# The stamp runs seconds after the start check, so it tests the name again
+# and writes only where nothing is there: the test keeps out a link, dangling
+# or not, a FIFO and any file. Under set -C bash creates a missing file
+# exclusively and clobbers no regular file, so a regular file, a link to one
+# or a dangling link planted since the test is not written through. It opens
+# any other existing name without O_EXCL, though: a FIFO, or a link to one,
+# planted in that window by the same user can still block the write.
 stamp_node_backend() {
   local backend_file="${WORKSPACE}/.coherence/coordinator_backend"
   if [ "$workspace_had_state_db" = "0" ] && [ ! -e "$backend_file" ] && [ ! -L "$backend_file" ]; then

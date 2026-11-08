@@ -465,30 +465,7 @@ export function appendPolicyYaml(
   }
 
   const name = policyFileName(yamlPath);
-  let existing: string;
-  try {
-    existing = readRegularFile(yamlPath).toString("utf8");
-  } catch (err) {
-    // Only a missing file is empty. Reading any other failure as empty would
-    // rename a file holding just the new entries over every pattern it had.
-    const code = (err as NodeJS.ErrnoException).code;
-    // A link is never read through or renamed over, and a FIFO is never
-    // waited on: a read that blocked held this coordinator's only event
-    // loop, so it answered nothing, not even /health or SIGTERM (#248).
-    if (code === "ELOOP") {
-      throw new Error(
-        `${name} is a symlink; nothing was written. ` +
-          `Replace it with a copy of the file it names, or mount a directory at .coherence.`,
-      );
-    }
-    if (code === NOT_REGULAR) {
-      throw new Error(`${name} could not be read (not a regular file); nothing was written.`);
-    }
-    if (code !== "ENOENT") {
-      throw new Error(`${name} could not be read (${code ?? String(err)}); nothing was written.`);
-    }
-    existing = "";
-  }
+  const existing = readExistingPolicy(yamlPath, name);
   // A file that loads as no entries still loads as none after an append, so
   // the new entry would never apply; refusing is the only true answer.
   const current = readPolicyEntries(existing);
@@ -540,6 +517,30 @@ export function appendPolicyYaml(
     rmSync(tmpPath, { force: true });
   }
   return { added: trulyNew, rejected };
+}
+
+/** The text an append to `yamlPath` starts from, or an error naming `name` that writes nothing. */
+function readExistingPolicy(yamlPath: string, name: string): string {
+  try {
+    return readRegularFile(yamlPath).toString("utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") {
+      throw new Error(
+        `${name} is a symlink; nothing was written. ` +
+          `Replace it with a copy of the file it names, or mount a directory at .coherence.`,
+      );
+    }
+    if (code === NOT_REGULAR) {
+      throw new Error(`${name} could not be read (not a regular file); nothing was written.`);
+    }
+    // Only a missing file is empty. Reading any other failure as empty would
+    // rename a file holding just the new entries over every pattern it had.
+    if (code !== "ENOENT") {
+      throw new Error(`${name} could not be read (${code ?? String(err)}); nothing was written.`);
+    }
+    return "";
+  }
 }
 
 const REWRITE_HINT =
@@ -1468,8 +1469,6 @@ function loadYamlList(yamlPath: string, rejected: RejectedPattern[]): unknown[] 
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR" || code === "EISDIR" || code === NOT_REGULAR) return [];
-    // A link is not read through (#251): a repository can commit one, and
-    // the file it names is not this workspace's policy.
     if (code === "ELOOP") {
       process.stderr.write(`agent-coherence: WARNING — ${yamlPath} is a symlink; it loads as no entries\n`);
       rejected.push({ pattern: name, reason: "a symlink, so the file loads as no entries" });
