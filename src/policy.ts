@@ -1458,8 +1458,9 @@ function describeNonString(item: unknown): string {
  * file, under the name and reason the Python coordinator records (#192): the
  * warning reaches only the coordinator's log, and the rejected count on
  * /status is what tells an emptied file apart from no user patterns. A
- * symlink is rejected the same way and never read (#251); anything else that
- * is not a regular file, a FIFO among them, loads as [] without a word.
+ * symlink is rejected the same way and never read (#251). A FIFO or a device
+ * loads as [] without a word. A socket fails the open itself, so it is a file
+ * that could not be read, as on the Python coordinator.
  */
 function loadYamlList(yamlPath: string, rejected: RejectedPattern[]): unknown[] {
   const name = policyFileName(yamlPath);

@@ -61,7 +61,11 @@ function drainWithin(fd: number, size: number, maxBytes: number, sink: (chunk: B
   }
 }
 
-/** `code` of the error for a path that names a FIFO, a socket or a device: not a regular file, not a directory. */
+/**
+ * `code` of the error for a path that opens as neither a regular file nor a
+ * directory: a FIFO or a device. A socket fails the open itself, with the
+ * open's own error.
+ */
 export const NOT_REGULAR = "ENOTREG";
 
 function fileError(path: string, code: string, what: string): NodeJS.ErrnoException {
@@ -83,8 +87,11 @@ export function isSymlink(path: string): boolean {
  * (O_NONBLOCK). A failed open is put down to a link (code ELOOP) only when
  * lstat shows one: the errno O_NOFOLLOW gives differs by platform and by what
  * the link names. A directory throws EISDIR, as a plain read does, and
- * anything else that is not a regular file throws NOT_REGULAR. Any other
- * failure is the open's own error.
+ * anything else that opens but is not a regular file (a FIFO, a device)
+ * throws NOT_REGULAR. Any other failure is the open's own error, including
+ * the one for an entry the open refuses before any type check: a socket fails
+ * with ENXIO on Linux and EOPNOTSUPP on macOS, as it does on the Python
+ * coordinator.
  */
 export function openRegularFile(path: string): { fd: number; size: number } {
   let fd: number;
