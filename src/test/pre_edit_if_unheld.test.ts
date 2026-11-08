@@ -535,7 +535,7 @@ test("an opted-in admit names no holder the decision did not displace", async ()
     Object.defineProperty(s.registry, "acquireExclusiveIfUnheld", {
       configurable: true,
       value: (artifactId: string, agentId: string, nowTick: number) => {
-        s.registry.invalidate(id, sessionToAgentId(SID_A), nowTick, "session_stop");
+        s.registry.releaseToReader(id, sessionToAgentId(SID_A), nowTick);
         return original(artifactId, agentId, nowTick);
       },
     });

@@ -372,7 +372,7 @@ test("session-start: pending preemption notice rendered READ-ONLY — appears in
 
 // ------------------------------------------------------------ subagents
 
-test("session-start: parent lines first, then subagent group under its prefix; released grant → touched line (KTD8)", async () => {
+test("session-start: parent lines first, then subagent group under its prefix; a released grant renders as a held SHARED grant", async () => {
   const { registry, sessions, post, cleanup } = await makeServer();
   try {
     const cid = registry.resolveOrRegisterArtifact("CLAUDE.md", HASH_1);
@@ -394,8 +394,8 @@ test("session-start: parent lines first, then subagent group under its prefix; r
       ].join("\n"),
     );
 
-    // Stop the subagent — its E grant releases (row goes INVALID); the row
-    // is still touched, rendered without a flag.
+    // Stop the subagent — its E grant releases to a read (row goes SHARED),
+    // so it renders as a held SHARED grant, byte-identical to Python.
     await post("/hooks/session-stop", { session_id: SID_A, agent_id: "worker-1" });
     const r2 = await post("/hooks/session-start", { session_id: SID_A });
     assert.equal(
@@ -404,7 +404,7 @@ test("session-start: parent lines first, then subagent group under its prefix; r
         SS_HEADER,
         "At compaction you held SHARED on CLAUDE.md (v1) — re-acquire before writing.",
         "Subagent worker-1:",
-        "plan.md is at v1.",
+        "At compaction you held SHARED on plan.md (v1) — re-acquire before writing.",
         SS_CLOSING,
       ].join("\n"),
     );
