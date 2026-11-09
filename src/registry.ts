@@ -301,7 +301,8 @@ export class ArtifactRegistry {
    *
    * Scoped to the caller's agents on purpose (SB-10 review): this runs on
    * the session-start hook path — twice per compaction, synchronously, on
-   * a table nothing ever garbage-collects — while the only rows the walk
+   * a table that keeps every Claude Code session's rows (`forgetAgent`
+   * deletes only an ended volume attempt's) — while the only rows the walk
    * can render belong to the requesting session's parent and subagents. An
    * unfiltered read would load the workspace's entire coordination history
    * to discard all but a handful of rows, and better-sqlite3 being
@@ -982,6 +983,59 @@ export class ArtifactRegistry {
         this.setAgentStateInternal(artifactId, agentId, priorState, MESIState.SHARED, nowTick, "invalidate", null);
       }
       this.db.exec("COMMIT");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Rollback failure non-recoverable; surface original error.
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Forget an identity that has ended: delete its `agent_states` rows, its
+   * `heartbeats` row and its `pending_notices` rows in one transaction, and
+   * return how many `agent_states` rows went. Only for an explicit end: a
+   * deleted row reads as never seen, so a later edit from that identity would
+   * be admitted where its stale copy was denied.
+   *
+   * Refused with a `CoherenceError`, deleting nothing, while the identity
+   * holds any EXCLUSIVE or MODIFIED row: its write grant stays visible to its
+   * peers. A row that carries a reclaim record stays, as the record of who
+   * lost a grant to the reclaim, and is left INVALID, so the identity no
+   * longer counts as a reader; a store the Python coordinator also opens
+   * can carry one from its sweep. A notice the identity caused is its
+   * victim's and stays.
+   */
+  forgetAgent(agentId: string): number {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const writerRow = this.db
+        .prepare(
+          `SELECT artifact_id FROM agent_states
+           WHERE agent_id = ? AND state IN (?, ?) LIMIT 1`,
+        )
+        .get(agentId, MESIState.MODIFIED, MESIState.EXCLUSIVE) as
+        { artifact_id: string } | undefined;
+      if (writerRow !== undefined) {
+        throw new CoherenceError(
+          `forget_not_allowed: agent=${agentId} artifact=${writerRow.artifact_id} ` +
+            `(holds an EXCLUSIVE or MODIFIED grant)`,
+        );
+      }
+      const deleted = this.db
+        .prepare(`DELETE FROM agent_states WHERE agent_id = ? AND last_reclaim_trigger IS NULL`)
+        .run(agentId).changes;
+      // A kept reclaim row the identity read again is SHARED; an ended
+      // identity reads nothing, so it stays only as the record, not a reader.
+      this.db
+        .prepare(`UPDATE agent_states SET state = ? WHERE agent_id = ? AND state != ?`)
+        .run(MESIState.INVALID, agentId, MESIState.INVALID);
+      this.db.prepare(`DELETE FROM heartbeats WHERE agent_id = ?`).run(agentId);
+      this.db.prepare(`DELETE FROM pending_notices WHERE agent_id = ?`).run(agentId);
+      this.db.exec("COMMIT");
+      return deleted;
     } catch (err) {
       try {
         this.db.exec("ROLLBACK");
