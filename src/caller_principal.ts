@@ -79,6 +79,7 @@ import {
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { sessionToAgentId } from './agent_id.js';
+import { NODE_BACKEND } from './coordinator_pin.js';
 import {
   type CoordinatorEndpoint,
   readBackendFromPidFile,
@@ -113,9 +114,6 @@ const REPORTABLE_REASONS: ReadonlySet<unknown> = new Set([
   CALLER_PRINCIPAL_CLAIMED_REASON,
   CLAIM_UNCONFIRMED_REASON,
 ]);
-/** The pid-file backend that issues no principals (this package's own coordinator). */
-export const NODE_BACKEND = 'node';
-
 /** base64url of 32 random bytes — the shape of a nonce this client makes and a principal the coordinator mints. */
 const VALUE_RE = /^[A-Za-z0-9_-]{43}$/;
 const KEY_RE = /^[0-9a-f]{32}$/;

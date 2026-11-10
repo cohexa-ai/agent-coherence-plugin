@@ -19,12 +19,17 @@
  * The lock is on the inode. Unlinking server.pid while it is held lets the
  * next coordinator lock a new file beside a live one, so it is rewritten in
  * place and never unlinked.
+ *
+ * A client probes the same lock before it sends a coordinator anything
+ * (probePidFileLock): a free lock means the coordinator server.pid names has
+ * exited.
  */
 import { closeSync, constants, fsyncSync, ftruncateSync, openSync, writeSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
-/** From macOS <fcntl.h>; Node's fs.constants does not export it. */
+/** From macOS <fcntl.h>; Node's fs.constants exports neither. */
 const O_EXLOCK = 0x20;
+const O_SHLOCK = 0x10;
 
 /**
  * How long a start retries a held lock before it gives up. The lock is also
@@ -57,6 +62,22 @@ export const LOCK_HELPERS: readonly LockHelper[] = [
     ],
   ],
   ["flock", ["-x", "-n", "3"]],
+];
+
+/**
+ * The LOCK_HELPERS with LOCK_SH | LOCK_NB, on an fd open for reading only;
+ * they exit as those do.
+ */
+export const SHARED_LOCK_HELPERS: readonly LockHelper[] = [
+  [
+    "perl",
+    [
+      "-MFcntl=:flock",
+      "-e",
+      'open(my $fh, "<&=", 3) or exit 2; exit 0 if flock($fh, LOCK_SH | LOCK_NB); exit($!{EWOULDBLOCK} ? 1 : 3)',
+    ],
+  ],
+  ["flock", ["-s", "-n", "3"]],
 ];
 
 /**
@@ -125,4 +146,57 @@ export function rewritePidFile(fd: number, content: string): void {
   ftruncateSync(fd, 0);
   writeSync(fd, content, 0);
   fsyncSync(fd);
+}
+
+/** What a probe of the lock on server.pid found: a coordinator holds it, none does, or null: cannot tell. */
+export type LockProbe = "held" | "free" | null;
+
+/**
+ * Take a shared lock on the open file behind `fd` with the first helper that
+ * answers, as lockWithHelpers does: "free" when it got it (the lock then stays
+ * with `fd` until the caller closes it), "held" when a coordinator holds the
+ * lock, null when the file cannot be locked or no helper could say.
+ */
+export function probeLockWithHelpers(fd: number, helpers: readonly LockHelper[] = SHARED_LOCK_HELPERS): LockProbe {
+  const outcome = lockWithHelpers(fd, helpers);
+  if (outcome === null) return null;
+  return outcome === "held" ? "free" : "held";
+}
+
+// Read-only and never through a link: a client probes a file it does not own.
+const PROBE_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+function probeWithOpenFlags(pidFile: string): LockProbe {
+  try {
+    closeSync(openSync(pidFile, PROBE_FLAGS | O_SHLOCK));
+    return "free";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "EAGAIN" || code === "EWOULDBLOCK" ? "held" : null;
+  }
+}
+
+function probeWithHelpers(pidFile: string): LockProbe {
+  let fd: number;
+  try {
+    fd = openSync(pidFile, PROBE_FLAGS);
+  } catch {
+    return null;
+  }
+  try {
+    return probeLockWithHelpers(fd);
+  } finally {
+    // Drops the shared lock the helper took on this open file.
+    closeSync(fd);
+  }
+}
+
+/**
+ * Whether a coordinator holds its lock on `pidFile` (cohexa-ai/agent-coherence#503).
+ * A SHARED lock, taken and dropped at once, never an exclusive one: a client
+ * probing must not read as a coordinator to another client's probe, nor hold
+ * off a start for longer than an instant, which LOCK_WAIT_MS outlasts.
+ */
+export function probePidFileLock(pidFile: string): LockProbe {
+  return process.platform === "darwin" ? probeWithOpenFlags(pidFile) : probeWithHelpers(pidFile);
 }

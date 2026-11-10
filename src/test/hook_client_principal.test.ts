@@ -43,6 +43,7 @@ import { SessionRegistry } from '../sessions.js';
 import { createServer } from '../server.js';
 import { sessionToAgentId } from '../agent_id.js';
 import { principalRefusalReason, recoverFromPrincipalRefusal } from '../caller_principal.js';
+import { writeStandInPidFile } from './coordinator_stand_in.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HOOK_CLIENT_JS = join(HERE, '..', 'hook_client.js');
@@ -123,7 +124,7 @@ async function fakeCoordinator(
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
   const port = (server.address() as AddressInfo).port;
-  writeFileSync(join(root, '.coherence', 'server.pid'), `${process.pid}\n${port}\n`);
+  writeStandInPidFile(join(root, '.coherence', 'server.pid'), `${process.pid}\n${port}\n`);
   return { server, seen };
 }
 

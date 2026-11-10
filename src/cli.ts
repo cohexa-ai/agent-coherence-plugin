@@ -23,6 +23,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { escapeNonprintable, httpErrorLine, pyRepr } from "./cli_output.js";
 import {
   CLI_REQUEST_TIMEOUT_MS,
+  CoordinatorDeparted,
   type CoordinatorEndpoint,
   findCoordinatorRoot,
   requestJsonStatus,
@@ -211,7 +212,11 @@ function refusalRejections(body: Record<string, unknown> | null): Array<Record<s
   return Array.isArray(rejected) && rejected.every(isPlainObject) ? rejected : [];
 }
 
-/** An exit 2 once the request was sent: the failure line, then the CLI's own rejections. */
+/**
+ * An exit 2 once the request went out (an error answer, or a network error
+ * that cut it short): the failure line, then the CLI's own rejections. An exit
+ * with nothing sent is failUnsent's.
+ */
 function failAfterRequest(prog: PolicyProg, line: string, invalid: ReadonlyArray<[string, string]>): number {
   err(`${prog}: ${line}`);
   printRejections(prog, [], invalid);
@@ -219,28 +224,38 @@ function failAfterRequest(prog: PolicyProg, line: string, invalid: ReadonlyArray
 }
 
 /**
- * The coordinator's endpoint, or null once its absence is reported. Nothing
- * was sent, so the CLI's own rejections stay unprinted, as library #379 allows.
+ * An exit 2 with nothing sent: no coordinator found, or the one found left
+ * before the request (CoordinatorDeparted). Nothing was sent, so the CLI's own
+ * rejections stay unprinted, as library #379 allows.
  */
+function failUnsent(prog: PolicyProg, exc: Error): number {
+  err(`${prog}: ${escapeNonprintable(exc.message)}`);
+  return 2;
+}
+
+/** The coordinator's endpoint, or null once failUnsent reported its absence. */
 function findEndpoint(prog: PolicyProg, root: string): CoordinatorEndpoint | null {
   try {
     return resolveEndpoint(resolve(root));
   } catch (exc) {
-    err(`${prog}: ${escapeNonprintable((exc as Error).message)}`);
+    failUnsent(prog, exc as Error);
     return null;
   }
 }
 
-/** The answer, or the message of the network error that left it incomplete. */
+/**
+ * The answer, the message of the network error that left it incomplete, or
+ * the CoordinatorDeparted that kept it from being sent at all.
+ */
 async function postPolicy(
   endpoint: CoordinatorEndpoint,
   endpointPath: "/policy/track" | "/policy/untrack",
   paths: string[],
-): Promise<Answer | string> {
+): Promise<Answer | string | CoordinatorDeparted> {
   try {
     return await requestJsonStatus(endpoint, "POST", endpointPath, { paths }, undefined, CLI_REQUEST_TIMEOUT_MS);
   } catch (exc) {
-    return (exc as Error).message;
+    return exc instanceof CoordinatorDeparted ? exc : (exc as Error).message;
   }
 }
 
@@ -313,6 +328,7 @@ async function runPolicyMutation(
   const endpoint = findEndpoint(prog, root);
   if (endpoint === null) return 2;
   const answer = await postPolicy(endpoint, endpointPath, valid);
+  if (answer instanceof CoordinatorDeparted) return failUnsent(prog, answer);
   if (typeof answer === "string") return failAfterRequest(prog, escapeNonprintable(answer), invalid);
   if (answer.status < 200 || answer.status >= 300) return reportRefusal(prog, answer, invalid);
   if (answer.body === null) return failAfterRequest(prog, "coordinator returned a non-JSON response", invalid);

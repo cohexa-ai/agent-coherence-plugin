@@ -18,6 +18,7 @@ import { SessionRegistry } from "../sessions.js";
 import { createServer } from "../server.js";
 import { normalizeWorkspacePath } from "../cli.js";
 import { CLI_REQUEST_TIMEOUT_MS, HOOK_REQUEST_TIMEOUT_MS } from "../hook_client_transport.js";
+import { writeStandInPidFile } from "./coordinator_stand_in.js";
 
 const DIST = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -76,7 +77,7 @@ test("end-to-end: a refused write reaches the operator as HTTP <status>: <error>
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   try {
     const port = (server.address() as AddressInfo).port;
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
     writeFileSync(join(root, ".coherence", "tracked.yaml"), "- keep.md\n- *.log\n");
 
@@ -110,7 +111,7 @@ test("end-to-end: a refusal with no string error prints its status; a non-JSON s
   try {
     const port = (fake.address() as AddressInfo).port;
     mkdirSync(join(root, ".coherence"), { recursive: true });
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
 
     const refused = await runCli("cli_untrack.js", ["notes.md", "--root", root], root);
@@ -147,7 +148,7 @@ test("end-to-end: track writes YAML + prints; untrack uses `removed`; status ren
   try {
     const port = (server.address() as AddressInfo).port;
     mkdirSync(join(root, ".coherence"), { recursive: true });
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`); // 2-line Python format
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`); // 2-line Python format
     writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
 
     // track: one valid relative + one absolute-inside (normalized) + one outside (client-rejected).
@@ -281,7 +282,7 @@ async function startPythonStatusStub(): Promise<StatusStub> {
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   const port = (server.address() as AddressInfo).port;
   mkdirSync(join(root, ".coherence"), { recursive: true });
-  writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+  writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
   writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
   const stub: StatusStub = {
     root,
@@ -397,7 +398,7 @@ test("a response cut off mid-body exits 2, not a silent 0", async () => {
   try {
     const port = (server.address() as AddressInfo).port;
     mkdirSync(join(root, ".coherence"), { recursive: true });
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
 
     const cut = await runCli("cli_status.js", ["--root", root], root);
@@ -432,7 +433,7 @@ test("--detail full against the Node coordinator surfaces its 501, exit 2", asyn
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   try {
     const port = (server.address() as AddressInfo).port;
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
 
     const full = await runCli("cli_status.js", ["--detail", "full", "--root", root], root);
@@ -555,7 +556,7 @@ test("the Node coordinator's default tier publishes the workspace root nowhere",
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   try {
     const port = (server.address() as AddressInfo).port;
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
 
     for (const tier of [[], ["--detail", "minimal"]]) {
@@ -642,7 +643,7 @@ async function startCannedCoordinator(): Promise<CannedCoordinator> {
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   const port = (server.address() as AddressInfo).port;
   mkdirSync(join(root, ".coherence"), { recursive: true });
-  writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+  writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
   writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
   return {
     root,
@@ -772,7 +773,7 @@ for (const prog of ["track", "untrack"] as const) {
       assert.doesNotMatch(absent.stderr, /rejected/);
 
       mkdirSync(join(root, ".coherence"), { recursive: true });
-      writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${(server.address() as AddressInfo).port}\n`);
+      writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${(server.address() as AddressInfo).port}\n`);
       writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
       const cut = await runCli(`cli_${prog}.js`, argv, root);
       assert.equal(cut.status, 2, cut.stderr);
