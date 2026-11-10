@@ -73,6 +73,8 @@ check:
   following a link, without blocking and from a regular file only, and the
   hook client refuses a `.coherence` that is a link before it reads anything
   inside it;
+- the hook client and the CLIs read `server.pid` the same way, so they never
+  send the bearer to the port a linked `server.pid` names;
 - the coordinator reads the policy files the same way (`src/disk_content.ts`),
   so a track or untrack over a linked policy file answers HTTP 400, and a
   linked policy file loads as no entries;
@@ -89,8 +91,37 @@ Not covered:
   refuses the workspace; nothing looks for one in between.
 - A link at the workspace root or above it. Only `.coherence` and the entries
   directly inside it are checked.
-- The read of `.coherence/server.pid` by the hook client and the CLIs, which
-  start no coordinator. It still follows a link there.
+
+### A process on an exited coordinator's port
+
+The hook client and the CLIs find the coordinator through the port in
+`.coherence/server.pid` and send the bearer from `hook.secret` with every
+request; the coordinator proves nothing back. Once a coordinator exits, its
+port is free and any local process can bind it. So before each request they
+check (`src/coordinator_pin.ts`) that `server.pid` still names the coordinator
+they found and that it still holds the workspace lock, the `flock` a
+coordinator holds on `server.pid` while it runs. They probe the lock with a
+shared lock dropped at once, never an exclusive one, so a probe never reads as
+a coordinator. A Node coordinator (`backend=node`) is judged by its pid, also
+once it has removed `server.pid` at its stop; a lock seen held keeps it counted
+as running. Where the check sees that the coordinator exited or was replaced,
+nothing is sent. A `server.pid` that is gone or cannot be read does not stop a
+request (for a Node coordinator, only while its pid runs), so an attached
+client keeps working; one that has become a link, or anything but a pid file,
+does ([Cohexa-ai/agent-coherence#503](https://github.com/Cohexa-ai/agent-coherence/issues/503)).
+
+The check is not proof of the secret, and it cannot see everything:
+
+- A coordinator that dies between the check and the send can still lose that
+  one request to a new listener.
+- A start that has taken the lock but not yet emptied a dead coordinator's
+  lines in `server.pid` makes them read as running, so a request in that
+  moment can go to the dead coordinator's port.
+- Where no lock tool can probe the lock (on Linux, neither `perl` nor
+  `flock(1)` is installed, or the file system cannot lock), a request to a
+  coordinator whose `server.pid` has no `backend=node` line goes.
+- A Node coordinator's pid, once another process carries it, reads as that
+  coordinator.
 
 ### Out of scope
 
