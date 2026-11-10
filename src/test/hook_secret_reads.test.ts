@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { coherenceDirRefusalMessage } from '../coherence_dir.js';
 import { compiledModuleUrl, makeFifo, releaseFifo, runBounded } from './fifo_fixture.js';
 import { killAndWait } from './pid_lock_fixture.js';
+import { writeStandInPidFile } from './coordinator_stand_in.js';
 
 const HOOK_CLIENT_JS = join(dirname(fileURLToPath(import.meta.url)), '..', 'hook_client.js');
 const SESSION_ID = '44444444-4444-4444-8444-444444444444';
@@ -191,7 +192,7 @@ test(
 function workspaceWith(root: string, port: number, secret: string): string {
   const coherenceDir = join(root, '.coherence');
   mkdirSync(coherenceDir, { recursive: true });
-  writeFileSync(join(coherenceDir, 'server.pid'), `${process.pid}\n${port}\n`);
+  writeStandInPidFile(join(coherenceDir, 'server.pid'), `${process.pid}\n${port}\n`);
   writeFileSync(join(coherenceDir, 'hook.secret'), `${secret}\n`);
   return coherenceDir;
 }
@@ -267,7 +268,16 @@ test(
     assert.deepEqual(run, {
       timedOut: false,
       rows: {
-        'a regular hook.secret': { value: { port: 4242, bearer: OURS } },
+        'a regular hook.secret': {
+          value: {
+            port: 4242,
+            bearer: OURS,
+            pin: {
+              coherenceDir: at('a regular hook.secret').coherenceDir,
+              lines: { pid: process.pid, port: 4242, backend: null },
+            },
+          },
+        },
         'hook.secret linked to a secret': secretRefused('hook.secret linked to a secret'),
         'hook.secret a dangling link': secretRefused('hook.secret a dangling link'),
         '.coherence linked to another workspace': dirRefused(

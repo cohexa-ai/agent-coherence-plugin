@@ -27,6 +27,7 @@ import {
   SkipHook,
 } from "../hook_client.js";
 import { readPortFromPidFile } from "../hook_client_transport.js";
+import { writeStandInPidFile } from "./coordinator_stand_in.js";
 
 const SID = "44444444-4444-4444-8444-444444444444";
 const HOOK_CLIENT_JS = join(dirname(fileURLToPath(import.meta.url)), "..", "hook_client.js");
@@ -412,7 +413,7 @@ test("session-start fail-open: closed port / empty stdin / malformed JSON → '{
       });
     });
     mkdirSync(join(root, ".coherence"), { recursive: true });
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${closedPort}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${closedPort}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${"x".repeat(32)}\n`);
 
     const down = runClient(

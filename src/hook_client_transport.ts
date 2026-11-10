@@ -9,6 +9,11 @@
  *   NEVER depend on a `backend=` line existing.
  * - Bearer ← `<root>/.coherence/hook.secret`, trimmed, non-empty: a regular
  *   file, never a link, in a `.coherence` that is no link either (#251).
+ * - Nothing is sent to a coordinator that has exited
+ *   (cohexa-ai/agent-coherence#503): resolveEndpoint refuses one, and every
+ *   request first checks that the coordinator it resolved is still the one
+ *   server.pid names (see coordinator_pin.ts). server.pid is read as a regular
+ *   file only, never through a link.
  * - POST/GET to `http://127.0.0.1:{port}{path}` with `Authorization: Bearer`,
  *   `Host: 127.0.0.1`, JSON content type. Redirects are NOT followed (node:http
  *   doesn't follow them; the bearer never leaves the original request).
@@ -19,12 +24,25 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { request } from "node:http";
 import { linkRefusalMessage } from "./coherence_dir.js";
+import {
+  type CoordinatorPin,
+  type PidFileLines,
+  exitEvidence,
+  pinDeparture,
+  readPidFile,
+} from "./coordinator_pin.js";
 import { MAX_SECRET_FILE_BYTES, NOT_REGULAR, isSymlink, readStateFile } from "./disk_content.js";
 
 export class CoordinatorUnavailable extends Error {}
+
+/**
+ * The coordinator an endpoint was resolved from has exited or been replaced,
+ * so the request was not sent (cohexa-ai/agent-coherence#503).
+ */
+export class CoordinatorDeparted extends CoordinatorUnavailable {}
 
 /** Per-git-call wall-clock bound (mirrors the Python resolver's timeout=5.0). */
 const GIT_TIMEOUT_MS = 5000;
@@ -32,6 +50,11 @@ const GIT_TIMEOUT_MS = 5000;
 export interface CoordinatorEndpoint {
   port: number;
   bearer: string;
+  /**
+   * The coordinator resolveEndpoint found, checked before every request. None
+   * for an endpoint built by hand, which no pid file describes.
+   */
+  pin?: CoordinatorPin;
 }
 
 /** Parent repo root from any path inside it (mirrors Python resolver.find_coordinator_root). */
@@ -71,19 +94,15 @@ export function findCoordinatorRoot(start?: string): string | null {
   }
 }
 
+/** The lines of a pid file read as a regular file only, never through a link; none unless it reads. */
+function pidFileLines(pidFilePath: string): PidFileLines | null {
+  const read = readPidFile(dirname(pidFilePath), basename(pidFilePath));
+  return read.status === "read" ? read.lines : null;
+}
+
 /** Port from server.pid: line index 1, int, 1..65535 — else null (mirrors Python read_port_from_file). */
 export function readPortFromPidFile(pidFilePath: string): number | null {
-  let text: string;
-  try {
-    text = readFileSync(pidFilePath, "utf8");
-  } catch {
-    return null;
-  }
-  const lines = text.split(/\r?\n/);
-  if (lines.length < 2) return null;
-  const port = Number.parseInt(lines[1]!.trim(), 10);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
-  return port;
+  return pidFileLines(pidFilePath)?.port ?? null;
 }
 
 /**
@@ -94,22 +113,12 @@ export function readPortFromPidFile(pidFilePath: string): number | null {
  * solely to skip work a Node coordinator could never answer.
  */
 export function readBackendFromPidFile(pidFilePath: string): string | null {
-  let text: string;
-  try {
-    text = readFileSync(pidFilePath, 'utf8');
-  } catch {
-    return null;
-  }
-  const line = text.split(/\r?\n/)[2];
-  if (line === undefined || !line.startsWith('backend=')) return null;
-  const backend = line.slice('backend='.length).trim();
-  return backend === '' ? null : backend;
+  return pidFileLines(pidFilePath)?.backend ?? null;
 }
 
 /** Read port + bearer from `<root>/.coherence/` or throw CoordinatorUnavailable. */
 export function resolveEndpoint(coordinatorRoot: string): CoordinatorEndpoint {
   const coherenceDir = join(coordinatorRoot, ".coherence");
-  const pidFile = join(coherenceDir, "server.pid");
   const secretFile = join(coherenceDir, "hook.secret");
 
   // #251: a linked .coherence is another directory's state, so its server.pid
@@ -117,15 +126,37 @@ export function resolveEndpoint(coordinatorRoot: string): CoordinatorEndpoint {
   // coordinator's bearer, and a FIFO there would hold this read. Checked
   // before anything inside it is read.
   throwIfCoherenceDirLinked(coherenceDir);
-  const port = readPortFromPidFile(pidFile);
-  if (port === null) {
-    throw new CoordinatorUnavailable(`no coordinator running for this workspace (no port in ${pidFile})`);
-  }
+  const { lines, port } = runningCoordinatorLines(coherenceDir);
   const bearer = readBearer(coherenceDir, secretFile);
   if (bearer === "") {
     throw new CoordinatorUnavailable(`${secretFile} is empty`);
   }
-  return { port, bearer };
+  return { port, bearer, pin: { coherenceDir, lines } };
+}
+
+/**
+ * server.pid's lines and port, once they name a coordinator that has not
+ * exited. Read as a regular file only: a link there would send the bearer to
+ * whatever port the file it names holds.
+ */
+function runningCoordinatorLines(coherenceDir: string): { lines: PidFileLines; port: number } {
+  const read = readPidFile(coherenceDir);
+  const pidFile = read.path;
+  if (read.status === "link") throw new CoordinatorUnavailable(linkRefusalMessage(pidFile, coherenceDir));
+  if (read.status === "not_regular") {
+    throw new CoordinatorUnavailable(`${pidFile} is not a regular file; restart the coordinator`);
+  }
+  const lines = read.status === "read" ? read.lines : null;
+  if (lines === null || lines.port === null) {
+    throw new CoordinatorUnavailable(`no coordinator running for this workspace (no port in ${pidFile})`);
+  }
+  const evidence = exitEvidence(pidFile, lines);
+  if (evidence !== null) {
+    throw new CoordinatorUnavailable(
+      `no coordinator running for this workspace (${pidFile} names pid ${lines.pid}, which ${evidence}); start one`,
+    );
+  }
+  return { lines, port: lines.port };
 }
 
 function throwIfCoherenceDirLinked(coherenceDir: string): void {
@@ -182,6 +213,9 @@ export async function requestJson(
  * coordinator does not implement) from other refusals, or read a 400's
  * `{error}` — the caller-principal claim and its refusal report. `timeoutMs`
  * bounds how long the socket may sit idle; the hooks' limit unless given.
+ * Rejects with CoordinatorDeparted, no socket opened, once the coordinator a
+ * pinned endpoint was resolved from may no longer be the one on its port: a
+ * process that took the port never receives the bearer.
  */
 export function requestJsonStatus(
   endpoint: CoordinatorEndpoint,
@@ -192,6 +226,11 @@ export function requestJsonStatus(
   timeoutMs: number = HOOK_REQUEST_TIMEOUT_MS,
 ): Promise<{ status: number; body: Record<string, unknown> | null }> {
   return new Promise((resolvePromise, rejectPromise) => {
+    const departure = endpoint.pin === undefined ? null : pinDeparture(endpoint.pin);
+    if (departure !== null) {
+      rejectPromise(new CoordinatorDeparted(`${departure}; nothing was sent`));
+      return;
+    }
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8");
     const headers: Record<string, string> = {
       Authorization: `Bearer ${endpoint.bearer}`,
