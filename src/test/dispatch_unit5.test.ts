@@ -7,11 +7,12 @@
  */
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, cpSync, chmodSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, cpSync, chmodSync, symlinkSync, readFileSync, existsSync, realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { findCoordinatorRoot } from "../hook_client_transport.js";
 import { writeExecutable } from "./executable_fixture.js";
 import { makeFifo, runCommandBounded } from "./fifo_fixture.js";
 import { shimRefusal, type ShimRefusalKind } from "./shim_refusal_fixture.js";
@@ -196,6 +197,94 @@ test("dispatcher: env override beats the file; unknown values fall back to pytho
     assert.equal(env.stdout.trim(), "NODE-BOOTSTRAP");
     const unknown = runDispatch(STUB_ROOT, ws, { COHERENCE_COORDINATOR_BACKEND: "cobol" });
     assert.equal(unknown.stdout.trim(), "PYTHON-BOOTSTRAP");
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+// ------------------------------------- workspace the Node coordinator serves (#254)
+
+/** ensure-coordinator-node's workspace line, which the stub below repeats. */
+const NODE_BOOTSTRAP_WORKSPACE_LINE = 'WORKSPACE="${AGENT_COHERENCE_WORKSPACE:-$PWD}"';
+
+/** A plugin-root copy whose Node bootstrap stub prints the workspace the real one would serve. */
+const WORKSPACE_STUB_ROOT = ((): string => {
+  const root = join(STUBS, "plugin-workspace");
+  mkdirSync(join(root, "bin"), { recursive: true });
+  cpSync(join(PLUGIN_ROOT, "bin", "ensure-coordinator-dispatch"), join(root, "bin", "ensure-coordinator-dispatch"));
+  writeExecutable(join(root, "bin", "ensure-coordinator"), "#!/usr/bin/env bash\necho PYTHON-BOOTSTRAP\n");
+  writeExecutable(
+    join(root, "bin", "ensure-coordinator-node"),
+    `#!/usr/bin/env bash\n${NODE_BOOTSTRAP_WORKSPACE_LINE}\necho "NODE-BOOTSTRAP $WORKSPACE"\n`,
+  );
+  return root;
+})();
+
+function dispatchFrom(cwd: string, env: Record<string, string> = {}) {
+  return spawnSync("/bin/bash", [join(WORKSPACE_STUB_ROOT, "bin", "ensure-coordinator-dispatch")], {
+    cwd,
+    encoding: "utf8",
+    env: { PATH: NODE_24_PATH, HOME: cwd, ...env } as NodeJS.ProcessEnv,
+    timeout: 10000,
+  });
+}
+
+function git(cwd: string, ...args: string[]) {
+  return spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", ...args], { cwd, encoding: "utf8" });
+}
+
+test("dispatcher: a session started in a subdirectory or a linked worktree starts the Node coordinator at the root the hooks use", () => {
+  assert.ok(
+    readFileSync(join(PLUGIN_ROOT, "bin", "ensure-coordinator-node"), "utf8").includes(NODE_BOOTSTRAP_WORKSPACE_LINE),
+    "the stub no longer repeats ensure-coordinator-node's workspace line",
+  );
+  const base = mkdtempSync(join(tmpdir(), "dispatch5-root-"));
+  try {
+    const repo = join(base, "repo");
+    const subdirectory = join(repo, "sub", "deeper");
+    mkdirSync(subdirectory, { recursive: true });
+    git(repo, "init", "-q");
+    git(repo, "commit", "-q", "--allow-empty", "-m", "init");
+    const worktree = join(base, "worktree");
+    assert.equal(git(repo, "worktree", "add", "-q", worktree).status, 0);
+
+    for (const cwd of [subdirectory, worktree]) {
+      // The workspace every hook and CLI resolves from this directory.
+      const hooksRoot = findCoordinatorRoot(cwd);
+      assert.ok(hooksRoot !== null && hooksRoot !== realpathSync(cwd), `the hooks resolve ${String(hooksRoot)} from ${cwd}`);
+      const r = dispatchFrom(cwd);
+      assert.deepEqual({ status: r.status, stdout: r.stdout }, { status: 0, stdout: `NODE-BOOTSTRAP ${hooksRoot}\n` }, r.stderr);
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("dispatcher: an explicit AGENT_COHERENCE_WORKSPACE still names the Node coordinator's workspace", () => {
+  const ws = mkdtempSync(join(tmpdir(), "dispatch5-ws-"));
+  const elsewhere = mkdtempSync(join(tmpdir(), "dispatch5-elsewhere-"));
+  try {
+    git(ws, "init", "-q");
+    const r = dispatchFrom(ws, { AGENT_COHERENCE_WORKSPACE: elsewhere });
+    assert.deepEqual({ status: r.status, stdout: r.stdout }, { status: 0, stdout: `NODE-BOOTSTRAP ${elsewhere}\n` }, r.stderr);
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+    rmSync(elsewhere, { recursive: true, force: true });
+  }
+});
+
+test("dispatcher: outside a git repository no Node coordinator starts, since no hook would ever reach it", () => {
+  const ws = mkdtempSync(join(tmpdir(), "dispatch5-nogit-"));
+  try {
+    // Keep git from finding a repository above the temp directory.
+    const env = { GIT_CEILING_DIRECTORIES: dirname(ws) };
+    assert.equal(findCoordinatorRoot(ws), null);
+    for (const backend of [{}, { COHERENCE_COORDINATOR_BACKEND: "node" }]) {
+      const r = dispatchFrom(ws, { ...env, ...backend });
+      assert.deepEqual({ status: r.status, stdout: r.stdout }, { status: 0, stdout: "" }, r.stderr);
+      assert.match(r.stderr, /not in a git repository; no coordinator started/);
+    }
+    assert.equal(existsSync(join(ws, ".coherence")), false);
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }

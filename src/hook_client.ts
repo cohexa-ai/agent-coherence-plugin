@@ -182,6 +182,13 @@ export function buildSessionStop(cc: CcPayload): Record<string, unknown> {
  * verb. The subagent identity is MANDATORY here — a SubagentStop payload
  * without an agent id must NOT fall back to the parent identity (that would
  * release the parent's live grants); absence skips (fail-open `{}`).
+ *
+ * A missed SubagentStop: the Python coordinator's heartbeat/idle sweep
+ * reclaims the grant. The Node coordinator has no sweep, so the subagent's
+ * grant stays held until a session-stop or a failed post-edit for that
+ * identity releases it, an ordinary pre-edit displaces it, or an opted-in
+ * pre-edit (`if_unheld: true`) 1800 s or more after its grant reclaims it. A
+ * parent's Stop does not release it.
  */
 export function buildSubagentStop(cc: CcPayload): Record<string, unknown> {
   const sessionId = requireSessionId(cc);
@@ -206,12 +213,24 @@ export function buildSubagentStop(cc: CcPayload): Record<string, unknown> {
  * absent source is not a compaction — SkipHook rides the fail-open ladder
  * to `{}` with NO network call. SessionStart stdin carries no agent_id;
  * withAgentId stays additive-only, so nothing is fabricated.
+ *
+ * hooks.json runs this in parallel with the bootstrap shim, which never reads
+ * stdin, so the pair is safe. A coordinator cold or crashed at compact time
+ * fails this open (`{}`) and that compaction's re-grounding is lost: the
+ * documented SB-10 loss mode.
  */
 export function buildSessionStart(cc: CcPayload): Record<string, unknown> {
   if (cc.source !== "compact") throw new SkipHook('source is not "compact"');
   return withAgentId(cc, { session_id: requireSessionId(cc) });
 }
 
+/**
+ * KTD-N H4: hooks.json matches Bash and Grep as well as Read because a model
+ * whose Read was warned or denied routes around it with `bash cat plan.md` or a
+ * grep over the directory. pre-bash forwards the command, from which the
+ * coordinator extracts tracked paths; pre-grep forwards the search root, under
+ * which it enumerates the tracked artifacts.
+ */
 export function buildPreBash(cc: CcPayload): Record<string, unknown> {
   const sessionId = requireSessionId(cc);
   const command = toolInput(cc).command;

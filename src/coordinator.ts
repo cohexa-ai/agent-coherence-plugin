@@ -31,7 +31,9 @@ import { ArtifactRegistry } from "./registry.js";
 import { PolicyRef } from "./policy.js";
 import { SessionRegistry } from "./sessions.js";
 import { readPackageVersion } from "./version.js";
-import { lockPidFile, rewritePidFile } from "./coordinator_lock.js";
+import { lockPidFile, pidFileDeparture, rewritePidFile } from "./coordinator_lock.js";
+
+const PID_FILE_CHECK_MS = 5000;
 
 interface Workspace {
   root: string;
@@ -198,9 +200,14 @@ async function main(): Promise<void> {
   // releases the lock, as on the Python coordinator, so a start that takes
   // the lock next finds no port to dial. Unlocked, server.pid is removed as
   // before #217, and only while it still holds what this coordinator wrote:
-  // it may be another coordinator's.
-  const shutdown = (signal: NodeJS.Signals): void => {
-    logInfo(`shutting down on ${signal}`);
+  // it may be another coordinator's. It runs once: a signal that arrives while
+  // it runs, or a second signal, would otherwise close the server twice.
+  let stopping = false;
+  const shutdown = (reason: string): void => {
+    if (stopping) return;
+    stopping = true;
+    clearInterval(pidFileWatch);
+    logInfo(`shutting down ${reason}`);
     const holdsLock = pidLock.state === "held";
     if (holdsLock && publishedPidFile !== null) {
       try {
@@ -231,8 +238,20 @@ async function main(): Promise<void> {
     });
   };
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  // #234: a coordinator no client can reach stops instead of running for
+  // ever. Clients find it only through server.pid, so once that is gone with
+  // its workspace (a removed git worktree), replaced, or rewritten by another
+  // coordinator, this one has nothing left to serve. Checked as often as the
+  // Python coordinator's watcher ticks.
+  const pidFileWatch = setInterval(() => {
+    if (publishedPidFile === null) return;
+    const departure = pidFileDeparture(workspace.pidFile, pidLock.fd, publishedPidFile);
+    if (departure !== null) shutdown(`because ${departure}`);
+  }, PID_FILE_CHECK_MS);
+  pidFileWatch.unref();
+
+  process.on("SIGINT", () => shutdown("on SIGINT"));
+  process.on("SIGTERM", () => shutdown("on SIGTERM"));
 }
 
 main().catch((err: unknown) => {

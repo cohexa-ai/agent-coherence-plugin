@@ -50,7 +50,9 @@
 #
 # Workspace root mirrors the hook-client's resolution: git common-dir (linked
 # worktrees resolve to the parent repo) else toplevel. Not a git repo → no
-# workspace state to protect, so the runtime guard alone decides.
+# workspace state to protect, so the runtime guard alone decides. The Node
+# bootstrap is handed this root as its workspace, and outside a git repo it
+# does not run at all (see the node case at the end).
 #
 # Before any of that, and whatever selects the backend, the root's .coherence
 # is checked (coherence-dir-check below). A refused start runs neither
@@ -177,6 +179,18 @@ fi
 
 case "$backend" in
   node)
+    # The Node bootstrap and its coordinator serve AGENT_COHERENCE_WORKSPACE,
+    # else the directory the session started in, while every hook and CLI
+    # uses the root resolved above (#254). Outside a repository those use
+    # none, so a coordinator started there would serve no one and never stop:
+    # none starts, as the Python bootstrap starts none there either.
+    if [ -z "${AGENT_COHERENCE_WORKSPACE:-}" ]; then
+      if [ -z "$root" ]; then
+        echo "agent-coherence: not in a git repository; no coordinator started (the hooks work only inside one)" >&2
+        exit 0
+      fi
+      export AGENT_COHERENCE_WORKSPACE="$root"
+    fi
     exec "$self_dir/ensure-coordinator-node"
     ;;
   *)

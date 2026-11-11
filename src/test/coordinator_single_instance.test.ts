@@ -167,6 +167,36 @@ test(
 );
 
 test(
+  "a coordinator whose workspace is removed stops by itself (#234)",
+  withWorkspace(async (ws, started) => {
+    // A workspace removed under a running coordinator, as with a removed git
+    // worktree: no client can find it any more, so it must not run for ever.
+    const coordinator = startCoordinator(ws);
+    started.push(coordinator);
+    await waitFor("the coordinator to publish", () => publishedPid(ws));
+    rmSync(join(ws, ".coherence"), { recursive: true, force: true });
+    assert.equal(await within("the coordinator to stop", coordinator.exited), 0, coordinator.stderr());
+    assert.match(coordinator.stderr(), /shutting down because .*server\.pid is gone/);
+  }),
+);
+
+test(
+  "a coordinator whose server.pid is replaced stops by itself and leaves the new file alone (#234)",
+  withWorkspace(async (ws, started) => {
+    const coordinator = startCoordinator(ws);
+    started.push(coordinator);
+    await waitFor("the coordinator to publish", () => publishedPid(ws));
+    // Deleting server.pid lets a second coordinator lock a new file beside
+    // this one; clients follow the new file, so this one has nothing to serve.
+    rmSync(pidFileOf(ws));
+    writeFileSync(pidFileOf(ws), "99999\n1\nbackend=node\n");
+    assert.equal(await within("the coordinator to stop", coordinator.exited), 0, coordinator.stderr());
+    assert.match(coordinator.stderr(), /shutting down because .*server\.pid is another file now/);
+    assert.equal(readFileSync(pidFileOf(ws), "utf8"), "99999\n1\nbackend=node\n");
+  }),
+);
+
+test(
   "on a host that cannot lock, coordinators run unlocked as before and remove only their own files on stop",
   { skip: process.platform === "darwin" ? "macOS always locks, with open(2)" : false },
   withWorkspace(async (ws, started) => {
@@ -190,5 +220,27 @@ test(
     assert.equal(await within("the second coordinator to stop", second.exited), 0, second.stderr());
     assert.equal(existsSync(pidFileOf(ws)), false, "an unlocked coordinator removes its own server.pid, as before #217");
     assert.equal(existsSync(join(ws, ".coherence", "server.port")), false, "no coordinator writes server.port");
+  }),
+);
+
+test(
+  "on a host that cannot lock, a coordinator whose server.pid another one rewrote stops by itself, leaving one (#234)",
+  { skip: process.platform === "darwin" ? "macOS always locks, with open(2)" : false },
+  withWorkspace(async (ws, started) => {
+    // Unlocked, both coordinators write the same file. Clients follow the
+    // last lines written, so the first one has nothing left to serve.
+    const emptyBin = join(ws, "empty-bin");
+    mkdirSync(emptyBin);
+    const first = startCoordinator(ws, { PATH: emptyBin });
+    started.push(first);
+    await waitFor("the first coordinator to publish", () => publishedWithPortBy(ws, first.child.pid));
+    const second = startCoordinator(ws, { PATH: emptyBin });
+    started.push(second);
+    const secondPidFile = await waitFor("the second coordinator to publish", () => publishedWithPortBy(ws, second.child.pid));
+
+    assert.equal(await within("the first coordinator to stop by itself", first.exited), 0, first.stderr());
+    assert.match(first.stderr(), /shutting down because .*server\.pid no longer names this coordinator/);
+    assert.equal(readFileSync(pidFileOf(ws), "utf8"), secondPidFile);
+    assert.equal(second.child.exitCode, null, second.stderr());
   }),
 );
