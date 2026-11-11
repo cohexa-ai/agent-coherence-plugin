@@ -179,14 +179,19 @@ export function pidFileDeparture(pidFile: string, fd: number, published: string)
   if (onDisk.dev !== opened.dev || onDisk.ino !== opened.ino) return `${pidFile} is another file now`;
   // The same file: read through the descriptor, so a file swapped in since the
   // check above is never what is compared.
-  return readPidFileThrough(fd) === published ? null : `${pidFile} no longer names this coordinator`;
+  return holdsExactly(fd, published) ? null : `${pidFile} no longer names this coordinator`;
 }
 
-function readPidFileThrough(fd: number): string {
-  const { size } = fstatSync(fd);
-  const buffer = Buffer.alloc(size);
-  const read = readSync(fd, buffer, 0, size, 0);
-  return buffer.toString("utf8", 0, read);
+/**
+ * Whether the file open on `fd` holds `expected` and nothing more. One byte
+ * past it is read, so a longer file never matches, and a file of any size
+ * costs no more than that.
+ */
+function holdsExactly(fd: number, expected: string): boolean {
+  const want = Buffer.from(expected, "utf8");
+  const buffer = Buffer.alloc(want.length + 1);
+  const read = readSync(fd, buffer, 0, buffer.length, 0);
+  return read === want.length && buffer.subarray(0, read).equals(want);
 }
 
 /** What a probe of the lock on server.pid found: a coordinator holds it, none does, or null: cannot tell. */

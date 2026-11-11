@@ -33,7 +33,6 @@ import { SessionRegistry } from "./sessions.js";
 import { readPackageVersion } from "./version.js";
 import { lockPidFile, pidFileDeparture, rewritePidFile } from "./coordinator_lock.js";
 
-/** How often a coordinator checks that server.pid still leads clients to it (#234). */
 const PID_FILE_CHECK_MS = 5000;
 
 interface Workspace {
