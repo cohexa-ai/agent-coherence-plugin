@@ -390,6 +390,21 @@ test(
 );
 
 test(
+  "a descriptor that cannot be read says nothing about server.pid, rather than throwing out of the coordinator's timer",
+  withPidFile(async (pidFile) => {
+    // The check runs in a timer with no handler around it: a throw there
+    // would end the coordinator without its shutdown. A closed descriptor
+    // stands in for one that fails as on a network file system (EIO, ESTALE).
+    const published = "4242\n5151\nbackend=node\n";
+    const lock = tryLockPidFile(pidFile);
+    if (lock.state === "contended") assert.fail("the lock is held");
+    rewritePidFile(lock.fd, published);
+    closeSync(lock.fd);
+    assert.equal(pidFileDeparture(pidFile, lock.fd, published), null);
+  }),
+);
+
+test(
   "the probe never follows a link at server.pid",
   withPidFile(async (pidFile) => {
     const target = `${pidFile}.target`;

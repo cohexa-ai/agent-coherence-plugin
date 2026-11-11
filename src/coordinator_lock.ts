@@ -175,11 +175,17 @@ export function pidFileDeparture(pidFile: string, fd: number, published: string)
     const code = (err as NodeJS.ErrnoException).code;
     return code === "ENOENT" || code === "ENOTDIR" ? `${pidFile} is gone` : null;
   }
-  const opened = fstatSync(fd);
-  if (onDisk.dev !== opened.dev || onDisk.ino !== opened.ino) return `${pidFile} is another file now`;
-  // The same file: read through the descriptor, so a file swapped in since the
-  // check above is never what is compared.
-  return holdsExactly(fd, published) ? null : `${pidFile} no longer names this coordinator`;
+  try {
+    const opened = fstatSync(fd);
+    if (onDisk.dev !== opened.dev || onDisk.ino !== opened.ino) return `${pidFile} is another file now`;
+    // The same file: read through the descriptor, so a file swapped in since
+    // the check above is never what is compared.
+    return holdsExactly(fd, published) ? null : `${pidFile} no longer names this coordinator`;
+  } catch {
+    // The descriptor failed (EIO, ESTALE on a network file system), which
+    // tells nothing about server.pid. The caller is a timer that must not throw.
+    return null;
+  }
 }
 
 /**
