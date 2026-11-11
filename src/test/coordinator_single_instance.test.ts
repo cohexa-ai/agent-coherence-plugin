@@ -222,3 +222,25 @@ test(
     assert.equal(existsSync(join(ws, ".coherence", "server.port")), false, "no coordinator writes server.port");
   }),
 );
+
+test(
+  "on a host that cannot lock, a coordinator whose server.pid another one rewrote stops by itself, leaving one (#234)",
+  { skip: process.platform === "darwin" ? "macOS always locks, with open(2)" : false },
+  withWorkspace(async (ws, started) => {
+    // Unlocked, both coordinators write the same file. Clients follow the
+    // last lines written, so the first one has nothing left to serve.
+    const emptyBin = join(ws, "empty-bin");
+    mkdirSync(emptyBin);
+    const first = startCoordinator(ws, { PATH: emptyBin });
+    started.push(first);
+    await waitFor("the first coordinator to publish", () => publishedWithPortBy(ws, first.child.pid));
+    const second = startCoordinator(ws, { PATH: emptyBin });
+    started.push(second);
+    const secondPidFile = await waitFor("the second coordinator to publish", () => publishedWithPortBy(ws, second.child.pid));
+
+    assert.equal(await within("the first coordinator to stop by itself", first.exited), 0, first.stderr());
+    assert.match(first.stderr(), /shutting down because .*server\.pid no longer names this coordinator/);
+    assert.equal(readFileSync(pidFileOf(ws), "utf8"), secondPidFile);
+    assert.equal(second.child.exitCode, null, second.stderr());
+  }),
+);
