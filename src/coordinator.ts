@@ -33,6 +33,7 @@ import { SessionRegistry } from "./sessions.js";
 import { readPackageVersion } from "./version.js";
 import { lockPidFile, rewritePidFile } from "./coordinator_lock.js";
 import { foldProfileLogLine, probeFoldProfile } from "./fs_profile.js";
+import { prepareFoldIndex } from "./fold_merge.js";
 
 interface Workspace {
   root: string;
@@ -143,6 +144,15 @@ async function main(): Promise<void> {
       `(schema_version=${registry.getStats().schemaVersion}, ` +
       `migrations_applied=${registry.getStats().migrationsApplied})`,
   );
+  // Still under the lock and before the server exists: merge the rows an
+  // older build split for one file, then key file rows by the disk's fold.
+  prepareFoldIndex({
+    registry,
+    root: workspace.root,
+    foldProfile,
+    lockHeld: pidLock.state === "held",
+    log: logInfo,
+  });
 
   const policy = PolicyRef.load(workspace.root);
   const policySummary = policy.summary();

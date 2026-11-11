@@ -39,6 +39,97 @@ import {
   RECLAIM_MAX_HOLD_TRIGGER,
   RECLAMATION_PREEMPTER_ID,
 } from "./acquire_or_fail.js";
+import { tidyPath, type FoldProfile } from "./path_fold.js";
+import {
+  FOLD_MERGE_PREEMPTER_ID,
+  FOLD_MERGE_TRIGGER,
+  indexKeyOf,
+  planFoldMerge,
+  type FoldGroup,
+  type FoldRow,
+  type MergeArtifactRow,
+  type MergeNoticeRow,
+  type MergePlan,
+  type MergeSnapshot,
+  type MergeStateRow,
+} from "./fold_merge.js";
+
+/**
+ * A file request's name, as the route door computes it: `key` is the fold
+ * key under the coordinator's profile, `tidied` the request's tidied
+ * spelling, and `diskSpelling` the disk's own spelling of the request when it
+ * has one (inside the root and folding to `key`). The registry makes no
+ * filesystem calls, so the door finds the disk spelling.
+ */
+export interface FileName {
+  readonly key: string;
+  readonly tidied: string;
+  readonly diskSpelling?: string;
+}
+
+/** One fold key that several file rows share, lowest rowid first. */
+export interface FoldBucket {
+  readonly key: string;
+  readonly ids: readonly string[];
+}
+
+/**
+ * Fold key -> file-row ids, lowest rowid first, each file row listed once
+ * under the key of its stored name. Built once per start after the merge.
+ */
+interface FoldIndex {
+  readonly profile: FoldProfile;
+  readonly byKey: Map<string, string[]>;
+  readonly keyById: Map<string, string>;
+}
+
+/** A write holder found on one of a file's rows. */
+interface RowWriter {
+  readonly artifactId: string;
+  readonly agentId: string;
+  readonly state: MESIState;
+  readonly grantedAtTick: number | null;
+}
+
+interface InsertRequest {
+  /** The lookup that runs inside the insert's transaction. */
+  readonly existing: () => Artifact | null;
+  readonly name: string;
+  readonly contentHash: string;
+  readonly isKey: boolean;
+}
+
+const STATE_COLUMNS =
+  "artifact_id, agent_id, state, transient_state, transient_tick, granted_at_tick, " +
+  "last_reclaim_trigger, last_reclaim_tick, deadline_tick, last_observed_version";
+
+function isUniqueViolation(err: unknown): boolean {
+  return (
+    err !== null &&
+    typeof err === "object" &&
+    "code" in err &&
+    err.code === "SQLITE_CONSTRAINT_UNIQUE"
+  );
+}
+
+function placeholdersFor(values: readonly unknown[]): string {
+  return values.map(() => "?").join(", ");
+}
+
+/** A write grant held under `MAX_HOLD_SEC`, or with no recorded tick, is current: it is never reclaimed. */
+function isCurrentHolder(holder: RowWriter, nowTick: number): boolean {
+  return holder.grantedAtTick === null || nowTick - holder.grantedAtTick < MAX_HOLD_SEC;
+}
+
+export type FoldMergeOutcome =
+  | {
+      kind: "merged";
+      survivorId: string;
+      removedIds: readonly string[];
+      keeperAgentId: string | null;
+      demotedWriters: readonly string[];
+    }
+  | { kind: "skipped"; reason: string };
 
 /** Per KTD-K REVISED: per-lock-acquisition retry budget, NOT per-transaction. */
 export const BUSY_TIMEOUT_MS = 1500;
@@ -150,6 +241,7 @@ export class ArtifactRegistry {
   private readonly db: Database;
   private readonly stats: RegistryStats;
   private closed = false;
+  private foldIndex: FoldIndex | null = null;
 
   constructor(databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
@@ -169,11 +261,146 @@ export class ArtifactRegistry {
       schemaVersion: result.current,
       migrationsApplied: result.applied.length,
     };
+    this.ensureNameKindsTable();
   }
 
   /** Stats from constructor migration run; surfaces in /status diagnostics. */
   getStats(): RegistryStats {
     return this.stats;
+  }
+
+  // ------------------------------------------------------------------
+  // One identity per file: the fold index, key rows, the start-time merge
+  // ------------------------------------------------------------------
+
+  /**
+   * The side table listing the rows created for names that are not files
+   * (keys). Created at every writer open, outside the migration chain: a new
+   * `user_version` would make an older Node build refuse the store, while an
+   * extra table passes the foreign-ledger guard (`rejectForeignLedgerDb`),
+   * which inspects only the schema_runtime stamp, the artifact_versions table
+   * and artifacts.owner_generation.
+   */
+  private ensureNameKindsTable(): void {
+    this.db.exec(
+      `CREATE TABLE IF NOT EXISTS artifact_name_kinds (
+         artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+         kind        TEXT NOT NULL
+       )`,
+    );
+  }
+
+  /**
+   * Key file rows by `profile`: every row not listed as a key, in rowid
+   * order, once, under the fold of its stored name. Called once per start,
+   * after the merge, by a coordinator that holds the single-writer lock;
+   * until then names stay exact. Returns each key several file rows share.
+   */
+  buildFoldIndex(profile: FoldProfile): FoldBucket[] {
+    const byKey = new Map<string, string[]>();
+    const keyById = new Map<string, string>();
+    for (const row of this.fileRowsForFold()) {
+      const key = indexKeyOf(row.name, profile);
+      const ids = byKey.get(key) ?? [];
+      ids.push(row.id);
+      byKey.set(key, ids);
+      keyById.set(row.id, key);
+    }
+    this.foldIndex = { profile, byKey, keyById };
+    return [...byKey]
+      .filter(([, ids]) => ids.length > 1)
+      .map(([key, ids]) => ({ key, ids: [...ids] }));
+  }
+
+  /** The profile the fold index was built under, or null while names stay exact. */
+  foldIndexProfile(): FoldProfile | null {
+    return this.foldIndex?.profile ?? null;
+  }
+
+  /** Every row not listed as a key, in rowid order (insertion order: no AUTOINCREMENT, no VACUUM). */
+  fileRowsForFold(): FoldRow[] {
+    return this.db
+      .prepare(
+        `SELECT rowid AS rowid, id, name FROM artifacts
+         WHERE id NOT IN (SELECT artifact_id FROM artifact_name_kinds)
+         ORDER BY rowid`,
+      )
+      .all() as FoldRow[];
+  }
+
+  /**
+   * The artifact a file request names. With the index every spelling of a
+   * key reaches the key's lowest-rowid row, so a bucket (rows a merge left
+   * apart) acts as one file; without it the tidied spelling is looked up
+   * exactly.
+   */
+  findFileArtifact(name: FileName): Artifact | null {
+    return this.foldIndex === null ? this.selectByName(name.tidied) : this.indexedArtifact(name.key);
+  }
+
+  /**
+   * `findFileArtifact`, registering the file at version 1 on a miss. A new
+   * row is named by the disk's spelling when the request has one, else by
+   * the tidied request, and never joins a key that already has a row.
+   */
+  resolveOrRegisterFile(name: FileName, contentHash: string): string {
+    const stored = name.diskSpelling ?? name.tidied;
+    const result = this.resolveOrInsert({
+      existing: () => this.findFileArtifact(name),
+      name: stored,
+      contentHash,
+      isKey: false,
+    });
+    // Listed only once the insert committed: one that rolled back leaves no entry.
+    if (result.inserted) this.addIndexed(result.id, stored);
+    return result.id;
+  }
+
+  /** The artifact a key (a name that is not a file) names, by its exact name. */
+  findKeyArtifact(name: string): Artifact | null {
+    return this.selectByName(name);
+  }
+
+  /**
+   * `findKeyArtifact`, registering the key at version 1 on a miss and
+   * listing the new row as a key, so later starts keep it out of the index
+   * and the merge. A file row of the same exact name is shared, as before.
+   */
+  resolveOrRegisterKey(name: string, contentHash: string): string {
+    return this.resolveOrInsert({
+      existing: () => this.selectByName(name),
+      name,
+      contentHash,
+      isKey: true,
+    }).id;
+  }
+
+  /**
+   * Merge one group the start found, in one BEGIN IMMEDIATE that re-reads
+   * it: a group whose rows are gone, are listed as keys or no longer share
+   * the key is skipped and changes nothing. Every state and notice moves to
+   * the survivor before any row is deleted (the delete cascades), and the
+   * single-writer check runs before COMMIT; any failure rolls back.
+   */
+  mergeFoldGroup(group: FoldGroup, nowTick: number): FoldMergeOutcome {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const artifacts = this.groupArtifacts(group.ids);
+      const stale = this.staleGroupReason(group, artifacts);
+      if (stale !== null) {
+        this.db.exec("COMMIT");
+        return { kind: "skipped", reason: stale };
+      }
+      const facts = { diskSpelling: group.diskSpelling, diskHash: group.diskHash, nowTick };
+      const plan = planFoldMerge(this.groupSnapshot(artifacts), facts);
+      this.applyMergePlan(plan, group.ids);
+      this.db.exec("COMMIT");
+      const { survivorId, removedIds, keeperAgentId, demotedWriters } = plan;
+      return { kind: "merged", survivorId, removedIds, keeperAgentId, demotedWriters };
+    } catch (err) {
+      this.rollbackQuietly();
+      throw err;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -184,7 +411,7 @@ export class ArtifactRegistry {
    * KTD-9 first-observation seeding. Mirrors Python `resolve_or_register`
    * (sqlite_registry.py:818).
    *
-   * Atomically: SELECT artifact by name → if found, return its id; otherwise
+   * Atomically: look the artifact up -> if found, return its id; otherwise
    * INSERT new artifact at version=1 with the given content_hash. Concurrent
    * first-Reads from two sessions on the same fresh path converge to ONE row:
    * BEGIN IMMEDIATE + UNIQUE constraint on `artifacts.name` absorbs the race;
@@ -192,48 +419,12 @@ export class ArtifactRegistry {
    * we catch + re-fetch.
    *
    * Returns the artifact's UUID hex id (32 chars, no hyphens, lowercase).
+   *
+   * `name` is a file path: it goes through the fold key like
+   * `resolveOrRegisterFile`, with no disk spelling.
    */
   resolveOrRegisterArtifact(name: string, contentHash: string): string {
-    const select = this.db.prepare(`SELECT id FROM artifacts WHERE name = ?`);
-    const insert = this.db.prepare(`
-      INSERT INTO artifacts (id, name, version, content_hash, size_tokens, last_writer_id, updated_at)
-      VALUES (?, ?, 1, ?, NULL, NULL, ?)
-    `);
-
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const existing = select.get(name) as { id: string } | undefined;
-      if (existing !== undefined) {
-        this.db.exec("COMMIT");
-        return existing.id;
-      }
-      const newId = newArtifactId();
-      insert.run(newId, name, contentHash, Date.now() / 1000);
-      this.db.exec("COMMIT");
-      return newId;
-    } catch (err) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch {
-        // Rollback failure non-recoverable; surface original error.
-      }
-      // UNIQUE-on-name race: another caller inserted between our SELECT and
-      // INSERT. Re-fetch the winning row. better-sqlite3 surfaces the
-      // constraint violation as SqliteError with `code === "SQLITE_CONSTRAINT_UNIQUE"`.
-      if (
-        err !== null &&
-        typeof err === "object" &&
-        "code" in err &&
-        err.code === "SQLITE_CONSTRAINT_UNIQUE"
-      ) {
-        const existing = select.get(name) as { id: string } | undefined;
-        if (existing !== undefined) {
-          return existing.id;
-        }
-        // Genuine UNIQUE violation that's NOT our name race; re-throw.
-      }
-      throw err;
-    }
+    return this.resolveOrRegisterFile(this.fileNameOf(name), contentHash);
   }
 
   /** Return artifact metadata by id, or null if unknown. */
@@ -244,12 +435,238 @@ export class ArtifactRegistry {
     return row ?? null;
   }
 
-  /** Return artifact metadata by name (parent-repo-relative path), or null. */
+  /** Return artifact metadata for a file path (parent-repo-relative), through the fold key, or null. */
   getArtifactByName(name: string): Artifact | null {
+    return this.findFileArtifact(this.fileNameOf(name));
+  }
+
+  /** The row stored under exactly `name`, or null. */
+  private selectByName(name: string): Artifact | null {
     const row = this.db
       .prepare(`SELECT id, name, version, content_hash, size_tokens, last_writer_id, updated_at FROM artifacts WHERE name = ?`)
       .get(name) as Artifact | undefined;
     return row ?? null;
+  }
+
+  /** A path's name as the registry keys it itself, for callers that pass a bare path. */
+  private fileNameOf(path: string): FileName {
+    const tidied = tidyPath(path);
+    const key = this.foldIndex === null ? tidied : indexKeyOf(path, this.foldIndex.profile);
+    return { key, tidied };
+  }
+
+  /**
+   * BEGIN IMMEDIATE, the request's own lookup, and an INSERT at version 1 on
+   * a miss. A UNIQUE violation on the name means a row of exactly that name
+   * exists that the lookup does not reach (a key row, for a file request):
+   * that row is returned, as the name-keyed registry always did.
+   */
+  private resolveOrInsert(request: InsertRequest): { id: string; inserted: boolean } {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = request.existing();
+      if (existing !== null) {
+        this.db.exec("COMMIT");
+        return { id: existing.id, inserted: false };
+      }
+      const id = newArtifactId();
+      this.insertArtifactRow(id, request);
+      this.db.exec("COMMIT");
+      return { id, inserted: true };
+    } catch (err) {
+      this.rollbackQuietly();
+      const winner = isUniqueViolation(err) ? this.selectByName(request.name) : null;
+      if (winner !== null) return { id: winner.id, inserted: false };
+      throw err;
+    }
+  }
+
+  private insertArtifactRow(id: string, request: InsertRequest): void {
+    this.db
+      .prepare(
+        `INSERT INTO artifacts (id, name, version, content_hash, size_tokens, last_writer_id, updated_at)
+         VALUES (?, ?, 1, ?, NULL, NULL, ?)`,
+      )
+      .run(id, request.name, request.contentHash, Date.now() / 1000);
+    if (request.isKey) {
+      this.db
+        .prepare(`INSERT INTO artifact_name_kinds (artifact_id, kind) VALUES (?, 'key')`)
+        .run(id);
+    }
+  }
+
+  private rollbackQuietly(): void {
+    try {
+      this.db.exec("ROLLBACK");
+    } catch {
+      // Rollback failure non-recoverable; the caller surfaces the original error.
+    }
+  }
+
+  /**
+   * The lowest-rowid row of `key`'s bucket. Each hit is re-read by id inside
+   * the caller's transaction, and a row no longer in the store leaves the
+   * index, so the lookup moves on to the next row or misses.
+   */
+  private indexedArtifact(key: string): Artifact | null {
+    for (const id of [...(this.foldIndex?.byKey.get(key) ?? [])]) {
+      const row = this.getArtifactById(id);
+      if (row !== null) return row;
+      this.forgetIndexed(id);
+    }
+    return null;
+  }
+
+  private addIndexed(id: string, storedName: string): void {
+    if (this.foldIndex === null) return;
+    const key = indexKeyOf(storedName, this.foldIndex.profile);
+    const ids = this.foldIndex.byKey.get(key) ?? [];
+    ids.push(id);
+    this.foldIndex.byKey.set(key, ids);
+    this.foldIndex.keyById.set(id, key);
+  }
+
+  private forgetIndexed(id: string): void {
+    const key = this.foldIndex?.keyById.get(id);
+    if (this.foldIndex === null || key === undefined) return;
+    const ids = (this.foldIndex.byKey.get(key) ?? []).filter((other) => other !== id);
+    if (ids.length === 0) this.foldIndex.byKey.delete(key);
+    else this.foldIndex.byKey.set(key, ids);
+    this.foldIndex.keyById.delete(id);
+  }
+
+  /** The other file rows of `artifactId`'s bucket; none without the index. */
+  private bucketPeers(artifactId: string): string[] {
+    const key = this.foldIndex?.keyById.get(artifactId);
+    if (key === undefined) return [];
+    return (this.foldIndex?.byKey.get(key) ?? []).filter((id) => id !== artifactId);
+  }
+
+  /** Write holders other than `agentId` on the row `rowId`. */
+  private rowWriters(rowId: string, agentId: string): RowWriter[] {
+    const rows = this.db
+      .prepare(
+        `SELECT agent_id, state, granted_at_tick FROM agent_states
+         WHERE artifact_id = ? AND state IN (?, ?) AND agent_id != ?`,
+      )
+      .all(rowId, MESIState.MODIFIED, MESIState.EXCLUSIVE, agentId) as Array<{
+      agent_id: string;
+      state: string;
+      granted_at_tick: number | null;
+    }>;
+    return rows.map((r) => ({
+      artifactId: rowId,
+      agentId: r.agent_id,
+      state: toMESIState(r.state),
+      grantedAtTick: r.granted_at_tick,
+    }));
+  }
+
+  /** Write holders other than `agentId` on the other rows of `artifactId`'s bucket. */
+  private peerRowWriters(artifactId: string, agentId: string): RowWriter[] {
+    return this.bucketPeers(artifactId).flatMap((rowId) => this.rowWriters(rowId, agentId));
+  }
+
+  /**
+   * A bucket is one file, so an acquire on one of its rows takes the write
+   * grant from holders of its other rows as the merge would: INVALID and
+   * present, the merge's reclaim record, and a notice from the merge.
+   */
+  private demotePeerRowWriters(artifactId: string, agentId: string, nowTick: number): string[] {
+    const writers = this.peerRowWriters(artifactId, agentId);
+    for (const writer of writers) {
+      const { artifactId: rowId, agentId: holderId, state } = writer;
+      this.setAgentStateInternal(rowId, holderId, state, MESIState.INVALID, nowTick, FOLD_MERGE_TRIGGER);
+      this.recordReclaim(rowId, holderId, { trigger: FOLD_MERGE_TRIGGER, tick: nowTick });
+      this.upsertPendingNotice(holderId, rowId, FOLD_MERGE_PREEMPTER_ID, nowTick);
+    }
+    return writers.map((writer) => writer.agentId);
+  }
+
+  /** Every other agent's write grant on the file `artifactId` names: its own row first, then the bucket's others. */
+  private fileWriters(artifactId: string, agentId: string): RowWriter[] {
+    return [...this.rowWriters(artifactId, agentId), ...this.peerRowWriters(artifactId, agentId)];
+  }
+
+  private groupArtifacts(ids: readonly string[]): MergeArtifactRow[] {
+    return this.db
+      .prepare(
+        `SELECT rowid AS rowid, id, name, version, content_hash, size_tokens, last_writer_id, updated_at
+         FROM artifacts WHERE id IN (${placeholdersFor(ids)}) ORDER BY rowid`,
+      )
+      .all(...ids) as MergeArtifactRow[];
+  }
+
+  /** Why a group found before the transaction no longer holds inside it, or null when it does. */
+  private staleGroupReason(group: FoldGroup, artifacts: readonly MergeArtifactRow[]): string | null {
+    if (group.ids.length < 2 || artifacts.length !== group.ids.length) return "a row is gone";
+    const listed = this.db
+      .prepare(`SELECT 1 FROM artifact_name_kinds WHERE artifact_id IN (${placeholdersFor(group.ids)})`)
+      .get(...group.ids);
+    if (listed !== undefined) return "a row is listed as a key";
+    const apart = artifacts.some((row) => indexKeyOf(row.name, group.profile) !== group.key);
+    return apart ? "a row no longer shares the key" : null;
+  }
+
+  private groupSnapshot(artifacts: readonly MergeArtifactRow[]): MergeSnapshot {
+    const ids = artifacts.map((row) => row.id);
+    const states = this.db
+      .prepare(`SELECT ${STATE_COLUMNS} FROM agent_states WHERE artifact_id IN (${placeholdersFor(ids)})`)
+      .all(...ids) as Array<MergeStateRow & { state: string }>;
+    const notices = this.db
+      .prepare(
+        `SELECT agent_id, artifact_id, preempter_agent_id, preempted_at_unix_ts
+         FROM pending_notices WHERE artifact_id IN (${placeholdersFor(ids)})`,
+      )
+      .all(...ids) as MergeNoticeRow[];
+    return { artifacts, states: states.map((row) => ({ ...row, state: toMESIState(row.state) })), notices };
+  }
+
+  /**
+   * Write `plan` inside the merge's transaction: the survivor's values, then
+   * the group's states and notices replaced by one row per agent on the
+   * survivor, the single-writer check, and only then the other rows' delete.
+   */
+  private applyMergePlan(plan: MergePlan, groupIds: readonly string[]): void {
+    const survivor = this.getArtifactById(plan.survivorId) as Artifact;
+    checkMonotonicVersion(survivor.version, plan.values.version);
+    const { version, content_hash, size_tokens, last_writer_id, updated_at } = plan.values;
+    this.db
+      .prepare(
+        `UPDATE artifacts SET version = ?, content_hash = ?, size_tokens = ?, last_writer_id = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(version, content_hash, size_tokens, last_writer_id, updated_at, plan.survivorId);
+    const inGroup = `artifact_id IN (${placeholdersFor(groupIds)})`;
+    this.db.prepare(`DELETE FROM pending_notices WHERE ${inGroup}`).run(...groupIds);
+    this.db.prepare(`DELETE FROM agent_states WHERE ${inGroup}`).run(...groupIds);
+    this.insertMergedRows(plan);
+    checkSingleWriter(this.getStateMap(plan.survivorId));
+    if (plan.removedIds.length > 0) {
+      this.db
+        .prepare(`DELETE FROM artifacts WHERE id IN (${placeholdersFor(plan.removedIds)})`)
+        .run(...plan.removedIds);
+    }
+  }
+
+  private insertMergedRows(plan: MergePlan): void {
+    const insertState = this.db.prepare(
+      `INSERT INTO agent_states (${STATE_COLUMNS}) VALUES (${placeholdersFor(STATE_COLUMNS.split(","))})`,
+    );
+    for (const row of plan.states) {
+      insertState.run(
+        row.artifact_id, row.agent_id, row.state, row.transient_state, row.transient_tick,
+        row.granted_at_tick, row.last_reclaim_trigger, row.last_reclaim_tick, row.deadline_tick,
+        row.last_observed_version,
+      );
+    }
+    const insertNotice = this.db.prepare(
+      `INSERT INTO pending_notices (agent_id, artifact_id, preempter_agent_id, preempted_at_unix_ts)
+       VALUES (?, ?, ?, ?)`,
+    );
+    for (const row of plan.notices) {
+      insertNotice.run(row.agent_id, row.artifact_id, row.preempter_agent_id, row.preempted_at_unix_ts);
+    }
   }
 
   /** Cheap existence check; cheaper than getArtifactById when only presence matters. */
@@ -397,8 +814,9 @@ export class ArtifactRegistry {
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      // Write holders of the file's other spellings first, when a merge left them apart.
+      const invalidatedPeers = this.demotePeerRowWriters(artifactId, agentId, nowTick);
       const stateMap = this.getStateMap(artifactId);
-      const invalidatedPeers: string[] = [];
 
       for (const [peerId, peerState] of stateMap) {
         if (peerId === agentId) continue;
@@ -463,6 +881,9 @@ export class ArtifactRegistry {
    *
    * `acquireExclusive` is untouched, so a request that does not opt in
    * still displaces an opted-in holder.
+   *
+   * A write holder of another row of the artifact's fold bucket (spellings
+   * of one file a merge left apart) counts as a holder too.
    */
   acquireExclusiveIfUnheld(
     artifactId: string,
@@ -476,17 +897,18 @@ export class ArtifactRegistry {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       // Read on this connection, inside the open transaction.
-      const holder = this.exclusiveHolder(artifactId, agentId);
-      let reclaimed: { agentId: string; heldForSec: number } | null = null;
-      if (holder !== null) {
-        const heldForSec = holder.grantedAtTick === null ? null : nowTick - holder.grantedAtTick;
-        if (heldForSec === null || heldForSec < MAX_HOLD_SEC) {
-          this.db.exec("COMMIT");
-          return { kind: "other_holder", holderAgentId: holder.agentId };
-        }
-        this.reclaimInTxn(artifactId, holder.agentId, nowTick);
-        reclaimed = { agentId: holder.agentId, heldForSec };
+      const holders = this.fileWriters(artifactId, agentId);
+      const current = holders.find((holder) => isCurrentHolder(holder, nowTick));
+      if (current !== undefined) {
+        this.db.exec("COMMIT");
+        return { kind: "other_holder", holderAgentId: current.agentId };
       }
+      for (const holder of holders) this.reclaimInTxn(holder.artifactId, holder.agentId, nowTick);
+      const first = holders[0];
+      const reclaimed =
+        first === undefined
+          ? null
+          : { agentId: first.agentId, heldForSec: nowTick - (first.grantedAtTick as number) };
       this.grantUnheldInTxn(artifactId, agentId, nowTick);
       this.db.exec("COMMIT");
       return { kind: "granted", reclaimed };
@@ -906,8 +1328,7 @@ export class ArtifactRegistry {
   /**
    * Return (agent_id, granted_at_tick) of the current exclusive holder for an
    * artifact, excluding `excludeAgentId`. Returns null if no M∪E holder. Used
-   * by pre-edit collision detection, and by `acquireExclusiveIfUnheld` inside
-   * its transaction.
+   * by pre-edit collision detection.
    */
   exclusiveHolder(
     artifactId: string,
@@ -1066,13 +1487,22 @@ export class ArtifactRegistry {
       nowTick,
       RECLAIM_MAX_HOLD_TRIGGER,
     );
+    this.recordReclaim(artifactId, holderId, { trigger: RECLAIM_MAX_HOLD_TRIGGER, tick: nowTick });
+    this.upsertPendingNotice(holderId, artifactId, RECLAMATION_PREEMPTER_ID, nowTick);
+  }
+
+  /** The record of who lost a grant, and to what; `forgetAgent` keeps a row that carries one. */
+  private recordReclaim(
+    artifactId: string,
+    agentId: string,
+    reclaim: { trigger: string; tick: number },
+  ): void {
     this.db
       .prepare(
         `UPDATE agent_states SET last_reclaim_trigger = ?, last_reclaim_tick = ?
          WHERE artifact_id = ? AND agent_id = ?`,
       )
-      .run(RECLAIM_MAX_HOLD_TRIGGER, nowTick, artifactId, holderId);
-    this.upsertPendingNotice(holderId, artifactId, RECLAMATION_PREEMPTER_ID, nowTick);
+      .run(reclaim.trigger, reclaim.tick, artifactId, agentId);
   }
 
   /**
