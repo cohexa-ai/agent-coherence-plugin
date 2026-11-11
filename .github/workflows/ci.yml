@@ -33,6 +33,15 @@ jobs:
       - name: Check manifest versions synced
         run: node tools/check_versions_synced.js
 
+      # The fold table is generated output, so a hand edit or a generator
+      # change committed without its regenerated table must not pass. The
+      # generator fetches the pinned UCD 17.0.0 files from unicode.org and
+      # refuses any whose SHA-256 differs from data/ucd-17.0.0/SHA256SUMS.
+      - name: Reproduce the fold table from the pinned Unicode files
+        run: |
+          node tools/gen_fold_table.js
+          git diff --exit-code -- src/fold_data/fold_table.json
+
       - name: Install dependencies
         run: npm ci
 

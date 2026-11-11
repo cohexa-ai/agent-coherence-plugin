@@ -488,6 +488,8 @@ Releases follow [SemVer 2.0](https://semver.org/spec/v2.0.0.html); the canonical
 
 Apache-2.0. See [LICENSE](LICENSE).
 
+Third-party data: `src/fold_data/fold_table.json` is derived from the Unicode Character Database and is distributed under the Unicode License v3, whose notice the file carries in its `license` field and [src/fold_data/LICENSE-UNICODE](src/fold_data/LICENSE-UNICODE) repeats.
+
 ## Links
 
 - Underlying library: [Cohexa-ai/agent-coherence](https://github.com/Cohexa-ai/agent-coherence)
