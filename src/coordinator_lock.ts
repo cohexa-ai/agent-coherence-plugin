@@ -24,7 +24,18 @@
  * (probePidFileLock): a free lock means the coordinator server.pid names has
  * exited.
  */
-import { closeSync, constants, fsyncSync, ftruncateSync, openSync, writeSync } from "node:fs";
+import {
+  type Stats,
+  closeSync,
+  constants,
+  fstatSync,
+  fsyncSync,
+  ftruncateSync,
+  lstatSync,
+  openSync,
+  readSync,
+  writeSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
 
 /** From macOS <fcntl.h>; Node's fs.constants exports neither. */
@@ -146,6 +157,36 @@ export function rewritePidFile(fd: number, content: string): void {
   ftruncateSync(fd, 0);
   writeSync(fd, content, 0);
   fsyncSync(fd);
+}
+
+/**
+ * Why `pidFile` no longer leads clients to the coordinator that opened it on
+ * `fd` and published `published` in it, or null while it still does, or when
+ * that cannot be told (#234). Clients find a coordinator only through this
+ * file, so one gone with its workspace, replaced by another file (in which
+ * another coordinator may hold its own lock), or rewritten with another
+ * coordinator's lines leaves this coordinator nothing to serve.
+ */
+export function pidFileDeparture(pidFile: string, fd: number, published: string): string | null {
+  let onDisk: Stats;
+  try {
+    onDisk = lstatSync(pidFile);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? `${pidFile} is gone` : null;
+  }
+  const opened = fstatSync(fd);
+  if (onDisk.dev !== opened.dev || onDisk.ino !== opened.ino) return `${pidFile} is another file now`;
+  // The same file: read through the descriptor, so a file swapped in since the
+  // check above is never what is compared.
+  return readPidFileThrough(fd) === published ? null : `${pidFile} no longer names this coordinator`;
+}
+
+function readPidFileThrough(fd: number): string {
+  const { size } = fstatSync(fd);
+  const buffer = Buffer.alloc(size);
+  const read = readSync(fd, buffer, 0, size, 0);
+  return buffer.toString("utf8", 0, read);
 }
 
 /** What a probe of the lock on server.pid found: a coordinator holds it, none does, or null: cannot tell. */
