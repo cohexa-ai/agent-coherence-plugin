@@ -45,7 +45,8 @@
  * says `backend=node`, so the client does not claim and the request is exactly
  * what it was before.
  */
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { isValidSubagentId } from "./agent_id.js";
 import {
@@ -114,9 +115,35 @@ function requireFilePath(cc: CcPayload): string {
   return fp;
 }
 
-/** Absolute CC path → workspace-relative; outside the root → SkipHook (mirrors Python). */
+/**
+ * The disk's spelling of an absolute path, following links as the Python
+ * client's `Path.resolve()` does (macOS's `/var` becomes `/private/var`). The
+ * native resolver, unlike the JS `realpathSync`, also returns the disk's case
+ * for a differently cased spelling. It throws on a missing leaf, so a file a
+ * tool is about to create resolves its deepest existing ancestor and keeps
+ * the rest as typed.
+ */
+function resolveOnDisk(absolutePath: string): string {
+  try {
+    return realpathSync.native(absolutePath);
+  } catch {
+    // Missing, or a link the resolver cannot follow: told apart below.
+  }
+  // The entry exists yet does not resolve: a dangling or looping link. Keying
+  // the link's own path would give its file a second identity once the
+  // target exists, so the hook skips instead.
+  if (lstatSync(absolutePath, { throwIfNoEntry: false }) !== undefined) {
+    throw new SkipHook(`link does not resolve: ${absolutePath}`);
+  }
+  return join(resolveOnDisk(dirname(absolutePath)), basename(absolutePath));
+}
+
+/**
+ * Absolute CC path → workspace-relative, with the root and the path both
+ * resolved on disk; outside the root → SkipHook (mirrors Python).
+ */
 export function toWorkspaceRelative(filePath: string, root: string): string {
-  const rel = relative(root, resolve(filePath));
+  const rel = relative(realpathSync.native(root), resolveOnDisk(resolve(filePath)));
   if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
     throw new SkipHook(`path outside workspace root: ${filePath}`);
   }
