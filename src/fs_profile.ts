@@ -49,7 +49,6 @@ export interface FoldProbeInput {
   deviceOf?: (path: string) => bigint;
 }
 
-/** Every directory the probe creates in `.coherence` starts with this. */
 export const PROBE_DIR_PREFIX = 'fold-probe-';
 
 /**
@@ -80,7 +79,6 @@ function cannotTell(reason: string): FoldProfileResult {
   return { profile: 'none', status: 'cannot_tell', reason };
 }
 
-/** The profile whose answers these are, or cannot-tell when they match none exactly. */
 export function classifyVectorAnswers(answers: readonly boolean[]): FoldProfileResult {
   const pattern = answers.map((answer) => (answer ? '1' : '0')).join('');
   const profile = KNOWN_ANSWERS.get(pattern);
@@ -88,7 +86,6 @@ export function classifyVectorAnswers(answers: readonly boolean[]): FoldProfileR
   return { profile, status: 'classified' };
 }
 
-/** A filesystem step of the probe failed; its message is the cannot-tell reason. */
 class ProbeStepFailed extends Error {}
 
 function attempt<T>(failure: string, step: () => T): T {
@@ -150,7 +147,6 @@ function answerCreatedVectors(coherenceDir: string): boolean[] {
   }
 }
 
-/** Remove `path` when it is a regular file; leave anything else, a link included, and say so. */
 function removeRegularFile(path: string, log: (line: string) => void): boolean {
   if (!lstatSync(path).isFile()) {
     log(`left ${path} in place: not a regular file`);
@@ -180,7 +176,6 @@ function sweepEntry(path: string, log: (line: string) => void): boolean {
   }
 }
 
-/** Whether every stale probe directory was removed. */
 function sweepStaleProbeDirs(coherenceDir: string, log: (line: string) => void): boolean {
   const names = attempt('.coherence could not be listed', () => readdirSync(coherenceDir));
   const stale = names.filter((name) => name.startsWith(PROBE_DIR_PREFIX));
@@ -220,7 +215,6 @@ export function probeFoldProfile(input: FoldProbeInput): FoldProfileResult {
   }
 }
 
-/** The one start-log line that names the profile, and on cannot-tell the reason. */
 export function foldProfileLogLine(result: FoldProfileResult): string {
   const line = `workspace disk fold profile: ${result.profile}`;
   return result.status === 'classified' ? line : `${line} (cannot tell: ${result.reason ?? ''})`;

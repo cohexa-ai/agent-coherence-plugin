@@ -6,7 +6,6 @@
  *
  * Wire shape per KTD-B / KTD-B.3 C3:
  * - Request: `{session_id, path, if_unheld?}`
- * - `name_kind: "key"` in the body names a key, kept exactly as sent (door.ts)
  * - Response: `{ok: true}` on clean acquire; `{ok: true, hookSpecificOutput: {...}}`
  *   with collision warning if another session held M/E; `disk_differs: true`
  *   with the out-of-band notice when the file on disk no longer holds the
@@ -141,7 +140,6 @@ export async function handlePreEdit(
     return;
   }
   const sessionId: string = body.session_id;
-  // Every answer repeats the request's own spelling.
   const path: string = name.requested;
   const optedIn = body.if_unheld === true;
 

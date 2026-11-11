@@ -31,7 +31,6 @@ export type FoldingProfile = Exclude<FoldProfile, 'none'>;
 /** The Unicode version of the shared table, which /status advertises beside the profile. */
 export const FOLD_TABLE_UNICODE_VERSION: string = foldData.unicode_version;
 
-/** Characters counted as code points, as Python's `len` counts them. */
 export const FOLD_LENGTH_LIMIT = 1024;
 
 // Hangul syllables carry no mapping in the UCD; Unicode defines them by arithmetic.
@@ -210,7 +209,6 @@ export function tidyPath(path: string): string {
   return `${leading}${segments.join('/')}${trailing}`;
 }
 
-/** The key two spellings share exactly when the profile's disk treats them as one name. */
 export function foldKey(path: string, profile: FoldProfile): string {
   const tidied = tidyPath(path);
   if (profile === 'none') return tidied;
@@ -237,7 +235,6 @@ export function policyFoldText(text: string, profile: FoldingProfile): string {
   );
 }
 
-/** Whether `text` is longer than FOLD_LENGTH_LIMIT code points. */
 export function exceedsFoldLimit(text: string): boolean {
   // A code point takes one or two UTF-16 units, so a string this short cannot be over.
   if (text.length <= FOLD_LENGTH_LIMIT) return false;

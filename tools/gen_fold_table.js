@@ -279,7 +279,6 @@ function parseSequence(text) {
     .map((part) => parseInt(part, 16));
 }
 
-/** The data lines of a UCD file, with comments and blank lines removed. */
 function dataLines(text) {
   return text
     .split('\n')

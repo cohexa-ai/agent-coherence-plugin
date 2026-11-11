@@ -111,8 +111,6 @@ async function main(): Promise<void> {
     // that dead port while this one starts.
     rewritePidFile(pidLock.fd, "");
   }
-  // Once per process, under the lock and before the store opens: what the
-  // workspace disk treats as one file name.
   const foldProfile = probeFoldProfile({
     root: workspace.root,
     coherenceDir: workspace.coherenceDir,
@@ -144,8 +142,6 @@ async function main(): Promise<void> {
       `(schema_version=${registry.getStats().schemaVersion}, ` +
       `migrations_applied=${registry.getStats().migrationsApplied})`,
   );
-  // Still under the lock and before the server exists: merge the rows an
-  // older build split for one file, then key file rows by the disk's fold.
   prepareFoldIndex({
     registry,
     root: workspace.root,

@@ -67,7 +67,6 @@ export interface FileName {
   readonly diskSpelling?: string;
 }
 
-/** One fold key that several file rows share, lowest rowid first. */
 export interface FoldBucket {
   readonly key: string;
   readonly ids: readonly string[];
@@ -83,7 +82,6 @@ interface FoldIndex {
   readonly keyById: Map<string, string>;
 }
 
-/** A write holder found on one of a file's rows. */
 interface RowWriter {
   readonly artifactId: string;
   readonly agentId: string;
@@ -99,9 +97,23 @@ interface InsertRequest {
   readonly isKey: boolean;
 }
 
-const STATE_COLUMNS =
-  "artifact_id, agent_id, state, transient_state, transient_tick, granted_at_tick, " +
-  "last_reclaim_trigger, last_reclaim_tick, deadline_tick, last_observed_version";
+const STATE_COLUMN_NAMES = [
+  "artifact_id",
+  "agent_id",
+  "state",
+  "transient_state",
+  "transient_tick",
+  "granted_at_tick",
+  "last_reclaim_trigger",
+  "last_reclaim_tick",
+  "deadline_tick",
+  "last_observed_version",
+] as const satisfies readonly (keyof MergeStateRow)[];
+
+const STATE_COLUMNS = STATE_COLUMN_NAMES.join(", ");
+
+// Under the 999 bound-parameter limit of SQLite builds before 3.32.
+const MAX_IDS_PER_SELECT = 500;
 
 function isUniqueViolation(err: unknown): boolean {
   return (
@@ -119,6 +131,22 @@ function placeholdersFor(values: readonly unknown[]): string {
 /** A write grant held under `MAX_HOLD_SEC`, or with no recorded tick, is current: it is never reclaimed. */
 function isCurrentHolder(holder: RowWriter, nowTick: number): boolean {
   return holder.grantedAtTick === null || nowTick - holder.grantedAtTick < MAX_HOLD_SEC;
+}
+
+function listIndexed(index: FoldIndex, id: string, storedName: string): void {
+  const key = indexKeyOf(storedName, index.profile);
+  const ids = index.byKey.get(key) ?? [];
+  ids.push(id);
+  index.byKey.set(key, ids);
+  index.keyById.set(id, key);
+}
+
+// SQLite's BINARY order, which the SQL match returns: UTF-8 bytes.
+function sortByNameBytes(rows: readonly Artifact[]): Artifact[] {
+  return rows
+    .map((row) => ({ bytes: Buffer.from(row.name), row }))
+    .sort((a, b) => Buffer.compare(a.bytes, b.bytes))
+    .map(({ row }) => row);
 }
 
 export type FoldMergeOutcome =
@@ -297,27 +325,19 @@ export class ArtifactRegistry {
    * until then names stay exact. Returns each key several file rows share.
    */
   buildFoldIndex(profile: FoldProfile): FoldBucket[] {
-    const byKey = new Map<string, string[]>();
-    const keyById = new Map<string, string>();
-    for (const row of this.fileRowsForFold()) {
-      const key = indexKeyOf(row.name, profile);
-      const ids = byKey.get(key) ?? [];
-      ids.push(row.id);
-      byKey.set(key, ids);
-      keyById.set(row.id, key);
-    }
-    this.foldIndex = { profile, byKey, keyById };
-    return [...byKey]
+    const index: FoldIndex = { profile, byKey: new Map(), keyById: new Map() };
+    for (const row of this.fileRowsForFold()) listIndexed(index, row.id, row.name);
+    this.foldIndex = index;
+    return [...index.byKey]
       .filter(([, ids]) => ids.length > 1)
       .map(([key, ids]) => ({ key, ids: [...ids] }));
   }
 
-  /** The profile the fold index was built under, or null while names stay exact. */
   foldIndexProfile(): FoldProfile | null {
     return this.foldIndex?.profile ?? null;
   }
 
-  /** Every row not listed as a key, in rowid order (insertion order: no AUTOINCREMENT, no VACUUM). */
+  /** Rowid order is insertion order: no AUTOINCREMENT, no VACUUM. */
   fileRowsForFold(): FoldRow[] {
     return this.db
       .prepare(
@@ -356,7 +376,6 @@ export class ArtifactRegistry {
     return result.id;
   }
 
-  /** The artifact a key (a name that is not a file) names, by its exact name. */
   findKeyArtifact(name: string): Artifact | null {
     return this.selectByName(name);
   }
@@ -364,7 +383,7 @@ export class ArtifactRegistry {
   /**
    * `findKeyArtifact`, registering the key at version 1 on a miss and
    * listing the new row as a key, so later starts keep it out of the index
-   * and the merge. A file row of the same exact name is shared, as before.
+   * and the merge. A file row of the same exact name is shared.
    */
   resolveOrRegisterKey(name: string, contentHash: string): string {
     return this.resolveOrInsert({
@@ -440,7 +459,6 @@ export class ArtifactRegistry {
     return this.findFileArtifact(this.fileNameOf(name));
   }
 
-  /** The row stored under exactly `name`, or null. */
   private selectByName(name: string): Artifact | null {
     const row = this.db
       .prepare(`SELECT id, name, version, content_hash, size_tokens, last_writer_id, updated_at FROM artifacts WHERE name = ?`)
@@ -448,7 +466,6 @@ export class ArtifactRegistry {
     return row ?? null;
   }
 
-  /** A path's name as the registry keys it itself, for callers that pass a bare path. */
   private fileNameOf(path: string): FileName {
     const tidied = tidyPath(path);
     const key = this.foldIndex === null ? tidied : indexKeyOf(path, this.foldIndex.profile);
@@ -459,7 +476,7 @@ export class ArtifactRegistry {
    * BEGIN IMMEDIATE, the request's own lookup, and an INSERT at version 1 on
    * a miss. A UNIQUE violation on the name means a row of exactly that name
    * exists that the lookup does not reach (a key row, for a file request):
-   * that row is returned, as the name-keyed registry always did.
+   * that row is returned.
    */
   private resolveOrInsert(request: InsertRequest): { id: string; inserted: boolean } {
     this.db.exec("BEGIN IMMEDIATE");
@@ -509,7 +526,8 @@ export class ArtifactRegistry {
    * index, so the lookup moves on to the next row or misses.
    */
   private indexedArtifact(key: string): Artifact | null {
-    for (const id of [...(this.foldIndex?.byKey.get(key) ?? [])]) {
+    // forgetIndexed replaces the bucket array, so this one stays as it was.
+    for (const id of this.foldIndex?.byKey.get(key) ?? []) {
       const row = this.getArtifactById(id);
       if (row !== null) return row;
       this.forgetIndexed(id);
@@ -518,12 +536,7 @@ export class ArtifactRegistry {
   }
 
   private addIndexed(id: string, storedName: string): void {
-    if (this.foldIndex === null) return;
-    const key = indexKeyOf(storedName, this.foldIndex.profile);
-    const ids = this.foldIndex.byKey.get(key) ?? [];
-    ids.push(id);
-    this.foldIndex.byKey.set(key, ids);
-    this.foldIndex.keyById.set(id, key);
+    if (this.foldIndex !== null) listIndexed(this.foldIndex, id, storedName);
   }
 
   private forgetIndexed(id: string): void {
@@ -535,14 +548,12 @@ export class ArtifactRegistry {
     this.foldIndex.keyById.delete(id);
   }
 
-  /** The other file rows of `artifactId`'s bucket; none without the index. */
   private bucketPeers(artifactId: string): string[] {
     const key = this.foldIndex?.keyById.get(artifactId);
     if (key === undefined) return [];
     return (this.foldIndex?.byKey.get(key) ?? []).filter((id) => id !== artifactId);
   }
 
-  /** Write holders other than `agentId` on the row `rowId`. */
   private rowWriters(rowId: string, agentId: string): RowWriter[] {
     const rows = this.db
       .prepare(
@@ -562,7 +573,6 @@ export class ArtifactRegistry {
     }));
   }
 
-  /** Write holders other than `agentId` on the other rows of `artifactId`'s bucket. */
   private peerRowWriters(artifactId: string, agentId: string): RowWriter[] {
     return this.bucketPeers(artifactId).flatMap((rowId) => this.rowWriters(rowId, agentId));
   }
@@ -583,7 +593,6 @@ export class ArtifactRegistry {
     return writers.map((writer) => writer.agentId);
   }
 
-  /** Every other agent's write grant on the file `artifactId` names: its own row first, then the bucket's others. */
   private fileWriters(artifactId: string, agentId: string): RowWriter[] {
     return [...this.rowWriters(artifactId, agentId), ...this.peerRowWriters(artifactId, agentId)];
   }
@@ -597,7 +606,6 @@ export class ArtifactRegistry {
       .all(...ids) as MergeArtifactRow[];
   }
 
-  /** Why a group found before the transaction no longer holds inside it, or null when it does. */
   private staleGroupReason(group: FoldGroup, artifacts: readonly MergeArtifactRow[]): string | null {
     if (group.ids.length < 2 || artifacts.length !== group.ids.length) return "a row is gone";
     const listed = this.db
@@ -651,14 +659,10 @@ export class ArtifactRegistry {
 
   private insertMergedRows(plan: MergePlan): void {
     const insertState = this.db.prepare(
-      `INSERT INTO agent_states (${STATE_COLUMNS}) VALUES (${placeholdersFor(STATE_COLUMNS.split(","))})`,
+      `INSERT INTO agent_states (${STATE_COLUMNS}) VALUES (${placeholdersFor(STATE_COLUMN_NAMES)})`,
     );
     for (const row of plan.states) {
-      insertState.run(
-        row.artifact_id, row.agent_id, row.state, row.transient_state, row.transient_tick,
-        row.granted_at_tick, row.last_reclaim_trigger, row.last_reclaim_tick, row.deadline_tick,
-        row.last_observed_version,
-      );
+      insertState.run(...STATE_COLUMN_NAMES.map((column) => row[column]));
     }
     const insertNotice = this.db.prepare(
       `INSERT INTO pending_notices (agent_id, artifact_id, preempter_agent_id, preempted_at_unix_ts)
@@ -1218,14 +1222,37 @@ export class ArtifactRegistry {
   private indexedArtifactsUnder(prefix: string, profile: FoldingProfile): Artifact[] {
     // Folding is per segment, so a key under the root's key starts with it and "/".
     const rootKey = indexKeyOf(tidyPath(prefix).replace(/\/+$/, ""), profile);
+    const heads = this.bucketHeadsUnder(rootKey);
+    const fetched = this.artifactsById(heads.map(([, id]) => id));
     const found: Artifact[] = [];
-    for (const key of [...(this.foldIndex?.byKey.keys() ?? [])]) {
-      if (rootKey !== "" && key !== rootKey && !key.startsWith(`${rootKey}/`)) continue;
-      const row = this.indexedArtifact(key);
+    for (const [key, id] of heads) {
+      // A head gone from the store leaves the index, and the bucket's next row answers.
+      const row = fetched.get(id) ?? this.indexedArtifact(key);
       if (row !== null) found.push(row);
     }
-    // SQLite's BINARY order, which the SQL match returns: UTF-8 bytes.
-    return found.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
+    return sortByNameBytes(found);
+  }
+
+  /** [key, lowest-rowid id] of each bucket at or under `rootKey` ("" = every bucket). */
+  private bucketHeadsUnder(rootKey: string): Array<[string, string]> {
+    const heads: Array<[string, string]> = [];
+    for (const [key, ids] of this.foldIndex?.byKey ?? []) {
+      if (rootKey !== "" && key !== rootKey && !key.startsWith(`${rootKey}/`)) continue;
+      const head = ids[0];
+      if (head !== undefined) heads.push([key, head]);
+    }
+    return heads;
+  }
+
+  private artifactsById(ids: readonly string[]): Map<string, Artifact> {
+    const columns = "id, name, version, content_hash, size_tokens, last_writer_id, updated_at";
+    const rows: Artifact[] = [];
+    for (let start = 0; start < ids.length; start += MAX_IDS_PER_SELECT) {
+      const chunk = ids.slice(start, start + MAX_IDS_PER_SELECT);
+      const sql = `SELECT ${columns} FROM artifacts WHERE id IN (${placeholdersFor(chunk)})`;
+      rows.push(...(this.db.prepare(sql).all(...chunk) as Artifact[]));
+    }
+    return new Map(rows.map((row) => [row.id, row]));
   }
 
   /**
@@ -1356,19 +1383,9 @@ export class ArtifactRegistry {
     artifactId: string,
     excludeAgentId: string,
   ): { agentId: string; grantedAtTick: number | null } | null {
-    const rows = this.db
-      .prepare(
-        `SELECT agent_id, granted_at_tick FROM agent_states
-         WHERE artifact_id = ? AND state IN (?, ?) AND agent_id != ?`,
-      )
-      .all(artifactId, MESIState.MODIFIED, MESIState.EXCLUSIVE, excludeAgentId) as Array<{
-      agent_id: string;
-      granted_at_tick: number | null;
-    }>;
-    if (rows.length === 0) return null;
     // checkSingleWriter elsewhere keeps this to at most one row.
-    const r = rows[0]!;
-    return { agentId: r.agent_id, grantedAtTick: r.granted_at_tick };
+    const first = this.rowWriters(artifactId, excludeAgentId)[0];
+    return first === undefined ? null : { agentId: first.agentId, grantedAtTick: first.grantedAtTick };
   }
 
   /**

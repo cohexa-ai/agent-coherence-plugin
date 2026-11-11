@@ -196,7 +196,6 @@ interface StatusDefaultBody {
 
 type AdvertisedFoldProfile = FoldProfile | "cannot_tell";
 
-/** The start's probe result as /status names it; a server built with none folds nothing. */
 function advertisedFoldProfile(result: FoldProfileResult | undefined): AdvertisedFoldProfile {
   if (result === undefined) return "none";
   return result.status === "cannot_tell" ? "cannot_tell" : result.profile;
@@ -252,7 +251,6 @@ function handleStatus(req: IncomingMessage, res: ServerResponse, options: Server
       // KTD-J counters land in Unit 8. Empty placeholder keeps the shape stable
       // so consumers can parse the body even before counters are wired.
       counters: {},
-      // Every tier names the fold, so a client reading any tier keys alike.
       fold_profile: advertisedFoldProfile(options.foldProfile),
       fold_table_unicode: FOLD_TABLE_UNICODE_VERSION,
     };

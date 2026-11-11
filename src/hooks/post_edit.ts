@@ -10,7 +10,6 @@
  * - Request: `{session_id, path, success, content_hash?}` where
  *   content_hash is REQUIRED when success=true (hook script computes it
  *   from worktree's post-write state).
- * - `name_kind: "key"` in the body names a key, kept exactly as sent (door.ts)
  * - Response: `{ok: true}` on commit success; `{ok: true, released: true}`
  *   on success=false release; `{ok: false, reason}` on protocol error.
  */

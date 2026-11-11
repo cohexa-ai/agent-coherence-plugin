@@ -74,7 +74,6 @@ export async function handlePreGrep(
   let strictStaleFirst: StaleSummary | null = null;
   const regrants: Regrant[] = [];
   const policy = storedFilePolicy(deps);
-  // No seeding on the grep path: only rows the registry already holds.
   for (const existing of trackedArtifacts) {
     const path = existing.name;
     const agentState = deps.registry.getAgentState(existing.id, agentId);

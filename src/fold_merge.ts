@@ -30,7 +30,6 @@ import { MESIState, isWriter } from './states.js';
  */
 export const FOLD_MERGE_PREEMPTER_ID = '707e50c79be1538fa2ac5d849131619e';
 
-/** The reclaim trigger recorded on a holder that lost its grant to a fold rule. */
 export const FOLD_MERGE_TRIGGER = 'fold_merge';
 
 /**
@@ -41,7 +40,6 @@ export function indexKeyOf(name: string, profile: FoldProfile): string {
   return exceedsFoldLimit(name) ? name : foldKey(name, profile);
 }
 
-/** A file row as detection and the index see it; rowid order is insertion order. */
 export interface FoldRow {
   readonly rowid: number;
   readonly id: string;
@@ -60,7 +58,6 @@ export interface FoldGroup {
   readonly diskHash: string | null;
 }
 
-/** Where one row's name leads on disk. */
 export interface ResolvedFile {
   readonly dev: bigint;
   readonly ino: bigint;
@@ -109,7 +106,6 @@ export function sameFileGroups(
   return [...byFile.values()].filter((entry) => entry.rows.length > 1);
 }
 
-/** Whether a spelling relative to the root names a place inside it. */
 export function isInsideRoot(spelling: string): boolean {
   return (
     spelling !== '' && spelling !== '..' && !spelling.startsWith('../') && !isAbsolute(spelling)
@@ -205,7 +201,6 @@ export interface MergeNoticeRow {
   readonly preempted_at_unix_ts: number;
 }
 
-/** A group's rows as read inside the merge's transaction; artifacts in rowid order. */
 export interface MergeSnapshot {
   readonly artifacts: readonly MergeArtifactRow[];
   readonly states: readonly MergeStateRow[];
@@ -237,7 +232,6 @@ export interface MergePlan {
   readonly demotedWriters: readonly string[];
 }
 
-/** The row stored under the disk's spelling, else the oldest row. */
 function chooseSurvivor(
   artifacts: readonly MergeArtifactRow[],
   diskSpelling: string | null
@@ -288,7 +282,6 @@ function chooseKeeper(
   return writers.length === 1 ? (writers[0] as MergeStateRow) : null;
 }
 
-/** Rows grouped by agent, agents in code-unit order; each agent's rows keep their given order. */
 function rowsByAgent<Row extends { agent_id: string }>(rows: readonly Row[]): Map<string, Row[]> {
   const byAgent = new Map<string, Row[]>();
   const ordered = [...rows].sort((a, b) =>
@@ -421,7 +414,6 @@ export interface StartFoldInput {
   readonly registry: ArtifactRegistry;
   readonly root: string;
   readonly foldProfile: FoldProfileResult;
-  /** Whether this process holds the workspace's single-coordinator lock. */
   readonly lockHeld: boolean;
   readonly log: (line: string) => void;
 }

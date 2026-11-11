@@ -56,7 +56,6 @@ import {
   type FoldProfile,
 } from "./path_fold.js";
 
-/** A file is a workspace path; a key is any other name, matched exactly as given. */
 export type NameKind = "file" | "key";
 
 /**
@@ -71,7 +70,6 @@ export interface PolicyMatchContext {
   readonly diskSpelling?: string;
 }
 
-/** What a policy check assumes when it is given no context. */
 export const UNFOLDED_FILE: PolicyMatchContext = { profile: "none", kind: "file" };
 
 /** Mirror of Python coordinator_server.MAX_POLICY_PATHS_PER_REQUEST. */
@@ -328,10 +326,9 @@ export class TrackedArtifactPolicy {
    * default or user-added pattern) and matches at least one strict_mode_paths
    * glob. Intersection semantics — strict never applies to a path no tracked
    * pattern matches. An ignored pattern does not take a path out of strict
-   * mode (see `isTracked`). Empty strict_mode_paths short-circuits to false
-   * (v0.1.1 warn-only behavior preserved). Every pattern meets the name under
-   * each of its readings (`readingsOf`); without a context the name is a file
-   * on a disk that folds nothing.
+   * mode (see `isTracked`). Empty strict_mode_paths short-circuits to false.
+   * Every pattern meets the name under each of its readings (`readingsOf`);
+   * without a context the name is a file on a disk that folds nothing.
    */
   isStrictMode(parentRelativePath: string, context: PolicyMatchContext = UNFOLDED_FILE): boolean {
     if (this.strictModePaths.length === 0) return false;
@@ -432,7 +429,6 @@ export class TrackedArtifactPolicy {
     return this.strictModePaths.filter((p) => reported.has(p));
   }
 
-  /** The strict patterns, as written, under which `view` finds `entry` covering a strict path. */
   private coveredIn(view: CoverageView, entry: Glob, budget: SearchBudget): string[] {
     const search = { tracked: view.tracked, budget };
     return view.strict.filter((strict) => this.entryCoversStrict(entry, strict, search)).map((s) => s.source);
@@ -787,10 +783,10 @@ function stripLeadingDotSlash(p: string): string | null {
   return cleaned;
 }
 
-function matchesAny(path: string, patterns: ReadonlyArray<string>): boolean {
+function matchesAny(path: string, patterns: ReadonlyArray<string>, patternOf = (p: string) => p): boolean {
   const posixPath = path.replace(/\\/g, "/");
   for (const pattern of patterns) {
-    if (globMatch(posixPath, pattern)) return true;
+    if (globMatch(posixPath, patternOf(pattern))) return true;
   }
   return false;
 }
@@ -799,7 +795,6 @@ function matchesAny(path: string, patterns: ReadonlyArray<string>): boolean {
 // The readings a name is matched under
 // ----------------------------------------------------------------------
 
-/** A name's folded reading and the profile it was folded under. */
 interface FoldedName {
   readonly text: string;
   readonly profile: FoldingProfile;
@@ -810,9 +805,9 @@ interface NameReadings {
   /** As requested: tidied for a file, exact for a key. */
   readonly requested: string;
   /**
-   * A file as typed, before tidying, when that differs: a glob written with
-   * `//` or `/./` kept matching a request typed the same way before files
-   * were tidied, and still does.
+   * A file as typed, before tidying, when that differs. A file also matches
+   * as typed, so a glob written with `//` or `/./` keeps matching a request
+   * typed the same way.
    */
   readonly asTyped?: string;
   /** As the disk stores it, on a folding disk, when the coordinator has it. */
@@ -825,7 +820,7 @@ interface NameReadings {
 function readingsOf(name: string, context: PolicyMatchContext): NameReadings | null {
   const requested = normalizeRelative(name, context.kind);
   if (requested === null) return null;
-  const typed = context.kind === "file" ? normalizeRelative(name, "key") : null;
+  const typed = context.kind === "file" ? stripLeadingDotSlash(name) : null;
   const asTyped = typed !== null && typed !== requested ? { asTyped: typed } : {};
   const profile = foldingProfileOf(requested, context);
   if (profile === undefined) return { requested, ...asTyped, onDisk: undefined, folded: undefined };
@@ -868,13 +863,10 @@ function readingsMatch(name: NameReadings, patterns: ReadonlyArray<string>): boo
 }
 
 function matchesAnyFolded(name: FoldedName, patterns: ReadonlyArray<string>): boolean {
-  const posixPath = name.text.replace(/\\/g, "/");
-  return patterns.some((pattern) => globMatch(posixPath, foldPolicyPattern(pattern, name.profile)));
+  return matchesAny(name.text, patterns, (pattern) => foldPolicyPattern(pattern, name.profile));
 }
 
-// Per-process cache of folded policy patterns, one per profile: every hook
-// matches its folded name against every pattern. Untrack entries are folded
-// uncached, so a client cannot grow it.
+// Untrack entries are folded uncached, so a client cannot grow this cache.
 const foldedPolicyPatterns: Record<FoldingProfile, Map<string, string>> = {
   caseless: new Map(),
   nfd: new Map(),
@@ -1564,13 +1556,11 @@ function isLiteralGlob(pattern: string): boolean {
   return !/[*?[]/.test(pattern);
 }
 
-/** The strict and tracked patterns the coverage search reads under one reading. */
 interface CoverageView {
   readonly strict: ReadonlyArray<Glob>;
   readonly tracked: ReadonlyArray<Glob>;
 }
 
-/** The tracked patterns a coverage decision searches against, and the budget it draws on. */
 interface CoverageSearch {
   readonly tracked: ReadonlyArray<Glob>;
   readonly budget: SearchBudget;
@@ -1590,7 +1580,7 @@ function matchesCharged(entry: Glob, path: string, budget: SearchBudget): boolea
 /**
  * An untrack entry as a glob. Paths are matched with a leading "./" stripped
  * (`normalizeRelative`), so an entry spelled that way names the same paths.
- * The entry is not tidied, so the search reads it as it always has. On a
+ * The entry is not tidied, so the search reads it as written. On a
  * folding `profile` its literal characters are folded, as the strict and
  * tracked patterns it is searched against are.
  */
@@ -1603,13 +1593,11 @@ function entryGlob(pattern: string, profile: FoldProfile = "none"): Glob {
 // Patterns whose literal directories pass through a link
 // ----------------------------------------------------------------------
 
-/** The directories every path `pattern` matches starts with: its literal prefix, up to its last `/`. */
 function literalDirectories(pattern: string): string[] {
   const directories = literalRun(globTokens(pattern)).split("/").slice(0, -1);
   return directories.filter((segment) => segment !== "" && segment !== ".");
 }
 
-/** The first of `directories`, read as a path down from `root`, that is a link, or undefined. */
 function firstLinkedDirectory(root: string, directories: ReadonlyArray<string>): string | undefined {
   for (let depth = 1; depth <= directories.length; depth++) {
     const relative = directories.slice(0, depth).join("/");

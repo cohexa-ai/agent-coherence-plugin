@@ -7,7 +7,6 @@
  *
  * Wire-shape parity with Python per KTD-B:
  * - Request body: `{session_id, path, content_hash?}` (snake_case, KTD-B.3 C3)
- * - `name_kind: "key"` in the body names a key, kept exactly as sent (door.ts)
  * - Response shapes:
  *   - Fresh: `{status: "fresh"}`, plus `hash_differs: true` when a valid
  *     grant's bytes differ from the record (#205)
@@ -80,7 +79,6 @@ export async function handlePreRead(
   }
 
   const sessionId: string = body.session_id;
-  // Every answer repeats the request's own spelling.
   const path: string = name.requested;
   const contentHash: string | null = (body.content_hash as string | null | undefined) ?? null;
 

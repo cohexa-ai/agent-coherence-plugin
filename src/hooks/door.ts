@@ -44,17 +44,15 @@ export interface KeyRequest {
 
 export type RequestName = FileRequest | KeyRequest;
 
-/** The profile names are matched under: `none` while the start built no fold index. */
 export function policyProfileOf(deps: HookDeps): FoldProfile {
   return deps.registry.foldIndexProfile() ?? 'none';
 }
 
-/** The policy context of a name the registry stores, which has no disk spelling to offer. */
+/** The policy context of a file name with no disk spelling. */
 export function storedFilePolicy(deps: HookDeps): PolicyMatchContext {
   return { profile: policyProfileOf(deps), kind: 'file' };
 }
 
-/** Absent or "file" is a file, "key" a key; any other value is refused. */
 function nameKindOf(raw: unknown): NameKind | null {
   if (raw === undefined || raw === 'file') return 'file';
   return raw === 'key' ? 'key' : null;
@@ -74,11 +72,9 @@ export function readRequestName(body: Record<string, unknown>, deps: HookDeps): 
   return { kind, requested: path, policy: { profile: policyProfileOf(deps), kind } };
 }
 
-/** A file name's tidied spelling, fold key and, on a disk that folds, disk spelling. */
 export function fileRequest(deps: HookDeps, requested: string): FileRequest {
   const profile = deps.registry.foldIndexProfile();
   const tidied = tidyPath(requested);
-  // Without an index (no single-writer lock) names match exactly as tidied.
   const key = profile === null ? tidied : indexKeyOf(tidied, profile);
   const policy: PolicyMatchContext = { profile: profile ?? 'none', kind: 'file' };
   const diskSpelling = isFolding(profile)
@@ -96,7 +92,7 @@ export function fileRequest(deps: HookDeps, requested: string): FileRequest {
  */
 export function tokenRequest(deps: HookDeps, token: string): FileRequest {
   if (!exceedsFoldLimit(token)) return fileRequest(deps, token);
-  const policy: PolicyMatchContext = { profile: policyProfileOf(deps), kind: 'file' };
+  const policy = storedFilePolicy(deps);
   return { kind: 'file', requested: token, file: { key: token, tidied: token }, policy };
 }
 
@@ -104,20 +100,21 @@ export function tokenRequest(deps: HookDeps, token: string): FileRequest {
 export function tokenRequests(deps: HookDeps): (token: string) => FileRequest {
   const known = new Map<string, FileRequest>();
   return (token) => {
-    const name = known.get(token) ?? tokenRequest(deps, token);
-    known.set(token, name);
+    let name = known.get(token);
+    if (name === undefined) {
+      name = tokenRequest(deps, token);
+      known.set(token, name);
+    }
     return name;
   };
 }
 
-/** The row a request names: a file through its fold key, a key by its exact name. */
 export function findRequested(deps: HookDeps, name: RequestName): Artifact | null {
   return name.kind === 'key'
     ? deps.registry.findKeyArtifact(name.requested)
     : deps.registry.findFileArtifact(name.file);
 }
 
-/** `findRequested`, registering the name at version 1 on a miss. */
 export function resolveRequested(deps: HookDeps, name: RequestName, contentHash: string): string {
   return name.kind === 'key'
     ? deps.registry.resolveOrRegisterKey(name.requested, contentHash)

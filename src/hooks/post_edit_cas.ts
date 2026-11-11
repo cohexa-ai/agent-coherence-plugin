@@ -5,8 +5,6 @@
  * Node port of Python `_handle_post_edit_cas` (coordinator_server.py:1920).
  * Wire bodies are byte-parity with Python (STABLE, per its docstring):
  *  - 400 `{error: …}` with Python's exact validation strings
- *  - `name_kind: "key"` names a key (a row or object key), kept exactly as
- *    sent and looked up by that exact name (door.ts)
  *  - untracked → `{ok: true}`; unknown-at-commit → `{ok:true, note:"untracked-at-commit"}`
  *  - WIN → `{ok: true, version: N+1}`
  *  - conflict → `{ok: false, reason, current_version}` (reason matched EXACTLY

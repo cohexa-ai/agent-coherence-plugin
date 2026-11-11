@@ -191,7 +191,6 @@ test("commitCas serialized: two OCC writers on one version — exactly one wins"
   }
 });
 
-/** The names of the rows `artifactsUnderPrefix` returns, in its order. */
 function namesUnderPrefix(registry: ArtifactRegistry, prefix: string): string[] {
   return registry.artifactsUnderPrefix(prefix).map((artifact) => artifact.name);
 }

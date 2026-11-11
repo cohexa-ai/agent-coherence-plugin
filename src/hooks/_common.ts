@@ -29,11 +29,6 @@ export interface HookDeps {
    */
   policy: PolicyRef;
   sessions: SessionRegistry;
-  /**
-   * The workspace root as the platform's resolver spells it, which the door
-   * relativizes a request's disk spelling against. Absent where a test builds
-   * the deps without a coordinator start: the policy's root is used as given.
-   */
   canonicalRoot?: string;
 }
 
