@@ -220,7 +220,16 @@ export function foldKey(path: string, profile: FoldProfile): string {
  * NFC. A disk that folds nothing matches globs against the name as given.
  */
 export function policyFold(path: string, profile: FoldingProfile): string {
-  return mapSegments(tidyPath(path), (segment) =>
+  return policyFoldText(tidyPath(path), profile);
+}
+
+/**
+ * `policyFold` of `text` exactly as given, without tidying: a glob's literal
+ * characters fold where they stand, and tidying a run such as the lone `.` in
+ * `*.*` would change what the glob matches.
+ */
+export function policyFoldText(text: string, profile: FoldingProfile): string {
+  return mapSegments(text, (segment) =>
     fromCodePoints(canonicalComposition(segmentKey(segment, profile)))
   );
 }

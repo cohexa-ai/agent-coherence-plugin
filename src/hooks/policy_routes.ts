@@ -32,6 +32,7 @@ import {
   partitionPolicyPaths,
   type TrackedArtifactPolicy,
 } from "../policy.js";
+import type { FoldProfile } from "../path_fold.js";
 import { type HookDeps, writeJson, writeError, readJsonBody } from "./_common.js";
 
 const UNTRACK_STRICT_PATH_REASON = "untrack_strict_path";
@@ -62,14 +63,16 @@ function untrackStrictError(refused: ReadonlyArray<RefusedEntry>): string {
  * put it on the untracked fast path, where a CAS commit at any expected
  * version is accepted: a silent lost update. Strict wins over ignore in the
  * policy anyway, so the refusal is what tells the operator the entry would
- * not take effect.
+ * not take effect. On a disk that folds names (`profile`), an entry covers a
+ * strict path it reaches under any spelling the disk treats as the same.
  */
-function strictUntrackRefusal(
+export function strictUntrackRefusal(
   paths: ReadonlyArray<string>,
   policy: TrackedArtifactPolicy,
+  profile: FoldProfile = "none",
 ): StrictUntrackRefusal | null {
   const { valid, rejected } = partitionPolicyPaths(paths);
-  const coverage = policy.strictPatternsCoveringEach(valid);
+  const coverage = policy.strictPatternsCoveringEach(valid, profile);
   const refused: RefusedEntry[] = valid.flatMap((path, i) =>
     coverage[i]!.length > 0 ? [{ path, strict_patterns: coverage[i]! }] : [],
   );
