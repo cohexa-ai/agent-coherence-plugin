@@ -209,7 +209,7 @@ channel below.
 | Bearer token | 32 random bytes hex-encoded at `<repo>/.coherence/hook.secret`, mode `0600`, atomically created via `O_WRONLY \| O_CREAT \| O_EXCL` | `src/auth.ts:ensureSecret` |
 | Token comparison | Constant-time via `crypto.timingSafeEqual` (Node) and `hmac.compare_digest` (Python coordinator) — never `===` (which short-circuits and leaks token prefix via response timing) | `src/auth.ts:verifyBearer` |
 | Host-header allowlist | Only `localhost` and `127.0.0.1` accepted; defeats DNS rebinding from non-loopback origins | `src/auth.ts:verifyHost` |
-| Token rotation | Stop all coordinator processes, `rm <repo>/.coherence/hook.secret`, next hook re-spawn regenerates. Hot rotation deferred to v0.2. | README "Troubleshooting" |
+| Token rotation | Stop all coordinator processes, `rm <repo>/.coherence/hook.secret`; the coordinator the next session start spawns regenerates it. Hot rotation deferred to v0.2. | README "Troubleshooting" |
 | Empty-file recovery | If `hook.secret` exists but is empty/malformed (previous instance crashed mid-write), bounded `O_EXCL` retry rather than `O_TRUNC` re-write (avoids clobbering a concurrent racer's valid secret); fail-closed after N attempts | `src/auth.ts:ensureSecret` |
 
 Both Python and Node coordinator backends read the same `hook.secret` file;

@@ -486,3 +486,32 @@ test("hooks.json: every ${CLAUDE_PLUGIN_ROOT} path is double-quoted, so an insta
     .map(({ event, command }) => `${event}: ${command}`);
   assert.deepEqual(unquoted, []);
 });
+
+test("hooks.json: holds only keys Claude Code's loader accepts, so it prints no unknown-keys notice", () => {
+  const hooksJsonPath = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "hooks",
+    "hooks.json",
+  );
+  const parsed = JSON.parse(readFileSync(hooksJsonPath, "utf8")) as {
+    hooks: Record<string, Array<Record<string, unknown>>>;
+  };
+  // The sets Claude Code 2.1.319 checks. It names any other key at the top
+  // level or in a matcher group in a notice at every session start (#259);
+  // it does not check the hook objects inside a group.
+  const topLevel = new Set(["$schema", "description", "hooks", "modules", "surface"]);
+  const matcherGroup = new Set(["matcher", "hooks"]);
+  const unknown = [
+    ...Object.keys(parsed).filter((key) => !topLevel.has(key)),
+    ...Object.entries(parsed.hooks).flatMap(([event, groups]) =>
+      groups.flatMap((group, index) =>
+        Object.keys(group)
+          .filter((key) => !matcherGroup.has(key))
+          .map((key) => `${key} in hooks.${event}[${index}]`),
+      ),
+    ),
+  ];
+  assert.deepEqual(unknown, []);
+});

@@ -4,17 +4,30 @@
  */
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  fstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   LOCK_HELPERS,
   SHARED_LOCK_HELPERS,
   lockPidFile,
   lockWithHelpers,
+  pidFileDeparture,
   probeLockWithHelpers,
   probePidFileLock,
+  rewritePidFile,
   tryLockPidFile,
 } from "../coordinator_lock.js";
 import { holdPidFileLock, killAndWait, pythonFlockProbe } from "./pid_lock_fixture.js";
@@ -302,6 +315,99 @@ test(
       await gone;
     }
     assert.equal(probePidFileLock(pidFile), "free");
+  }),
+);
+
+// Whether server.pid still leads clients to the coordinator that published it (#234).
+
+test(
+  "server.pid still holding what a coordinator published, in the file it opened, leads clients to it",
+  withPidFile(async (pidFile) => {
+    const lock = tryLockPidFile(pidFile);
+    try {
+      assert.notEqual(lock.state, "contended");
+      if (lock.state === "contended") return;
+      rewritePidFile(lock.fd, "4242\n5151\nbackend=node\n");
+      assert.equal(pidFileDeparture(pidFile, lock.fd, "4242\n5151\nbackend=node\n"), null);
+    } finally {
+      closeIfOpen(lock);
+    }
+  }),
+);
+
+test(
+  "server.pid removed, alone or with its workspace, no longer leads clients to the coordinator",
+  withPidFile(async (pidFile) => {
+    const published = "4242\n5151\nbackend=node\n";
+    const lock = tryLockPidFile(pidFile);
+    try {
+      if (lock.state === "contended") assert.fail("the lock is held");
+      rewritePidFile(lock.fd, published);
+      unlinkSync(pidFile);
+      assert.match(pidFileDeparture(pidFile, lock.fd, published) ?? "", /server\.pid is gone/);
+      rmSync(dirname(pidFile), { recursive: true, force: true });
+      assert.match(pidFileDeparture(pidFile, lock.fd, published) ?? "", /server\.pid is gone/);
+    } finally {
+      closeIfOpen(lock);
+    }
+  }),
+);
+
+test(
+  "server.pid replaced by another file, even with the same lines or a link to the old one, no longer leads clients to the coordinator",
+  withPidFile(async (pidFile) => {
+    const published = "4242\n5151\nbackend=node\n";
+    const lock = tryLockPidFile(pidFile);
+    try {
+      if (lock.state === "contended") assert.fail("the lock is held");
+      rewritePidFile(lock.fd, published);
+      const kept = `${pidFile}.kept`;
+      renameSync(pidFile, kept);
+      writeFileSync(pidFile, published);
+      assert.match(pidFileDeparture(pidFile, lock.fd, published) ?? "", /server\.pid is another file now/);
+      unlinkSync(pidFile);
+      symlinkSync(kept, pidFile);
+      assert.match(pidFileDeparture(pidFile, lock.fd, published) ?? "", /server\.pid is another file now/);
+    } finally {
+      closeIfOpen(lock);
+    }
+  }),
+);
+
+test(
+  "server.pid rewritten in place with other lines, as a second unlocked coordinator does, no longer leads clients to the coordinator",
+  withPidFile(async (pidFile) => {
+    const published = "4242\n5151\nbackend=node\n";
+    const lock = tryLockPidFile(pidFile);
+    try {
+      if (lock.state === "contended") assert.fail("the lock is held");
+      rewritePidFile(lock.fd, published);
+      writeFileSync(pidFile, "6363\n7474\nbackend=node\n");
+      assert.match(pidFileDeparture(pidFile, lock.fd, published) ?? "", /server\.pid no longer names this coordinator/);
+    } finally {
+      closeIfOpen(lock);
+    }
+  }),
+);
+
+test(
+  "a descriptor that cannot be read says nothing about server.pid, rather than throwing out of the coordinator's timer",
+  withPidFile(async (pidFile) => {
+    // The check runs in a timer with no handler around it: a throw there
+    // would end the coordinator without its shutdown. A descriptor number
+    // never opened (so no open can reuse it) stands in for one that fails as
+    // on a network file system (EIO, ESTALE).
+    const neverOpened = 2 ** 30;
+    const published = "4242\n5151\nbackend=node\n";
+    const lock = tryLockPidFile(pidFile);
+    try {
+      if (lock.state === "contended") assert.fail("the lock is held");
+      rewritePidFile(lock.fd, published);
+      assert.throws(() => fstatSync(neverOpened), { code: "EBADF" });
+      assert.equal(pidFileDeparture(pidFile, neverOpened, published), null);
+    } finally {
+      closeIfOpen(lock);
+    }
   }),
 );
 

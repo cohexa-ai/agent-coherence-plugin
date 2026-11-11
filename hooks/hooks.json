@@ -1,5 +1,4 @@
 {
-  "_comment": "Zero-Python Unit 5: all hook commands route through bin/hook-client (Node client preferred - no node_modules needed; Python client fallback; '{}' floor) and SessionStart routes through bin/ensure-coordinator-dispatch (coordinator_backend selection: env > .coherence/coordinator_backend > python default). Command-type hooks per Phase E.0 probe 2A: CC's schema validator rejects env-var URLs, so HTTP-type hooks are structurally infeasible; the client reads .coherence/server.pid itself.",
   "hooks": {
     "PreToolUse": [
       {
@@ -21,7 +20,6 @@
         ]
       },
       {
-        "_comment": "KTD-N H4 mitigation \u2014 the model routes around a denied/warned Read via `bash cat plan.md`. Without a Bash PreToolUse matcher, that routing pattern silently bypasses the stale-read warning surface, leaving the plugin's coherence guarantee intact only for the literal Read tool. The pre-bash client subcommand extracts tracked-artifact paths from the Bash command string and forwards them to /hooks/pre-bash on the coordinator.",
         "matcher": "Bash",
         "hooks": [
           {
@@ -31,7 +29,6 @@
         ]
       },
       {
-        "_comment": "KTD-N H4 mitigation \u2014 Grep is another bypass route: a user-initiated or model-initiated grep over a directory containing tracked artifacts (CLAUDE.md, plan.md, etc.) should surface stale-read warnings for artifacts the session hasn't freshened since peer commits. The pre-grep client subcommand extracts the search root and forwards to /hooks/pre-grep on the coordinator, which enumerates registry-known tracked artifacts under the prefix.",
         "matcher": "Grep",
         "hooks": [
           {
@@ -62,7 +59,6 @@
         ]
       },
       {
-        "_comment": "SB-10 U7: post-compaction re-grounding. Fires on EVERY SessionStart; the client gates on source=compact CLIENT-side (startup/resume/clear and absent source print {} with no request), so only compaction events reach POST /hooks/session-start. Runs in parallel with the bootstrap shim above - safe, the shim never reads stdin. If the coordinator is cold or crashed at compact time the client fails open ({}) and that compaction's re-grounding attachment is lost - the documented SB-10 loss mode; deferred re-emission via the admit hooks is a separate unit.",
         "hooks": [
           {
             "type": "command",
@@ -83,7 +79,6 @@
     ],
     "SubagentStop": [
       {
-        "_comment": "Release the SUBAGENT identity's write grants (EXCLUSIVE or MODIFIED) when it stops; the subagent keeps a read (SHARED) of each released file. The subcommand requires the payload's agent_id (validated against the subagent-id charset) - absent OR malformed means no-op {}, never a parent release. Backstop: the Python coordinator's heartbeat/idle sweep reclaims a grant if SubagentStop is missed. The Node coordinator has no sweep: a missed SubagentStop leaves the subagent's grant held until a session-stop or a failed post-edit for that identity releases it, an ordinary pre-edit displaces it, or an opted-in pre-edit (if_unheld: true) 1800 s or more after its grant reclaims it. A parent's Stop does not release it.",
         "hooks": [
           {
             "type": "command",
