@@ -109,7 +109,8 @@ export function sameFileGroups(
   return [...byFile.values()].filter((entry) => entry.rows.length > 1);
 }
 
-function isInsideRoot(spelling: string): boolean {
+/** Whether a spelling relative to the root names a place inside it. */
+export function isInsideRoot(spelling: string): boolean {
   return (
     spelling !== '' && spelling !== '..' && !spelling.startsWith('../') && !isAbsolute(spelling)
   );

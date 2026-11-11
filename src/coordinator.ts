@@ -21,7 +21,7 @@
  *   - /status three-tier (KTD-K)
  *   - hook handler routes (Unit 3)
  */
-import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { hostname } from "node:os";
 import { ensureSecret } from "./auth.js";
@@ -165,6 +165,11 @@ async function main(): Promise<void> {
 
   const sessions = new SessionRegistry();
 
+  // The door relativizes each request's disk spelling against the root, so
+  // the root needs the disk's spelling too: as given it may run through a
+  // link (/var on macOS) or be typed in another case than the disk keeps.
+  const canonicalRoot = realpathSync.native(workspace.root);
+
   const server = createServer({
     secret,
     startedAtMs,
@@ -173,6 +178,7 @@ async function main(): Promise<void> {
     policy,
     sessions,
     foldProfile,
+    canonicalRoot,
   });
 
   // What this coordinator published, once it has: on shutdown an unlocked

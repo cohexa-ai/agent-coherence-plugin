@@ -6,6 +6,7 @@
  *
  * Wire shape per KTD-B / KTD-B.3 C3:
  * - Request: `{session_id, path, if_unheld?}`
+ * - `name_kind: "key"` in the body names a key, kept exactly as sent (door.ts)
  * - Response: `{ok: true}` on clean acquire; `{ok: true, hookSpecificOutput: {...}}`
  *   with collision warning if another session held M/E; `disk_differs: true`
  *   with the out-of-band notice when the file on disk no longer holds the
@@ -42,7 +43,6 @@ import {
   drainNoticeText,
   holdsContentClaim,
   isRecentSelfCommitLag,
-  isValidPath,
   isValidSessionId,
   readJsonBody,
   readSubagentId,
@@ -51,6 +51,13 @@ import {
   writeJson,
 } from "./_common.js";
 import { attachPreToolUseContext, deliverPendingReground, writeFastAdmit } from "./reground.js";
+import {
+  findRequested,
+  isStrictRequest,
+  isTrackedRequest,
+  readRequestName,
+  resolveRequested,
+} from "./door.js";
 
 export type PreEditDeps = HookDeps;
 
@@ -87,6 +94,7 @@ interface PreEditBody {
   session_id?: unknown;
   path?: unknown;
   if_unheld?: unknown;
+  name_kind?: unknown;
 }
 
 /**
@@ -127,12 +135,14 @@ export async function handlePreEdit(
     writeError(res, 400, "missing session_id");
     return;
   }
-  if (!isValidPath(body.path)) {
+  const name = readRequestName(body as Record<string, unknown>, deps);
+  if (name === null) {
     writeError(res, 400, "missing or empty path");
     return;
   }
   const sessionId: string = body.session_id;
-  const path: string = body.path;
+  // Every answer repeats the request's own spelling.
+  const path: string = name.requested;
   const optedIn = body.if_unheld === true;
 
   // SB-10 U8 (KTD6): the allow-attach seam — runs after every deny
@@ -141,7 +151,7 @@ export async function handlePreEdit(
     deliverPendingReground(deps, sessionId, body as Record<string, unknown>, result);
 
   // SB-10 U8 (KTD6): the untracked exit goes through writeFastAdmit's compact-pending peek.
-  if (!deps.policy.isTracked(path)) {
+  if (!isTrackedRequest(deps, name)) {
     writeFastAdmit(res, deps, sessionId, body as Record<string, unknown>, { ok: true });
     return;
   }
@@ -152,9 +162,9 @@ export async function handlePreEdit(
   // Resolve-or-seed the artifact. Empty content_hash sentinel matches Python:
   // pre-edit doesn't get the post-write hash; post-edit supplies the real one.
   let artifactId: string;
-  const existing = deps.registry.getArtifactByName(path);
+  const existing = findRequested(deps, name);
   if (existing === null) {
-    artifactId = deps.registry.resolveOrRegisterArtifact(path, "");
+    artifactId = resolveRequested(deps, name, "");
   } else {
     artifactId = existing.id;
   }
@@ -175,7 +185,7 @@ export async function handlePreEdit(
   // records none: it never showed the file). A SHARED holder with no
   // observation at all has acted on no version and is admitted like a
   // first-time editor. Mirrors Python pre-edit.
-  if (existing !== null && deps.policy.isStrictMode(path)) {
+  if (existing !== null && isStrictRequest(deps, name)) {
     const editorState = deps.registry.getAgentState(artifactId, agentId);
     const observed = deps.registry.lastObservedVersionFor(artifactId, agentId);
     const unobservedShared =

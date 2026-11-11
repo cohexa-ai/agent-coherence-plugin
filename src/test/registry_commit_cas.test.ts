@@ -191,7 +191,12 @@ test("commitCas serialized: two OCC writers on one version — exactly one wins"
   }
 });
 
-test("artifactNamesUnderPrefix: directory-boundary match, empty/'.'/'./'=all, LIKE metachars literal (Python parity)", () => {
+/** The names of the rows `artifactsUnderPrefix` returns, in its order. */
+function namesUnderPrefix(registry: ArtifactRegistry, prefix: string): string[] {
+  return registry.artifactsUnderPrefix(prefix).map((artifact) => artifact.name);
+}
+
+test("artifactsUnderPrefix: directory-boundary match, empty/'.'/'./'=all, LIKE metachars literal (Python parity)", () => {
   const { registry, cleanup } = makeRegistry();
   try {
     registry.resolveOrRegisterArtifact("docs/plans/a.md", HASH_1);
@@ -204,18 +209,18 @@ test("artifactNamesUnderPrefix: directory-boundary match, empty/'.'/'./'=all, LI
     // P1: a prefix must match only true directory children, NOT a sibling
     // dir sharing the stem ("docs" must not bleed into "docs-internal/").
     // With or without a trailing slash.
-    assert.deepEqual(registry.artifactNamesUnderPrefix("docs"), ["docs/plans/a.md", "docs/specs/b.md"]);
-    assert.deepEqual(registry.artifactNamesUnderPrefix("docs/"), ["docs/plans/a.md", "docs/specs/b.md"]);
+    assert.deepEqual(namesUnderPrefix(registry, "docs"), ["docs/plans/a.md", "docs/specs/b.md"]);
+    assert.deepEqual(namesUnderPrefix(registry, "docs/"), ["docs/plans/a.md", "docs/specs/b.md"]);
     // "" / "." / "./" → all artifacts (Grep over workspace root) — the bug was
     // "." returning [] and silently skipping the whole pre-grep stale check.
-    assert.equal(registry.artifactNamesUnderPrefix("").length, 6);
-    assert.equal(registry.artifactNamesUnderPrefix(".").length, 6);
-    assert.equal(registry.artifactNamesUnderPrefix("./").length, 6);
-    assert.deepEqual(registry.artifactNamesUnderPrefix("nomatch/"), []);
+    assert.equal(namesUnderPrefix(registry, "").length, 6);
+    assert.equal(namesUnderPrefix(registry, ".").length, 6);
+    assert.equal(namesUnderPrefix(registry, "./").length, 6);
+    assert.deepEqual(namesUnderPrefix(registry, "nomatch/"), []);
     // `_` is a literal, not a LIKE wildcard: "a_b/" matches only "a_b/…".
-    assert.deepEqual(registry.artifactNamesUnderPrefix("a_b"), ["a_b/x.md"]);
+    assert.deepEqual(namesUnderPrefix(registry, "a_b"), ["a_b/x.md"]);
     // A search_root that IS a tracked file matches itself (the UNION exact arm).
-    assert.deepEqual(registry.artifactNamesUnderPrefix("plan.md"), ["plan.md"]);
+    assert.deepEqual(namesUnderPrefix(registry, "plan.md"), ["plan.md"]);
   } finally {
     cleanup();
   }

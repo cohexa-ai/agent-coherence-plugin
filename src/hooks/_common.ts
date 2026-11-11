@@ -12,6 +12,7 @@ import type { Artifact, ArtifactRegistry } from "../registry.js";
 import type { PolicyRef } from "../policy.js";
 import type { SessionRegistry } from "../sessions.js";
 import { isValidSubagentId } from "../agent_id.js";
+import { exceedsFoldLimit } from "../path_fold.js";
 import {
   hasReclaimNotice,
   preemptionNoticeText,
@@ -28,6 +29,12 @@ export interface HookDeps {
    */
   policy: PolicyRef;
   sessions: SessionRegistry;
+  /**
+   * The workspace root as the platform's resolver spells it, which the door
+   * relativizes a request's disk spelling against. Absent where a test builds
+   * the deps without a coordinator start: the policy's root is used as given.
+   */
+  canonicalRoot?: string;
 }
 
 export function writeJson(res: ServerResponse, status: number, body: unknown): void {
@@ -206,6 +213,15 @@ export function isValidSessionId(s: unknown): s is string {
 
 export function isValidPath(p: unknown): p is string {
   return typeof p === "string" && p.length > 0 && !p.startsWith("/") && !p.split("/").includes("..");
+}
+
+/**
+ * A request's path: `isValidPath`, and no longer than the 1024 code points
+ * the Python coordinator accepts. Such a name would never be folded, so a
+ * longer one is refused rather than given an identity of its own.
+ */
+export function isValidRequestPath(p: unknown): p is string {
+  return isValidPath(p) && !exceedsFoldLimit(p);
 }
 
 export function isValidContentHashOrAbsent(h: unknown): h is string | undefined | null {

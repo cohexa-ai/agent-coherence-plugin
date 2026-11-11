@@ -156,7 +156,7 @@ const STUBBED_ROUTES: Array<{
 }> = [
   {
     name: "pre-edit on a new path",
-    method: "resolveOrRegisterArtifact",
+    method: "resolveOrRegisterFile",
     path: "/hooks/pre-edit",
     body: { session_id: SID_A, path: "CLAUDE.md" },
   },
@@ -183,13 +183,13 @@ const STUBBED_ROUTES: Array<{
   },
   {
     name: "pre-bash on a tracked path",
-    method: "resolveOrRegisterArtifact",
+    method: "resolveOrRegisterFile",
     path: "/hooks/pre-bash",
     body: { session_id: SID_A, command: "cat CLAUDE.md" },
   },
   {
     name: "pre-grep's prefix lookup",
-    method: "artifactNamesUnderPrefix",
+    method: "artifactsUnderPrefix",
     path: "/hooks/pre-grep",
     body: { session_id: SID_A, search_root: "docs/" },
   },

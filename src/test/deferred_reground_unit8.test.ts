@@ -280,11 +280,14 @@ test("pending flag + untracked pre-read → delivered via envelope; next untrack
 test("no flag + untracked pre-read → byte-identical fast path with ZERO artifact-registry access (KTD6)", async () => {
   // The ArtifactRegistry is swapped for a proxy that explodes on ANY
   // property access — a touched registry would answer the failure envelope. Only the
-  // SessionRegistry's process-local peek is allowed on this path.
+  // SessionRegistry's process-local peek is allowed on this path, and the fold
+  // profile: an in-memory value fixed at start, which reads no store, that the
+  // policy check needs to match a name the way the workspace disk folds it.
   const tmp = mkdtempSync(join(tmpdir(), "reground8-noreg-"));
   const realRegistry = new ArtifactRegistry(join(tmp, ".coherence", "state.db"));
   const exploding = new Proxy(realRegistry, {
-    get(_target, prop) {
+    get(target, prop) {
+      if (prop === "foldIndexProfile") return () => target.foldIndexProfile();
       throw new Error(`registry touched on untracked fast path: ${String(prop)}`);
     },
   });

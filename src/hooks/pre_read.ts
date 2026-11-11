@@ -7,6 +7,7 @@
  *
  * Wire-shape parity with Python per KTD-B:
  * - Request body: `{session_id, path, content_hash?}` (snake_case, KTD-B.3 C3)
+ * - `name_kind: "key"` in the body names a key, kept exactly as sent (door.ts)
  * - Response shapes:
  *   - Fresh: `{status: "fresh"}`, plus `hash_differs: true` when a valid
  *     grant's bytes differ from the record (#205)
@@ -33,7 +34,6 @@ import {
   holdsContentClaim,
   isRecentSelfCommitLag,
   isValidContentHashOrAbsent,
-  isValidPath,
   isValidSessionId,
   readJsonBody,
   readSubagentId,
@@ -42,6 +42,13 @@ import {
   writeJson,
 } from "./_common.js";
 import { attachPreToolUseContext, deliverPendingReground, writeFastAdmit } from "./reground.js";
+import {
+  findRequested,
+  isStrictRequest,
+  isTrackedRequest,
+  readRequestName,
+  resolveRequested,
+} from "./door.js";
 
 export type PreReadDeps = HookDeps;
 
@@ -49,6 +56,7 @@ interface PreReadBody {
   session_id?: unknown;
   path?: unknown;
   content_hash?: unknown;
+  name_kind?: unknown;
 }
 
 export async function handlePreRead(
@@ -61,7 +69,8 @@ export async function handlePreRead(
     writeError(res, 400, "missing session_id");
     return;
   }
-  if (!isValidPath(body.path)) {
+  const name = readRequestName(body as Record<string, unknown>, deps);
+  if (name === null) {
     writeError(res, 400, "missing or empty path");
     return;
   }
@@ -71,7 +80,8 @@ export async function handlePreRead(
   }
 
   const sessionId: string = body.session_id;
-  const path: string = body.path;
+  // Every answer repeats the request's own spelling.
+  const path: string = name.requested;
   const contentHash: string | null = (body.content_hash as string | null | undefined) ?? null;
 
   // SB-10 U8 (KTD6): the allow-attach seam — runs after every deny
@@ -82,7 +92,7 @@ export async function handlePreRead(
 
   // Tracked-policy gate (R8 budget): untracked paths fast-path to {fresh}
   // via writeFastAdmit's SB-10 U8 compact-pending peek.
-  if (!deps.policy.isTracked(path)) {
+  if (!isTrackedRequest(deps, name)) {
     writeFastAdmit(res, deps, sessionId, body as Record<string, unknown>, { status: "fresh" });
     return;
   }
@@ -91,13 +101,13 @@ export async function handlePreRead(
   const nowTick = Math.floor(Date.now() / 1000);
 
   // Lookup artifact by path. None → KTD-9 first observation.
-  const existingArtifact = deps.registry.getArtifactByName(path);
+  const existingArtifact = findRequested(deps, name);
 
   if (existingArtifact === null) {
     // First observation per KTD-9 — seed v1 with the on-disk hash if the
     // caller supplied one, else use empty string sentinel (matches Python).
     const seedHash = contentHash ?? "";
-    const artifactId = deps.registry.resolveOrRegisterArtifact(path, seedHash);
+    const artifactId = resolveRequested(deps, name, seedHash);
     // Grant SHARED to the first reader so subsequent reads see themselves as
     // known-fresh.
     deps.registry.grantShared(artifactId, agentId, nowTick, "first_read");
@@ -136,7 +146,7 @@ export async function handlePreRead(
       // session id that id was derived from.
       const lastWriterAgent = existingArtifact.last_writer_id;
       const isSelfCommitLag = isRecentSelfCommitLag(existingArtifact, agentId, now);
-      if (deps.policy.isStrictMode(path) && !isSelfCommitLag) {
+      if (isStrictRequest(deps, name) && !isSelfCommitLag) {
         const sharedSummary: StaleSummary = {
           path,
           current_version: existingArtifact.version,
@@ -232,7 +242,7 @@ export async function handlePreRead(
   // KTD-T: do NOT re-grant SHARED on deny — the state stays INVALID/None so
   // every retry produces the same byte-stable deny text.
   if (
-    deps.policy.isStrictMode(path) &&
+    isStrictRequest(deps, name) &&
     (agentState === MESIState.INVALID || (agentState === null && hashDiffers))
   ) {
     writeJson(res, 200, {

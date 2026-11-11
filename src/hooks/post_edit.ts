@@ -10,6 +10,7 @@
  * - Request: `{session_id, path, success, content_hash?}` where
  *   content_hash is REQUIRED when success=true (hook script computes it
  *   from worktree's post-write state).
+ * - `name_kind: "key"` in the body names a key, kept exactly as sent (door.ts)
  * - Response: `{ok: true}` on commit success; `{ok: true, released: true}`
  *   on success=false release; `{ok: false, reason}` on protocol error.
  */
@@ -21,11 +22,11 @@ import {
   writeError,
   readJsonBody,
   isValidSessionId,
-  isValidPath,
   isValidContentHashRequired,
   isValidContentHashOrAbsent,
   readSubagentId,
 } from "./_common.js";
+import { findRequested, isTrackedRequest, readRequestName } from "./door.js";
 
 export type PostEditDeps = HookDeps;
 
@@ -34,6 +35,7 @@ interface PostEditBody {
   path?: unknown;
   success?: unknown;
   content_hash?: unknown;
+  name_kind?: unknown;
 }
 
 export async function handlePostEdit(
@@ -45,7 +47,8 @@ export async function handlePostEdit(
     writeError(res, 400, "missing session_id");
     return;
   }
-  if (!isValidPath(body.path)) {
+  const name = readRequestName(body as Record<string, unknown>, deps);
+  if (name === null) {
     writeError(res, 400, "missing or empty path");
     return;
   }
@@ -64,10 +67,9 @@ export async function handlePostEdit(
   }
 
   const sessionId: string = body.session_id;
-  const path: string = body.path;
   const contentHash: string | null = (body.content_hash as string | null | undefined) ?? null;
 
-  if (!deps.policy.isTracked(path)) {
+  if (!isTrackedRequest(deps, name)) {
     writeJson(res, 200, { ok: true });
     return;
   }
@@ -75,7 +77,7 @@ export async function handlePostEdit(
   const agentId = deps.sessions.registerSession(sessionId, readSubagentId(body as Record<string, unknown>));
   const nowTick = Math.floor(Date.now() / 1000);
 
-  const existing = deps.registry.getArtifactByName(path);
+  const existing = findRequested(deps, name);
   if (existing === null) {
     // No prior pre-edit / pre-read; nothing to commit against. Matches Python.
     writeJson(res, 200, { ok: true, note: "untracked-at-commit" });

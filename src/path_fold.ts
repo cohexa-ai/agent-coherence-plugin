@@ -28,6 +28,9 @@ import foldData from './fold_data/fold_table.json' with { type: 'json' };
 export type FoldProfile = 'caseless' | 'nfd' | 'none';
 export type FoldingProfile = Exclude<FoldProfile, 'none'>;
 
+/** The Unicode version of the shared table, which /status advertises beside the profile. */
+export const FOLD_TABLE_UNICODE_VERSION: string = foldData.unicode_version;
+
 /** Characters counted as code points, as Python's `len` counts them. */
 export const FOLD_LENGTH_LIMIT = 1024;
 

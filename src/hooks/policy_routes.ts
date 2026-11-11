@@ -34,6 +34,7 @@ import {
 } from "../policy.js";
 import type { FoldProfile } from "../path_fold.js";
 import { type HookDeps, writeJson, writeError, readJsonBody } from "./_common.js";
+import { policyProfileOf } from "./door.js";
 
 const UNTRACK_STRICT_PATH_REASON = "untrack_strict_path";
 
@@ -100,8 +101,13 @@ function handlePolicyMutation(
     return;
   }
   // Decided and acted on within this one synchronous handler, so no reload can
-  // land between the check and the append below.
-  const refusal = yamlFileName === "ignored.yaml" ? strictUntrackRefusal(paths, deps.policy.get()) : null;
+  // land between the check and the append below. The paths are patterns: they
+  // are validated, never tidied or folded, and the coverage search folds both
+  // sides itself on a disk that folds names.
+  const refusal =
+    yamlFileName === "ignored.yaml"
+      ? strictUntrackRefusal(paths, deps.policy.get(), policyProfileOf(deps))
+      : null;
   if (refusal !== null) {
     writeJson(res, 409, {
       ok: false,

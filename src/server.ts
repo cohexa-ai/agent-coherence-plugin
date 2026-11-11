@@ -26,7 +26,14 @@ import type { ArtifactRegistry } from "./registry.js";
 import type { PolicyRef, PolicySummary } from "./policy.js";
 import type { SessionRegistry } from "./sessions.js";
 import type { FoldProfileResult } from "./fs_profile.js";
-import { writeJson, writeError, writeHandlerFailure, internalFailureLabel } from "./hooks/_common.js";
+import { FOLD_TABLE_UNICODE_VERSION, type FoldProfile } from "./path_fold.js";
+import {
+  writeJson,
+  writeError,
+  writeHandlerFailure,
+  internalFailureLabel,
+  type HookDeps,
+} from "./hooks/_common.js";
 import { preReadRoute } from "./hooks/pre_read.js";
 import { preEditRoute } from "./hooks/pre_edit.js";
 import { postEditRoute } from "./hooks/post_edit.js";
@@ -62,6 +69,12 @@ export interface ServerOptions {
    * builds a server without a coordinator start.
    */
   foldProfile?: FoldProfileResult;
+  /**
+   * The workspace root as the platform's resolver spells it (links followed,
+   * the disk's case), found once at start. Absent where a test builds a
+   * server without a coordinator start: the policy's root is used as given.
+   */
+  canonicalRoot?: string;
 }
 
 /**
@@ -171,12 +184,30 @@ interface StatusDefaultBody {
     sessions: number;
   };
   policy_summary: PolicySummary;
+  /**
+   * What the workspace disk treats as one file name, so a client keys names
+   * the way this coordinator does. `cannot_tell` is keyed as `none`, but stays
+   * visible as a disk that could not be classified.
+   */
+  fold_profile: AdvertisedFoldProfile;
+  /** The Unicode version of the fold table; a client with another table keys by `none`. */
+  fold_table_unicode: string;
+}
+
+type AdvertisedFoldProfile = FoldProfile | "cannot_tell";
+
+/** The start's probe result as /status names it; a server built with none folds nothing. */
+function advertisedFoldProfile(result: FoldProfileResult | undefined): AdvertisedFoldProfile {
+  if (result === undefined) return "none";
+  return result.status === "cannot_tell" ? "cannot_tell" : result.profile;
 }
 
 interface StatusMetricsBody {
   backend: "node";
   version: string;
   counters: Record<string, number>;
+  fold_profile: AdvertisedFoldProfile;
+  fold_table_unicode: string;
 }
 
 function parseDetailParam(rawUrl: string): StatusDetail {
@@ -221,6 +252,9 @@ function handleStatus(req: IncomingMessage, res: ServerResponse, options: Server
       // KTD-J counters land in Unit 8. Empty placeholder keeps the shape stable
       // so consumers can parse the body even before counters are wired.
       counters: {},
+      // Every tier names the fold, so a client reading any tier keys alike.
+      fold_profile: advertisedFoldProfile(options.foldProfile),
+      fold_table_unicode: FOLD_TABLE_UNICODE_VERSION,
     };
     writeJson(res, 200, body);
     return;
@@ -288,6 +322,8 @@ function handleStatus(req: IncomingMessage, res: ServerResponse, options: Server
     // The summary carries the absolute workspace root. This is the default
     // tier, so it gets the "." the Python default tier reports instead.
     policy_summary: { ...options.policy.summary(), coordinator_root: "." },
+    fold_profile: advertisedFoldProfile(options.foldProfile),
+    fold_table_unicode: FOLD_TABLE_UNICODE_VERSION,
   };
   writeJson(res, 200, body);
 }
@@ -319,10 +355,11 @@ export function createServer(options: ServerOptions): Server {
         handleStatus(req, res, options);
         return;
       }
-      const hookDeps = {
+      const hookDeps: HookDeps = {
         registry: options.registry,
         policy: options.policy,
         sessions: options.sessions,
+        ...(options.canonicalRoot === undefined ? {} : { canonicalRoot: options.canonicalRoot }),
       };
       if (path === "/hooks/pre-read") {
         preReadRoute(req, res, hookDeps, MAX_REQUEST_BODY_BYTES).catch(handleHookFailure);

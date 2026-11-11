@@ -39,7 +39,7 @@ import {
   RECLAIM_MAX_HOLD_TRIGGER,
   RECLAMATION_PREEMPTER_ID,
 } from "./acquire_or_fail.js";
-import { tidyPath, type FoldProfile } from "./path_fold.js";
+import { tidyPath, type FoldingProfile, type FoldProfile } from "./path_fold.js";
 import {
   FOLD_MERGE_PREEMPTER_ID,
   FOLD_MERGE_TRIGGER,
@@ -1200,25 +1200,48 @@ export class ArtifactRegistry {
   }
 
   /**
-   * Return the names of all registry-known artifacts whose name starts with
-   * `prefix` (empty prefix = all). Used by /hooks/pre-grep to enumerate the
-   * tracked artifacts under a search root. Mirrors Python
-   * `sqlite_registry.artifact_names_under_prefix`.
+   * The rows a Grep under `prefix` reads (empty, "." or "./" = every row),
+   * ordered by name. Used by /hooks/pre-grep to enumerate the tracked
+   * artifacts under a search root.
    *
-   * The LIKE pattern escapes `%`, `_`, and the escape char itself so a
-   * literal prefix like `docs_v2/` cannot wildcard-match `docsXv2/`.
+   * On a disk that folds names, every file row whose fold key is the
+   * prefix's or lies under it, once per key: the key's lowest-rowid row, the
+   * one every other lookup reaches. Otherwise the SQL prefix match below,
+   * which mirrors Python `sqlite_registry.artifact_names_under_prefix`.
    */
-  artifactNamesUnderPrefix(prefix: string): string[] {
+  artifactsUnderPrefix(prefix: string): Artifact[] {
+    const profile = this.foldIndex?.profile;
+    if (profile === "caseless" || profile === "nfd") return this.indexedArtifactsUnder(prefix, profile);
+    return this.artifactsLikePrefix(prefix);
+  }
+
+  private indexedArtifactsUnder(prefix: string, profile: FoldingProfile): Artifact[] {
+    // Folding is per segment, so a key under the root's key starts with it and "/".
+    const rootKey = indexKeyOf(tidyPath(prefix).replace(/\/+$/, ""), profile);
+    const found: Artifact[] = [];
+    for (const key of [...(this.foldIndex?.byKey.keys() ?? [])]) {
+      if (rootKey !== "" && key !== rootKey && !key.startsWith(`${rootKey}/`)) continue;
+      const row = this.indexedArtifact(key);
+      if (row !== null) found.push(row);
+    }
+    // SQLite's BINARY order, which the SQL match returns: UTF-8 bytes.
+    return found.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
+  }
+
+  /**
+   * The LIKE pattern escapes `%`, `_`, and the escape char itself so a
+   * literal prefix like `docs_v2/` cannot wildcard-match `docsXv2/`. LIKE
+   * folds ASCII case, as the Python coordinator's match does.
+   */
+  private artifactsLikePrefix(prefix: string): Artifact[] {
+    const columns = "id, name, version, content_hash, size_tokens, last_writer_id, updated_at";
     // Empty / "." / "./" ⇒ all artifacts (Grep over the workspace root).
     // Mirrors Python artifact_names_under_prefix. P1: the bare-LIKE version
     // both OVER-matched siblings ("docs/specs" catching "docs/specs-internal/")
     // and returned [] for a "." search_root — silently skipping the entire
     // pre-grep stale check for the very common workspace-root Grep.
     if (prefix === "" || prefix === "." || prefix === "./") {
-      const all = this.db
-        .prepare(`SELECT name FROM artifacts ORDER BY name`)
-        .all() as { name: string }[];
-      return all.map((r) => r.name);
+      return this.db.prepare(`SELECT ${columns} FROM artifacts ORDER BY name`).all() as Artifact[];
     }
     // Strip trailing slash(es) then append exactly one, so the LIKE prefix
     // matches only true directory children — not sibling dirs sharing the
@@ -1226,14 +1249,13 @@ export class ArtifactRegistry {
     // still matches it.
     const stripped = prefix.replace(/\/+$/, "");
     const escaped = `${stripped}/`.replace(/([\\%_])/g, "\\$1");
-    const rows = this.db
+    return this.db
       .prepare(
-        `SELECT name FROM artifacts WHERE name LIKE ? ESCAPE '\\'
-         UNION SELECT name FROM artifacts WHERE name = ?
+        `SELECT ${columns} FROM artifacts WHERE name LIKE ? ESCAPE '\\'
+         UNION SELECT ${columns} FROM artifacts WHERE name = ?
          ORDER BY name`,
       )
-      .all(`${escaped}%`, stripped) as { name: string }[];
-    return rows.map((r) => r.name);
+      .all(`${escaped}%`, stripped) as Artifact[];
   }
 
   /**
