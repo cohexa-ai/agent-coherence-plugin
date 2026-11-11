@@ -25,6 +25,7 @@ import { verifyBearer, verifyHost } from "./auth.js";
 import type { ArtifactRegistry } from "./registry.js";
 import type { PolicyRef, PolicySummary } from "./policy.js";
 import type { SessionRegistry } from "./sessions.js";
+import type { FoldProfileResult } from "./fs_profile.js";
 import { writeJson, writeError, writeHandlerFailure, internalFailureLabel } from "./hooks/_common.js";
 import { preReadRoute } from "./hooks/pre_read.js";
 import { preEditRoute } from "./hooks/pre_edit.js";
@@ -55,6 +56,12 @@ export interface ServerOptions {
   policy: PolicyRef;
   /** In-memory session_id ↔ agent_id map for hook handlers. */
   sessions: SessionRegistry;
+  /**
+   * The workspace disk's fold profile, probed once by the coordinator's start
+   * before the store opened, and kept only in memory. Absent where a test
+   * builds a server without a coordinator start.
+   */
+  foldProfile?: FoldProfileResult;
 }
 
 /**

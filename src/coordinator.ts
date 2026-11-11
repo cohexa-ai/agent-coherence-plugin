@@ -32,6 +32,7 @@ import { PolicyRef } from "./policy.js";
 import { SessionRegistry } from "./sessions.js";
 import { readPackageVersion } from "./version.js";
 import { lockPidFile, rewritePidFile } from "./coordinator_lock.js";
+import { foldProfileLogLine, probeFoldProfile } from "./fs_profile.js";
 
 interface Workspace {
   root: string;
@@ -109,6 +110,15 @@ async function main(): Promise<void> {
     // that dead port while this one starts.
     rewritePidFile(pidLock.fd, "");
   }
+  // Once per process, under the lock and before the store opens: what the
+  // workspace disk treats as one file name.
+  const foldProfile = probeFoldProfile({
+    root: workspace.root,
+    coherenceDir: workspace.coherenceDir,
+    lockState: pidLock.state,
+    log: logInfo,
+  });
+  logInfo(foldProfileLogLine(foldProfile));
   // KTD-13 + README "auto-gitignored" claim: write .coherence/.gitignore
   // containing `*` so a careless `git add .` doesn't accidentally commit
   // state.db (MESI state + agent UUIDs), hook.secret (a credential), or
@@ -152,6 +162,7 @@ async function main(): Promise<void> {
     registry,
     policy,
     sessions,
+    foldProfile,
   });
 
   // What this coordinator published, once it has: on shutdown an unlocked
