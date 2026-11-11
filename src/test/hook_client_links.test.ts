@@ -8,10 +8,13 @@
  * `Path(file_path).resolve().relative_to(root)` on the same layout, except
  * where noted: a dangling link skips here (Python sends the missing target),
  * and a differently cased root reaches the coordinator here (Python's
- * `Path.resolve()` keeps the typed case, so it skips).
+ * `Path.resolve()` keeps the typed case, so it skips). Like `Path.resolve()`,
+ * the client keeps the case a name was typed in under a root spelled as the
+ * disk spells it.
  */
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -21,8 +24,11 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer as createHttpServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   buildPayload,
   buildPreEdit,
@@ -31,8 +37,12 @@ import {
   SkipHook,
   SUBCOMMANDS,
 } from '../hook_client.js';
+import { writeStandInPidFile } from './coordinator_stand_in.js';
 
 const SID = '55555555-5555-4555-8555-555555555555';
+const HOOK_CLIENT_JS = join(dirname(fileURLToPath(import.meta.url)), '..', 'hook_client.js');
+/** What the stand-in coordinator answers, so a request that reached it shows in the hook's output. */
+const REACHED = { reached: true };
 
 interface LinkedWorkspace {
   base: string;
@@ -113,6 +123,17 @@ test('a dangling link skips the hook with the skip signal, not a filesystem erro
   }
 });
 
+test('a looping link skips the hook with the skip signal', () => {
+  const { root, cleanup } = makeLinkedWorkspace();
+  try {
+    symlinkSync('loop-b.md', join(root, 'data', 'loop-a.md'));
+    symlinkSync('loop-a.md', join(root, 'data', 'loop-b.md'));
+    assert.throws(() => readPayload(join(root, 'data', 'loop-a.md'), root), SkipHook);
+  } finally {
+    cleanup();
+  }
+});
+
 test('a new file under an existing directory resolves the directory and keeps the leaf as typed', () => {
   const { root, cleanup } = makeLinkedWorkspace();
   try {
@@ -122,6 +143,27 @@ test('a new file under an existing directory resolves the directory and keeps th
     );
     assert.deepEqual(edit, { session_id: SID, path: 'documentation/New-Plan.MD' });
     assert.equal(readPayload(join(root, 'data', 'new', 'deep.md'), root).path, 'data/new/deep.md');
+  } finally {
+    cleanup();
+  }
+});
+
+test('a name typed in another case under a correctly spelled root is sent as typed', (t) => {
+  const { root, cleanup } = makeLinkedWorkspace();
+  try {
+    writeFileSync(join(root, 'README.md'), 'readme');
+    if (!existsSync(join(root, 'README.MD'))) {
+      t.skip('the temporary disk keeps two spellings apart, so README.MD is another file');
+      return;
+    }
+    assert.equal(readPayload(join(root, 'README.MD'), root).path, 'README.MD');
+    const edit = buildPreEdit(
+      { session_id: SID, tool_input: { file_path: join(root, 'README.MD') } },
+      root
+    );
+    assert.deepEqual(edit, { session_id: SID, path: 'README.MD' });
+    // The link is followed; the names typed around it keep their case.
+    assert.equal(readPayload(join(root, 'docs', 'GUIDE.MD'), root).path, 'documentation/GUIDE.MD');
   } finally {
     cleanup();
   }
@@ -191,4 +233,71 @@ test('no payload carries a name_kind field', () => {
   } finally {
     cleanup();
   }
+});
+
+// ------------------------------------------------------------ fail-open
+
+/**
+ * A coordinator stand-in for `root` that answers every request with REACHED,
+ * and the count of requests it received.
+ */
+async function standInCoordinator(t: TestContext, root: string): Promise<() => number> {
+  let requests = 0;
+  const server = createHttpServer((req, res) => {
+    requests += 1;
+    req.resume();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(REACHED));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const port = (server.address() as AddressInfo).port;
+  mkdirSync(join(root, '.coherence'), { recursive: true });
+  writeStandInPidFile(
+    join(root, '.coherence', 'server.pid'),
+    `${process.pid}\n${port}\nbackend=node\n`
+  );
+  writeFileSync(join(root, '.coherence', 'hook.secret'), `${'s'.repeat(32)}\n`);
+  return () => requests;
+}
+
+/**
+ * The real client's stdout for a pre-read of `filePath`. An async spawn: the
+ * stand-in answers on this process's event loop, which a sync spawn blocks.
+ */
+function hookPreRead(root: string, filePath: string): Promise<string> {
+  const cc = JSON.stringify({ session_id: SID, tool_input: { file_path: filePath } });
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [HOOK_CLIENT_JS, 'pre-read', '--root', root], {
+      cwd: tmpdir(),
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    let stdout = '';
+    child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString('utf8')));
+    child.on('close', () => resolve(stdout.trim()));
+    child.stdin.end(cc);
+  });
+}
+
+test('a path through a regular file fails open: the hook prints {} and sends nothing', async (t) => {
+  const { root, cleanup } = makeLinkedWorkspace();
+  t.after(cleanup);
+  const requests = await standInCoordinator(t, root);
+
+  // The stand-in answers a request the client does send.
+  assert.deepEqual(JSON.parse(await hookPreRead(root, join(root, 'plan.md'))), REACHED);
+  assert.throws(() => readPayload(join(root, 'plan.md', 'x'), root));
+  assert.equal(await hookPreRead(root, join(root, 'plan.md', 'x')), '{}');
+  assert.equal(requests(), 1);
+});
+
+test('a workspace root that cannot be resolved fails open: the hook prints {}', async (t) => {
+  const { base, cleanup } = makeLinkedWorkspace();
+  t.after(cleanup);
+  // Spelled as the disk resolves it, so only the missing root itself can stop a request.
+  const missing = join(realpathSync.native(base), 'missing');
+
+  assert.throws(() => readPayload(join(missing, 'plan.md'), missing));
+  // Nothing under such a root names a coordinator, so the hook stops before building a request.
+  assert.equal(await hookPreRead(missing, join(missing, 'plan.md')), '{}');
 });

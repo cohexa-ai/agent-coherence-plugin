@@ -327,9 +327,10 @@ export function drainNoticeText(
 
 /**
  * better-sqlite3's busy error, matched by its exact code, as
- * `resolveOrRegisterArtifact` matches its constraint code. The extended busy
- * codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`) are deliberately
- * not matched: only a held `BEGIN IMMEDIATE` has been observed here.
+ * `isUniqueViolation` in registry.ts matches its constraint code. The
+ * extended busy codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`) are
+ * deliberately not matched: only a held `BEGIN IMMEDIATE` has been observed
+ * here.
  */
 function isSqliteBusy(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && err.code === "SQLITE_BUSY";

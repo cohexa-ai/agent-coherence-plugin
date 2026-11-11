@@ -115,17 +115,31 @@ function requireFilePath(cc: CcPayload): string {
   return fp;
 }
 
+type Resolver = (path: string) => string;
+
 /**
- * The disk's spelling of an absolute path, following links as the Python
- * client's `Path.resolve()` does (macOS's `/var` becomes `/private/var`). The
- * native resolver, unlike the JS `realpathSync`, also returns the disk's case
- * for a differently cased spelling. It throws on a missing leaf, so a file a
- * tool is about to create resolves its deepest existing ancestor and keeps
- * the rest as typed.
+ * The JS resolver follows links and keeps the case every other name was
+ * typed in, as the Python client's `Path.resolve()` does (macOS's `/var`
+ * still becomes `/private/var`: it is a link). A Bash token is keyed as
+ * typed, so a Read of README.MD must be sent as typed too, or a coordinator
+ * that folds nothing keeps the two tools' records of one file apart.
  */
-function resolveOnDisk(absolutePath: string): string {
+const followLinks: Resolver = (path) => realpathSync(path);
+
+/**
+ * The native resolver also returns the disk's case, the one way a tool path
+ * spelled with a differently cased root (REPO for Repo) can meet the root.
+ */
+const diskSpelling: Resolver = (path) => realpathSync.native(path);
+
+/**
+ * An absolute path with its links followed by `realpath`. A resolver throws
+ * on a missing leaf, so a file a tool is about to create resolves its deepest
+ * existing ancestor and keeps the rest as typed.
+ */
+function resolveLinks(absolutePath: string, realpath: Resolver): string {
   try {
-    return realpathSync.native(absolutePath);
+    return realpath(absolutePath);
   } catch {
     // Missing, or a link the resolver cannot follow: told apart below.
   }
@@ -135,18 +149,27 @@ function resolveOnDisk(absolutePath: string): string {
   if (lstatSync(absolutePath, { throwIfNoEntry: false }) !== undefined) {
     throw new SkipHook(`link does not resolve: ${absolutePath}`);
   }
-  return join(resolveOnDisk(dirname(absolutePath)), basename(absolutePath));
+  return join(resolveLinks(dirname(absolutePath), realpath), basename(absolutePath));
+}
+
+/** `absolutePath` relative to `root`, both resolved by `realpath`; null when outside the root. */
+function relativeInside(root: string, absolutePath: string, realpath: Resolver): string | null {
+  const rel = relative(realpath(root), resolveLinks(absolutePath, realpath));
+  const outside = rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+  return outside ? null : rel;
 }
 
 /**
- * Absolute CC path → workspace-relative, with the root and the path both
- * resolved on disk; outside the root → SkipHook (mirrors Python).
+ * Absolute CC path to workspace-relative, links followed and typed case
+ * kept; the disk's spelling is tried only for a path that otherwise lies
+ * outside the root. Still outside: SkipHook (mirrors Python).
  */
 export function toWorkspaceRelative(filePath: string, root: string): string {
-  const rel = relative(realpathSync.native(root), resolveOnDisk(resolve(filePath)));
-  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-    throw new SkipHook(`path outside workspace root: ${filePath}`);
-  }
+  const absolutePath = resolve(filePath);
+  const rel =
+    relativeInside(root, absolutePath, followLinks) ??
+    relativeInside(root, absolutePath, diskSpelling);
+  if (rel === null) throw new SkipHook(`path outside workspace root: ${filePath}`);
   return rel;
 }
 

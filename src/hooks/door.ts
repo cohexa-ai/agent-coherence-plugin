@@ -86,12 +86,15 @@ export function fileRequest(deps: HookDeps, requested: string): FileRequest {
 }
 
 /**
- * A Bash token as a file request. A token over the fold limit is taken
- * exactly as typed, neither tidied nor folded: the index lists a stored name
- * over the limit under itself, so the token is stored and found that way.
+ * A Bash token as a file request. A token whose tidied name is over the fold
+ * limit is taken exactly as typed, neither tidied nor folded: the index lists
+ * a stored name over the limit under itself, so the token is stored and found
+ * that way. The limit is applied after tidying because the policy reads the
+ * tidied name: a token over it only by `./` padding is that file, and must
+ * meet that file's row and its stale and strict checks.
  */
 export function tokenRequest(deps: HookDeps, token: string): FileRequest {
-  if (!exceedsFoldLimit(token)) return fileRequest(deps, token);
+  if (!exceedsFoldLimit(tidyPath(token))) return fileRequest(deps, token);
   const policy = storedFilePolicy(deps);
   return { kind: 'file', requested: token, file: { key: token, tidied: token }, policy };
 }

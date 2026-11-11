@@ -43,8 +43,8 @@
  * that is not a workspace file, is matched as requested only.
  */
 import { randomBytes } from "node:crypto";
-import { writeFileSync, renameSync, mkdirSync, rmSync, lstatSync, type Stats } from "node:fs";
-import { join, dirname, basename } from "node:path";
+import { writeFileSync, renameSync, mkdirSync, rmSync, lstatSync, realpathSync, type Stats } from "node:fs";
+import { join, dirname, basename, isAbsolute, relative, sep } from "node:path";
 import { dump as yamlDump, load as yamlLoad, type YAMLException } from "js-yaml";
 import { NOT_REGULAR, readRegularFile } from "./disk_content.js";
 import {
@@ -297,11 +297,12 @@ export class TrackedArtifactPolicy {
   }
 
   /**
-   * Log, once, each tracked or strict pattern whose literal directories pass
-   * through a link inside the workspace: a hook session names a file reached
-   * through such a link by its target's path, which a pattern written against
-   * the link's path may not match. An ignored pattern that misses only leaves
-   * more coordinated, so ignored patterns are not checked.
+   * Log, once, each tracked or strict pattern whose literal segments pass
+   * through a link inside the workspace, a fully literal pattern's last one
+   * included: the hook client follows a link, so its Read, Edit and Write
+   * reach the coordinator under the target's path, which a pattern written
+   * against the link's path does not match. An ignored pattern that misses
+   * only leaves more coordinated, so ignored patterns are not checked.
    */
   private logLinkedPrefixes(): void {
     const labelled: Array<[string, string]> = [
@@ -310,14 +311,12 @@ export class TrackedArtifactPolicy {
     ];
     for (const [label, pattern] of labelled) {
       if (this.linkedPrefixesLogged.has(pattern)) continue;
-      const link = firstLinkedDirectory(this.coordinatorRoot, literalDirectories(pattern));
+      const link = firstLinkedSegment(this.coordinatorRoot, literalSegments(pattern));
       if (link === undefined) continue;
       this.linkedPrefixesLogged.add(pattern);
-      process.stderr.write(
-        `agent-coherence: ${label} pattern ${JSON.stringify(pattern)} reaches its files through the link ` +
-          `${JSON.stringify(link)} inside the workspace. A hook session names such a file by its ` +
-          `target's path, which this pattern may not match; write the pattern against the target's path.\n`,
-      );
+      const subject = `${label} pattern ${JSON.stringify(pattern)}`;
+      const target = linkTargetOf(this.coordinatorRoot, link);
+      process.stderr.write(`${linkedPatternMessage(subject, link, target)}\n`);
     }
   }
 
@@ -1590,23 +1589,82 @@ function entryGlob(pattern: string, profile: FoldProfile = "none"): Glob {
 }
 
 // ----------------------------------------------------------------------
-// Patterns whose literal directories pass through a link
+// Patterns whose literal segments pass through a link
 // ----------------------------------------------------------------------
 
-function literalDirectories(pattern: string): string[] {
-  const directories = literalRun(globTokens(pattern)).split("/").slice(0, -1);
-  return directories.filter((segment) => segment !== "" && segment !== ".");
+/**
+ * The literal segments of `pattern` a link can sit on: its literal
+ * directories, and its last segment as well when the whole pattern is
+ * literal, since that segment then names one entry, which can be a link to a
+ * file.
+ */
+function literalSegments(pattern: string): string[] {
+  const segments = literalRun(globTokens(pattern)).split("/");
+  const named = isLiteralGlob(pattern) ? segments : segments.slice(0, -1);
+  return named.filter((segment) => segment !== "" && segment !== ".");
 }
 
-function firstLinkedDirectory(root: string, directories: ReadonlyArray<string>): string | undefined {
-  for (let depth = 1; depth <= directories.length; depth++) {
-    const relative = directories.slice(0, depth).join("/");
-    const stats = lstatIfReadable(join(root, relative));
-    if (stats?.isSymbolicLink()) return relative;
+function firstLinkedSegment(root: string, segments: ReadonlyArray<string>): string | undefined {
+  for (let depth = 1; depth <= segments.length; depth++) {
+    const prefix = segments.slice(0, depth).join("/");
+    const stats = lstatIfReadable(join(root, prefix));
+    if (stats?.isSymbolicLink()) return prefix;
     // Past a missing entry or a file, no link further down is on any path.
     if (stats === undefined || !stats.isDirectory()) return undefined;
   }
   return undefined;
+}
+
+/**
+ * Resolvers in the order the hook client tries them: links followed with the
+ * typed case kept, then the disk's own spelling for a path the first leaves
+ * outside the root.
+ */
+const LINK_RESOLVERS: ReadonlyArray<(path: string) => string> = [
+  (path) => realpathSync(path),
+  (path) => realpathSync.native(path),
+];
+
+/**
+ * The workspace path the hook client sends for `link`: its target's path
+ * relative to the root, null when the target is outside the workspace (the
+ * client then sends nothing), or undefined when the link does not resolve.
+ */
+function linkTargetOf(root: string, link: string): string | null | undefined {
+  for (const realpath of LINK_RESOLVERS) {
+    let target: string;
+    try {
+      target = relative(realpath(root), realpath(join(root, link)));
+    } catch {
+      return undefined;
+    }
+    if (target !== ".." && !target.startsWith(`..${sep}`) && !isAbsolute(target)) return target;
+  }
+  return null;
+}
+
+/** The log line for a pattern (`subject`) that passes through `link`, by where its target lies. */
+function linkedPatternMessage(subject: string, link: string, target: string | null | undefined): string {
+  const head = `agent-coherence: ${subject} goes through the link ${JSON.stringify(link)}`;
+  if (target === null) {
+    return (
+      `${head}, whose target is outside the workspace. A Read, Edit or Write through it is not ` +
+      `coordinated at all: the hook client sends nothing for a path outside the workspace, so no ` +
+      `rewrite of this entry covers them.`
+    );
+  }
+  if (target === undefined) {
+    return (
+      `${head} inside the workspace, which does not resolve. The hook client sends nothing for a ` +
+      `Read, Edit or Write through it until its target exists, then follows it to the target's ` +
+      `path, which this entry does not match; name the target to cover them.`
+    );
+  }
+  return (
+    `${head} inside the workspace. The hook client follows the link, so a Read, Edit or Write ` +
+    `through it reaches the coordinator under the path of its target ${JSON.stringify(target)}, ` +
+    `which this entry does not match; name the target to cover them.`
+  );
 }
 
 /**

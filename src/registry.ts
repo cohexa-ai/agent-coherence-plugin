@@ -1377,15 +1377,25 @@ export class ArtifactRegistry {
   /**
    * Return (agent_id, granted_at_tick) of the current exclusive holder for an
    * artifact, excluding `excludeAgentId`. Returns null if no M∪E holder. Used
-   * by pre-edit collision detection.
+   * by pre-edit collision detection. A write holder of another row of the
+   * artifact's fold bucket counts too: the acquire that follows demotes it,
+   * and the opted-in acquire refuses on it.
    */
   exclusiveHolder(
     artifactId: string,
     excludeAgentId: string,
   ): { agentId: string; grantedAtTick: number | null } | null {
-    // checkSingleWriter elsewhere keeps this to at most one row.
-    const first = this.rowWriters(artifactId, excludeAgentId)[0];
+    // The artifact's own holder first; checkSingleWriter keeps each row to one.
+    const first = this.fileWriters(artifactId, excludeAgentId)[0];
     return first === undefined ? null : { agentId: first.agentId, grantedAtTick: first.grantedAtTick };
+  }
+
+  /**
+   * Whether an agent other than `agentId` holds EXCLUSIVE on the artifact or
+   * on another row of its fold bucket.
+   */
+  hasExclusivePeer(artifactId: string, agentId: string): boolean {
+    return this.fileWriters(artifactId, agentId).some((writer) => writer.state === MESIState.EXCLUSIVE);
   }
 
   /**

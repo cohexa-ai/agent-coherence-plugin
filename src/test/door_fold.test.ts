@@ -49,6 +49,7 @@ const TRACK_DATA = { 'tracked.yaml': '- "data/**"\n' };
 const TRACK_ALL = { 'tracked.yaml': '- "**"\n' };
 const CANNOT_TELL: FoldProfileResult = { profile: 'none', status: 'cannot_tell', reason: 'test' };
 const UNLOCKED: FoldProfileResult = { profile: 'none', status: 'cannot_tell', reason: 'unlocked' };
+const CASELESS: FoldProfileResult = { profile: 'caseless', status: 'classified' };
 
 type Answer = { status: number; body: Record<string, unknown> };
 
@@ -238,6 +239,29 @@ test('an alias pre-edit meets the holder of the file as its own spelling would',
   assert.equal(stateOf(door, 'data/x.txt', SID_C), MESIState.EXCLUSIVE);
 });
 
+test("an ordinary pre-edit meets a write holder on its fold bucket's other row", async (t) => {
+  const root = makeWorkspace(t, TRACK_ALL);
+  // Two rows for one file, as a build that folds nothing keeps them.
+  const split = await openDoor(t, root, { foldProfile: CANNOT_TELL });
+  const seen = { path: 'data/x.txt', content_hash: HASH_1 };
+  await split.post('/hooks/pre-read', { session_id: SID_A, ...seen });
+  await split.post('/hooks/pre-edit', { session_id: SID_C, path: 'DATA/X.TXT' });
+  await split.close();
+  // The file is missing at this start, so the rows stay apart as one bucket.
+  const door = await openDoor(t, root, { foldProfile: CASELESS });
+  writeWorkspaceFile(root, 'data/x.txt');
+
+  const edit = await door.post('/hooks/pre-edit', { session_id: SID_B, path: 'data/x.txt' });
+
+  assert.equal(door.indexProfile, 'caseless');
+  assert.deepEqual(rowNames(door), ['DATA/X.TXT', 'data/x.txt']);
+  assert.deepEqual([edit.body['ok'], edit.body['collision']], [true, true]);
+  // C's write may still be landing, so a disk unlike the record proves nothing.
+  assert.equal(edit.body['disk_differs'], undefined);
+  assert.equal(stateOf(door, 'DATA/X.TXT', SID_C), MESIState.INVALID);
+  assert.equal(stateOf(door, 'data/x.txt', SID_B), MESIState.EXCLUSIVE);
+});
+
 test('post-edit-cas and post-edit through an alias commit the file the alias names', async (t) => {
   const door = await dataDoor(t);
   const [a, b] = [SID_A, SID_B].map((sessionId) => sessionOf(door, sessionId));
@@ -386,6 +410,23 @@ test('a bash token over the fold limit is matched exactly as typed', async (t) =
   assert.deepEqual(first.body, { status: 'fresh' });
   assert.deepEqual(dotted.body, { status: 'fresh' });
   assert.deepEqual(rowNames(door), [`./${long}`, long]);
+});
+
+test('a bash token over the fold limit only by ./ padding reaches the file it tidies to', async (t) => {
+  const root = makeWorkspace(t, { 'strict_mode.yaml': '- "plan.md"\n' });
+  writeWorkspaceFile(root, 'plan.md');
+  const door = await openDoor(t, root);
+  await door.post('/hooks/pre-read', { session_id: SID_A, path: 'plan.md', content_hash: HASH_1 });
+  await commitAsB(door, 'plan.md');
+  const padded = `${'./'.repeat(520)}plan.md`;
+
+  const bash = await door.post('/hooks/pre-bash', { session_id: SID_A, command: `cat ${padded}` });
+
+  assert.deepEqual(rowNames(door), ['plan.md']);
+  assert.equal(bash.body['status'], 'stale');
+  assert.deepEqual(bash.body['stale_paths'], [padded]);
+  const output = bash.body['hookSpecificOutput'] as Record<string, unknown>;
+  assert.equal(output['permissionDecision'], 'deny');
 });
 
 // ------------------------------------------------------------------ disk spelling

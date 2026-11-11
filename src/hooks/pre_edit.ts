@@ -67,12 +67,11 @@ export type PreEditDeps = HookDeps;
  * peer in EXCLUSIVE counts as in flight. Python skips the check only when
  * that peer's heartbeat is within 5 s, so the two differ only for a peer
  * that has held EXCLUSIVE silently for longer, and the check never denies.
+ * A peer on another row of the file's fold bucket counts: its bytes land in
+ * the same file.
  */
 function aWriteIsInFlight(deps: PreEditDeps, artifactId: string, agentId: string): boolean {
-  for (const [peer, state] of deps.registry.getStateMap(artifactId)) {
-    if (peer !== agentId && state === MESIState.EXCLUSIVE) return true;
-  }
-  return false;
+  return deps.registry.hasExclusivePeer(artifactId, agentId);
 }
 
 /**

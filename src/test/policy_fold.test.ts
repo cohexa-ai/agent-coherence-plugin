@@ -12,6 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -371,6 +372,82 @@ test('a tracked or strict glob whose literal prefix crosses a link inside the ro
     assert.match(atReload[0]!, /tracked pattern "linked\/deep\/\*\*" .*through the link "linked"/);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a strict or tracked entry naming a linked file is logged once, naming the target', () => {
+  const root = mkdtempSync(join(tmpdir(), 'policy-fold-link-'));
+  try {
+    mkdirSync(join(root, 'docs', 'v2'), { recursive: true });
+    writeFileSync(join(root, 'docs', 'v2', 'spec.md'), 'spec');
+    symlinkSync(join('v2', 'spec.md'), join(root, 'docs', 'current.md'));
+    symlinkSync('missing.md', join(root, 'docs', 'dangle.md'));
+    writePolicy(root, {
+      tracked: ['docs/current.md', 'docs/v2/spec.md'],
+      strict: ['docs/current.md', 'docs/v2/spec.md', 'docs/dangle.md'],
+    });
+
+    const loaded = capturingStderr(() => TrackedArtifactPolicy.load(root));
+    const atLoad = linkLines(loaded.lines);
+    // One line per entry, though the same entry is both tracked and strict.
+    assert.equal(atLoad.length, 2, atLoad.join(''));
+    assert.match(atLoad[1]!, /"docs\/dangle\.md" .*which does not resolve/);
+    assert.match(atLoad[1]!, /sends nothing .* until its target exists/);
+    assert.match(atLoad[0]!, /pattern "docs\/current\.md" .*through the link "docs\/current\.md"/);
+    assert.match(atLoad[0]!, /the hook client follows the link/i);
+    assert.match(atLoad[0]!, /its target "docs\/v2\/spec\.md", which this entry does not match/);
+    assert.match(atLoad[0]!, /name the target to cover them/);
+
+    const reloaded = capturingStderr(() => loaded.result.reloaded());
+    assert.deepEqual(linkLines(reloaded.lines), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an entry through a link whose target is outside the workspace is logged as not coordinated', () => {
+  const base = mkdtempSync(join(tmpdir(), 'policy-fold-link-'));
+  try {
+    const root = join(base, 'ws');
+    mkdirSync(join(root, 'data'), { recursive: true });
+    mkdirSync(join(base, 'outside'));
+    writeFileSync(join(base, 'outside', 'secret.md'), 'secret');
+    symlinkSync(join(base, 'outside', 'secret.md'), join(root, 'data', 'out.md'));
+    symlinkSync(join(base, 'outside'), join(root, 'ext'));
+    writePolicy(root, { tracked: ['ext/**'], strict: ['data/out.md'] });
+
+    const atLoad = linkLines(capturingStderr(() => TrackedArtifactPolicy.load(root)).lines);
+    assert.equal(atLoad.length, 2, atLoad.join(''));
+    assert.match(atLoad[0]!, /tracked pattern "ext\/\*\*" .*through the link "ext"/);
+    assert.match(atLoad[1]!, /strict pattern "data\/out\.md" .*through the link "data\/out\.md"/);
+    for (const line of atLoad) {
+      assert.match(line, /target is outside the workspace/);
+      assert.match(line, /not coordinated at all/);
+      assert.doesNotMatch(line, /name the target/);
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('a link whose target spells the workspace in another case is read as inside it', (t) => {
+  const base = mkdtempSync(join(tmpdir(), 'policy-fold-link-'));
+  try {
+    const root = join(base, 'Repo');
+    mkdirSync(join(root, 'docs'), { recursive: true });
+    if (!existsSync(join(base, 'REPO'))) {
+      t.skip('the temporary disk keeps two spellings apart, so REPO is another directory');
+      return;
+    }
+    // The hook client meets the root under the disk's spelling, as it does here.
+    symlinkSync(join(base, 'REPO', 'docs'), join(root, 'ext'));
+    writePolicy(root, { strict: ['ext/*.md'] });
+
+    const atLoad = linkLines(capturingStderr(() => TrackedArtifactPolicy.load(root)).lines);
+    assert.equal(atLoad.length, 1, atLoad.join(''));
+    assert.match(atLoad[0]!, /its target "docs", which this entry does not match/);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
   }
 });
 

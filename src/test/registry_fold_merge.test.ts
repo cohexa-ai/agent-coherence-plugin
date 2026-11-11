@@ -635,6 +635,41 @@ test('when several rows match the disk hash, nobody keeps a write grant', (t) =>
   assertAtMostOneWriter(registry, second);
 });
 
+test('when several rows match the disk hash and only one has a write holder, nobody keeps it', (t) => {
+  const store = makeStore(t);
+  const raw = openRaw(t, store.dbPath);
+  const same = sha256('same bytes');
+  // The grant goes only to the single holder of the single row whose hash is
+  // the disk's; with two such rows, a lone holder on one of them does not fit.
+  const first = seedArtifact(raw, { name: 'data/x.txt', hash: same, updatedAt: 50 });
+  const second = seedArtifact(raw, { name: 'DATA/X.TXT', hash: same, updatedAt: 100 });
+  seedState(raw, {
+    artifactId: first,
+    agentId: AGENT_A,
+    state: MESIState.EXCLUSIVE,
+    grantedAt: 40,
+    observed: 1,
+  });
+  seedState(raw, { artifactId: second, agentId: AGENT_B, state: MESIState.SHARED, observed: 1 });
+  const registry = openRegistry(t, store.dbPath);
+  const outcome = registry.mergeFoldGroup(
+    groupOf(
+      'caseless',
+      { ids: [first, second], name: 'data/x.txt' },
+      { diskSpelling: null, diskHash: same }
+    ),
+    NOW
+  );
+  assert.equal(outcome.kind === 'merged' && outcome.keeperAgentId, null);
+  assert.deepEqual(outcome.kind === 'merged' && outcome.demotedWriters, [AGENT_A]);
+  assert.deepEqual(statesOf(raw, AGENT_A), [demotedAt(first, 1, NOW)]);
+  assert.deepEqual(noticesOf(raw, AGENT_A), [
+    { artifact_id: first, preempter_agent_id: FOLD_MERGE_PREEMPTER_ID, preempted_at_unix_ts: NOW },
+  ]);
+  assert.throws(() => registry.commit(first, AGENT_A, sha256('A'), NOW + 1), /commit_not_allowed/);
+  assertAtMostOneWriter(registry, first);
+});
+
 test('when the row matching the disk has no write holder, nobody keeps a write grant', (t) => {
   const store = makeStore(t);
   const raw = openRaw(t, store.dbPath);
