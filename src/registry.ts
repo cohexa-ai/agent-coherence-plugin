@@ -632,10 +632,13 @@ export class ArtifactRegistry {
     const states = this.db
       .prepare(`SELECT ${STATE_COLUMNS} FROM agent_states WHERE artifact_id IN (${placeholdersFor(ids)})`)
       .all(...ids) as Array<MergeStateRow & { state: string }>;
+    // The planner keeps the last of an agent's equal-time notices, so the order
+    // is explicit, and the Python coordinator reads the same one.
     const notices = this.db
       .prepare(
         `SELECT agent_id, artifact_id, preempter_agent_id, preempted_at_unix_ts
-         FROM pending_notices WHERE artifact_id IN (${placeholdersFor(ids)})`,
+         FROM pending_notices WHERE artifact_id IN (${placeholdersFor(ids)})
+         ORDER BY agent_id, artifact_id`,
       )
       .all(...ids) as MergeNoticeRow[];
     return { artifacts, states: states.map((row) => ({ ...row, state: toMESIState(row.state) })), notices };

@@ -802,6 +802,110 @@ test('one agent with rows on both spellings ends with one state row and one noti
   assertAtMostOneWriter(registry, first);
 });
 
+test("on equal write times the survivor takes the oldest row's values", (t) => {
+  // Neither hash is the disk's: the values come from the oldest row, not
+  // from the survivor or the row read last, as the Python coordinator chooses.
+  const store = makeStore(t);
+  const raw = openRaw(t, store.dbPath);
+  const first = seedArtifact(raw, {
+    name: 'data/x.txt',
+    hash: sha256('one'),
+    updatedAt: 100,
+    lastWriter: AGENT_A,
+    sizeTokens: 3,
+  });
+  const second = seedArtifact(raw, {
+    name: 'DATA/X.TXT',
+    hash: sha256('two'),
+    updatedAt: 100,
+    lastWriter: AGENT_B,
+    sizeTokens: 7,
+  });
+  const registry = openRegistry(t, store.dbPath);
+
+  const outcome = registry.mergeFoldGroup(
+    groupOf(
+      'caseless',
+      { ids: [first, second], name: 'data/x.txt' },
+      { diskSpelling: 'DATA/X.TXT', diskHash: sha256('neither') }
+    ),
+    NOW
+  );
+
+  assert.equal(outcome.kind === 'merged' && outcome.survivorId, second);
+  assert.deepEqual(
+    { ...registry.getArtifactById(second) },
+    {
+      id: second,
+      name: 'DATA/X.TXT',
+      version: 2,
+      content_hash: sha256('one'),
+      size_tokens: 3,
+      last_writer_id: AGENT_A,
+      updated_at: 100,
+    }
+  );
+});
+
+test("a demoted writer's notice names the merge over an older notice of the same time", (t) => {
+  // The merge's own notice is counted last, so it wins the tie: the demoted
+  // writer is not told another agent took its grant when the merge did.
+  const store = makeStore(t);
+  const raw = openRaw(t, store.dbPath);
+  const first = seedArtifact(raw, { name: 'data/x.txt' });
+  const second = seedArtifact(raw, { name: 'DATA/X.TXT' });
+  seedState(raw, {
+    artifactId: second,
+    agentId: AGENT_A,
+    state: MESIState.EXCLUSIVE,
+    grantedAt: 90,
+    observed: 1,
+  });
+  seedNotice(raw, { agentId: AGENT_A, artifactId: first, preempter: AGENT_B, at: NOW });
+  const registry = openRegistry(t, store.dbPath);
+
+  const outcome = registry.mergeFoldGroup(
+    groupOf(
+      'caseless',
+      { ids: [first, second], name: 'data/x.txt' },
+      { diskSpelling: null, diskHash: null }
+    ),
+    NOW
+  );
+
+  assert.deepEqual(outcome.kind === 'merged' && outcome.demotedWriters, [AGENT_A]);
+  assert.deepEqual(noticesOf(raw, AGENT_A), [
+    { artifact_id: first, preempter_agent_id: FOLD_MERGE_PREEMPTER_ID, preempted_at_unix_ts: NOW },
+  ]);
+});
+
+test('equal-time notices of one agent name the preempter on the greatest row id', (t) => {
+  // The merge reads notices by agent and row id, as the Python coordinator
+  // does, not in whatever order the store returns them.
+  const store = makeStore(t);
+  const raw = openRaw(t, store.dbPath);
+  const first = seedArtifact(raw, { name: 'data/x.txt' });
+  const second = seedArtifact(raw, { name: 'DATA/X.TXT' });
+  const [low, high] = [first, second].sort() as [string, string];
+  // Stored highest id first, so a read in storage order meets it first.
+  seedNotice(raw, { agentId: AGENT_C, artifactId: high, preempter: AGENT_B, at: 80 });
+  seedNotice(raw, { agentId: AGENT_C, artifactId: low, preempter: AGENT_A, at: 80 });
+  const registry = openRegistry(t, store.dbPath);
+
+  registry.mergeFoldGroup(
+    groupOf(
+      'caseless',
+      { ids: [first, second], name: 'data/x.txt' },
+      { diskSpelling: null, diskHash: null }
+    ),
+    NOW
+  );
+
+  assert.deepEqual(noticesOf(raw, AGENT_C), [
+    { artifact_id: first, preempter_agent_id: AGENT_B, preempted_at_unix_ts: 80 },
+  ]);
+});
+
 test('the merge preempter id is the uuid5 of its name', () => {
   const derived = uuidv5('ccs-coordinator-fold-merge:merged-spellings', uuidv5.URL).replace(
     /-/g,
