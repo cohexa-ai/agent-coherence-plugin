@@ -40,7 +40,9 @@ layer rejects on Host header alone before the auth check runs.
 
 **Mitigation**: Host-header allowlist. `src/auth.ts:verifyHost` accepts only
 `localhost` or `127.0.0.1`; any other hostname (including a rebind target
-like `attacker.example.com`) returns 401 before token comparison. This is
+like `attacker.example.com`) is answered 403 before the token is compared
+(`src/server.ts:checkAuth`); a request that passes the Host check but carries
+no valid bearer token is answered 401. This is
 the standard defense for local HTTP services exposed to a browser-capable
 machine.
 
@@ -109,6 +111,10 @@ nothing is sent. A `server.pid` that is gone or cannot be read does not stop a
 request (for a Node coordinator, only while its pid runs), so an attached
 client keeps working; one that has become a link, or anything but a pid file,
 does ([Cohexa-ai/agent-coherence#503](https://github.com/Cohexa-ai/agent-coherence/issues/503)).
+The `agent-coherence` library's clients make the same check in releases after
+0.15.0. A `CoherentVolume` from 0.15.0 makes none, and one with `managed`
+globs now attaches to the Node coordinator too, so it keeps sending the bearer
+to that coordinator's port after the coordinator exits: upgrade the library.
 
 The check is not proof of the secret, and it cannot see everything:
 
@@ -209,6 +215,7 @@ channel below.
 | Bearer token | 32 random bytes hex-encoded at `<repo>/.coherence/hook.secret`, mode `0600`, atomically created via `O_WRONLY \| O_CREAT \| O_EXCL` | `src/auth.ts:ensureSecret` |
 | Token comparison | Constant-time via `crypto.timingSafeEqual` (Node) and `hmac.compare_digest` (Python coordinator) — never `===` (which short-circuits and leaks token prefix via response timing) | `src/auth.ts:verifyBearer` |
 | Host-header allowlist | Only `localhost` and `127.0.0.1` accepted; defeats DNS rebinding from non-loopback origins | `src/auth.ts:verifyHost` |
+| Operator opt-in header | `GET /status?detail=full` is answered only to a request that carries `Coherence-Local-Operator: true` (the value in any case), and 403 otherwise, after the Host (403) and bearer (401) checks and before the coordinator reads its registry. The header keeps the operator view from being fetched and pasted by accident; it is **not** authentication, since anything that holds the bearer secret can send it. The view is the default tier plus the four policy pattern lists: no session names, no process id and no absolute root | `src/server.ts:handleStatus` |
 | Token rotation | Stop all coordinator processes, `rm <repo>/.coherence/hook.secret`; the coordinator the next session start spawns regenerates it. Hot rotation deferred to v0.2. | README "Troubleshooting" |
 | Empty-file recovery | If `hook.secret` exists but is empty/malformed (previous instance crashed mid-write), bounded `O_EXCL` retry rather than `O_TRUNC` re-write (avoids clobbering a concurrent racer's valid secret); fail-closed after N attempts | `src/auth.ts:ensureSecret` |
 
