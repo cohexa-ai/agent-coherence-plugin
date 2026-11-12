@@ -22,8 +22,8 @@
  */
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { verifyBearer, verifyHost } from "./auth.js";
-import type { ArtifactRegistry } from "./registry.js";
-import type { PolicyRef, PolicySummary } from "./policy.js";
+import type { Artifact, ArtifactRegistry } from "./registry.js";
+import type { PolicyPatternLists, PolicyRef, PolicySummary } from "./policy.js";
 import type { SessionRegistry } from "./sessions.js";
 import type { FoldProfileResult } from "./fs_profile.js";
 import { FOLD_TABLE_UNICODE_VERSION, type FoldProfile } from "./path_fold.js";
@@ -128,29 +128,41 @@ function handleHealth(req: IncomingMessage, res: ServerResponse, options: Server
 }
 
 /**
- * /status three-tier disclosure model per KTD-K.
+ * /status answers three tiers, chosen by `?detail=` (matched ignoring case;
+ * any other value is the default tier, so a typo never shows more):
  *
- * - **Default (minimal)**: Bearer-auth only. UUID5 agent_id ONLY (strip
- *   `claude-session-` prefix so operators can't accidentally cross-reference
- *   CC transcript history); repo-relative paths; counts and aggregates.
- *   Lower-leakage tier for default operator queries. R6: `agent_name` is the
- *   `claude-session-<session id>` form, so it is null here — see
- *   `handleStatus`.
- * - **`?detail=metrics`**: Bearer-auth only. KTD-J counters only; NO paths,
- *   NO session identifiers. Safe-to-share tier for GitHub bug reports.
- *   README routes users here for issue templates.
- * - **`?detail=full`**: Bearer + `Coherence-Local-Operator: true` header
- *   (misuse boundary — same-secret holder CAN set it trivially; the header
- *   prevents accidental paste-into-issue leakage, not malicious disclosure).
- *   Unmasks raw session_id (full agent_name), absolute paths, coordinator_pid.
- *   DEFERRED TO UNIT 8 — Unit 1 returns 501 Not Implemented for this tier.
+ * - **Default** (`/status`, `?detail=minimal`): bearer only. Repo-relative
+ *   paths and counts; each session is its `agent_id`, a uuid5 of the session
+ *   id that cannot be reversed, with `agent_name` null; the policy summary
+ *   carries counts and `coordinator_root: "."`.
+ * - **`?detail=metrics`**: bearer only. Counters and facts about this start;
+ *   no paths and no session identifiers, so it is safe to paste into a bug
+ *   report.
+ * - **`?detail=full`**, the operator view: bearer plus the
+ *   `Coherence-Local-Operator: true` header (any case), checked after the Host
+ *   and bearer checks and before any registry read. The header keeps the view
+ *   from being fetched and pasted by accident; it is not authentication, since
+ *   any holder of the bearer secret can send it. The body is the default body
+ *   with the four pattern lists the live policy enforces added to
+ *   `policy_summary`, each as written: `tracked_patterns`,
+ *   `user_added_patterns`, `ignored_patterns` and `strict_mode_patterns`, what
+ *   a client checks its own globs against. It adds nothing else: session names
+ *   stay null, the root stays ".", there is no pid, and a rejected pattern
+ *   shows only in its count. A reader needs only the lists, and every further
+ *   field would widen what a holder of the bearer secret sees.
  *
- * v0.1.1 Unit 1 ships default + metrics tiers with placeholder bodies
- * (empty arrays + zero counters). Unit 2 fills tracked_artifacts + sessions
- * with real registry data. Unit 8 lands ?detail=full + KTD-J counter values.
+ * Every tier carries `pre_edit_if_unheld: true` at the top level: this
+ * coordinator refuses a pre-edit that sends `if_unheld: true` while another
+ * session holds the file, rather than displacing the holder, and a client that
+ * relies on the refusal reads this key from whichever tier it asks for.
  */
 
 type StatusDetail = "default" | "metrics" | "full";
+
+/** Node lowercases header names. */
+const OPERATOR_OPT_IN_HEADER = "coherence-local-operator";
+const OPERATOR_OPT_IN_REFUSAL =
+  "detail=full (the operator view) requires the Coherence-Local-Operator: true header";
 
 interface StatusDefaultBody {
   status: "ok";
@@ -158,6 +170,8 @@ interface StatusDefaultBody {
   version: string;
   coordinator_uptime_seconds: number;
   schema_version: number;
+  /** A pre-edit sending `if_unheld: true` is refused while another session holds the file. */
+  pre_edit_if_unheld: true;
   // AC-03 (cross-backend parity): tracked_artifacts entries use `path`,
   // sessions entries carry `agent_name` + `states` (per-artifact MESI
   // map). Mirrors Python's `_handle_status` shape so dashboards and
@@ -194,6 +208,11 @@ interface StatusDefaultBody {
   fold_table_unicode: string;
 }
 
+/** The operator view: the default body, with the four pattern lists added to its policy summary. */
+type StatusOperatorBody = Omit<StatusDefaultBody, "policy_summary"> & {
+  policy_summary: PolicySummary & PolicyPatternLists;
+};
+
 type AdvertisedFoldProfile = FoldProfile | "cannot_tell";
 
 function advertisedFoldProfile(result: FoldProfileResult | undefined): AdvertisedFoldProfile {
@@ -204,6 +223,7 @@ function advertisedFoldProfile(result: FoldProfileResult | undefined): Advertise
 interface StatusMetricsBody {
   backend: "node";
   version: string;
+  pre_edit_if_unheld: true;
   counters: Record<string, number>;
   fold_profile: AdvertisedFoldProfile;
   fold_table_unicode: string;
@@ -212,10 +232,17 @@ interface StatusMetricsBody {
 function parseDetailParam(rawUrl: string): StatusDetail {
   // Use a fixed base because IncomingMessage.url is a path+query, not an absolute URL.
   const url = new URL(rawUrl, "http://localhost");
-  const detail = url.searchParams.get("detail");
+  // Matched ignoring case, as the Python coordinator matches it.
+  const detail = url.searchParams.get("detail")?.toLowerCase();
   if (detail === "metrics") return "metrics";
   if (detail === "full") return "full";
   return "default";
+}
+
+/** Whether the request opted into the operator view: the header is `true`, in any case. */
+function hasOperatorOptIn(req: IncomingMessage): boolean {
+  const value = req.headers[OPERATOR_OPT_IN_HEADER];
+  return typeof value === "string" && value.toLowerCase() === "true";
 }
 
 function handleStatus(req: IncomingMessage, res: ServerResponse, options: ServerOptions): void {
@@ -224,106 +251,107 @@ function handleStatus(req: IncomingMessage, res: ServerResponse, options: Server
     return;
   }
   const detail = parseDetailParam(req.url ?? "/status");
-
-  if (detail === "full") {
-    // The Node coordinator serves no operator tier. `agent-coherence-status
-    // --detail full` relays this text to the operator verbatim, so it says
-    // where the tier is served. It names no backend switch: a store this
-    // coordinator owns is one the Python coordinator fails closed on, and
-    // `agent-coherence-coordinator --prepare-for-migration` does not convert
-    // it (this coordinator serves no /admin/prepare-for-migration route).
-    writeError(
-      res,
-      501,
-      "detail=full (the operator tier) is served by the Python coordinator only; " +
-        "this Node coordinator serves the default and metrics tiers",
-    );
+  // Decided before any registry read; the refusal echoes nothing of the request.
+  if (detail === "full" && !hasOperatorOptIn(req)) {
+    writeError(res, 403, OPERATOR_OPT_IN_REFUSAL);
     return;
   }
+  writeJson(res, 200, statusBody(detail, options));
+}
 
-  const uptimeSeconds = Math.floor((Date.now() - options.startedAtMs) / 1000);
-  const schemaVersion = options.registry.getStats().schemaVersion;
+function statusBody(
+  detail: StatusDetail,
+  options: ServerOptions,
+): StatusDefaultBody | StatusMetricsBody | StatusOperatorBody {
+  if (detail === "metrics") return metricsStatusBody(options);
+  if (detail === "full") return operatorStatusBody(options);
+  return defaultStatusBody(options);
+}
 
-  if (detail === "metrics") {
-    const body: StatusMetricsBody = {
-      backend: "node",
-      version: options.version,
-      // KTD-J counters land in Unit 8. Empty placeholder keeps the shape stable
-      // so consumers can parse the body even before counters are wired.
-      counters: {},
-      fold_profile: advertisedFoldProfile(options.foldProfile),
-      fold_table_unicode: FOLD_TABLE_UNICODE_VERSION,
-    };
-    writeJson(res, 200, body);
-    return;
-  }
+function metricsStatusBody(options: ServerOptions): StatusMetricsBody {
+  return {
+    backend: "node",
+    version: options.version,
+    pre_edit_if_unheld: true,
+    // No counter is wired yet. The empty object keeps the shape stable, so
+    // consumers can parse the body before counters land.
+    counters: {},
+    fold_profile: advertisedFoldProfile(options.foldProfile),
+    fold_table_unicode: FOLD_TABLE_UNICODE_VERSION,
+  };
+}
 
-  // Default tier. Both tracked_artifacts and sessions wired from the registry's
-  // domain methods. agent_id is the UUID5 of the session_id, with no
-  // `claude-session-` prefix (the prefix only appears in the hook layer's
-  // agent_name field; the stored agent_id is already a bare UUID5 per KTD-K).
-  //
-  // AC-03 (cross-backend parity): tracked_artifacts uses `path` (not
-  // `name`) to match Python's wire shape. Sessions carry the agent_name field
-  // (null below the operator tier, per R6) + per-artifact MESI states so
-  // agent-coherence-status renders the same table against either backend.
+/**
+ * The default tier, and the base of the operator view. tracked_artifacts
+ * entries carry `path` and session rows `agent_name` + `states`, the Python
+ * coordinator's shape, so agent-coherence-status renders the same table
+ * against either backend.
+ */
+function defaultStatusBody(options: ServerOptions): StatusDefaultBody {
   const artifactList = options.registry.listArtifacts();
-  const artifacts = artifactList.map((a) => ({
-    id: a.id,
-    path: a.name, // Already repo-relative per the resolveOrRegister contract
-    version: a.version,
-  }));
-  const activeAgents = options.registry.listActiveAgents();
-  const sessions = activeAgents.map((agentId) => {
-    const states: Record<string, string> = {};
-    for (const art of artifactList) {
-      const state = options.registry.getAgentState(art.id, agentId);
-      // Only non-INVALID states appear in the per-agent map (Python parity).
-      if (state !== null && state !== "INVALID") {
-        states[art.name] = state;
-      }
-    }
-    // R6: `agent_name` is `claude-session-<session id>` — rendering it here
-    // republished that session's raw identifier beside its per-artifact
-    // state. Python moved the name behind the operator (?detail=full) tier;
-    // Node has no operator tier to move it into (detail=full answers 501
-    // above), so on the one tier it serves the name is dropped outright. The
-    // row keeps `agent_id`, a uuid5 of the session id that is not reversible,
-    // which is the handle a caller attributes by.
-    //
-    // null, not a sentinel: `<unknown>` is prose and belongs in
-    // permissionDecisionReason; this field is a machine-read identifier, and
-    // a string there is indistinguishable from a session actually named that.
-    // null is also what this row already carried whenever the SessionRegistry
-    // had not seen the agent_id — a holder that surfaced via a peer
-    // invalidation, or whose grant outlived the process that issued it — so
-    // the type and the consumer path are unchanged.
-    return {
-      agent_id: agentId,
-      agent_name: null,
-      states,
-    };
-  });
-
-  const body: StatusDefaultBody = {
+  // `name` is already repo-relative, per the resolveOrRegister contract.
+  const artifacts = artifactList.map((a) => ({ id: a.id, path: a.name, version: a.version }));
+  const sessions = statusSessions(options.registry, artifactList);
+  return {
     status: "ok",
     backend: "node",
     version: options.version,
-    coordinator_uptime_seconds: uptimeSeconds,
-    schema_version: schemaVersion,
+    coordinator_uptime_seconds: Math.floor((Date.now() - options.startedAtMs) / 1000),
+    schema_version: options.registry.getStats().schemaVersion,
+    pre_edit_if_unheld: true,
     tracked_artifacts: artifacts,
     sessions,
-    counts: {
-      tracked_artifacts: artifacts.length,
-      sessions: sessions.length,
-    },
-    // The summary carries the absolute workspace root. This is the default
-    // tier, so it gets the "." the Python default tier reports instead.
+    counts: { tracked_artifacts: artifacts.length, sessions: sessions.length },
+    // The summary carries the absolute workspace root. Every tier, the operator
+    // view included, gets the "." the Python default tier reports instead.
     policy_summary: { ...options.policy.summary(), coordinator_root: "." },
     fold_profile: advertisedFoldProfile(options.foldProfile),
     fold_table_unicode: FOLD_TABLE_UNICODE_VERSION,
   };
-  writeJson(res, 200, body);
+}
+
+/**
+ * The default body plus the pattern lists of the policy as this request reads
+ * it, the patterns enforced now.
+ */
+function operatorStatusBody(options: ServerOptions): StatusOperatorBody {
+  const body = defaultStatusBody(options);
+  return { ...body, policy_summary: { ...body.policy_summary, ...options.policy.patternLists() } };
+}
+
+/**
+ * Each holder by its `agent_id`, a uuid5 of the session id that cannot be
+ * reversed, with its per-artifact states. `agent_name` is null at every tier,
+ * the operator view included: it is `claude-session-<session id>`, so it would
+ * publish the raw session id beside that session's states. null, not a
+ * sentinel such as `<unknown>`: this field is machine-read, and a string there
+ * could not be told from a session actually named that. null is also what a
+ * holder the session map has not seen (one whose grant outlived the process
+ * that issued it) always carried.
+ */
+function statusSessions(
+  registry: ArtifactRegistry,
+  artifactList: Artifact[],
+): StatusDefaultBody["sessions"] {
+  return registry.listActiveAgents().map((agentId) => ({
+    agent_id: agentId,
+    agent_name: null,
+    states: heldStates(registry, artifactList, agentId),
+  }));
+}
+
+/** The agent's state per artifact, INVALID left out, as the Python coordinator lists it. */
+function heldStates(
+  registry: ArtifactRegistry,
+  artifactList: Artifact[],
+  agentId: string,
+): Record<string, string> {
+  const states: Record<string, string> = {};
+  for (const art of artifactList) {
+    const state = registry.getAgentState(art.id, agentId);
+    if (state !== null && state !== "INVALID") states[art.name] = state;
+  }
+  return states;
 }
 
 export function createServer(options: ServerOptions): Server {

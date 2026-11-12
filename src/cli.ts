@@ -372,7 +372,7 @@ export async function runStatus(argv: string[]): Promise<number> {
   try {
     const endpoint = resolveEndpoint(resolve(root));
     const path = detail === null ? "/status" : `/status?detail=${encodeURIComponent(detail)}`;
-    // The Python coordinator answers ?detail=full with 403 unless the request
+    // Both coordinators answer ?detail=full with 403 unless the request
     // carries the Coherence-Local-Operator opt-in, so an operator asking for
     // the full tier sends it. The other tiers do not need it and go without.
     const extra = detail === "full" ? { "Coherence-Local-Operator": "true" } : undefined;
@@ -382,7 +382,7 @@ export async function runStatus(argv: string[]): Promise<number> {
     return 2;
   }
   // Same `HTTP <status>: <error>` form as track/untrack and the Python CLI:
-  // the Node coordinator's 501 for ?detail=full says why, and so does a 403.
+  // a coordinator's refusal says why, so its text reaches the operator.
   if (answer.status < 200 || answer.status >= 300) {
     err(`agent-coherence-status: ${httpErrorLine(answer.status, answer.body)}`);
     return 2;

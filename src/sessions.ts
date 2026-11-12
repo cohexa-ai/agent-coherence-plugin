@@ -48,8 +48,8 @@ export class SessionRegistry {
    *
    * R2 attribution: a subagent gets an agent id DISTINCT from its parent's,
    * so the `[:8]` short form in warn/deny prose names the actual writer. The
-   * parent linkage stays in `nameByAgentId`; /status does not render it (R6:
-   * this coordinator serves no operator tier).
+   * parent linkage stays in `nameByAgentId`; /status does not render it at
+   * any tier, the operator view included.
    */
   registerSession(sessionId: string, subagentId?: string | null): string {
     const cacheKey =
