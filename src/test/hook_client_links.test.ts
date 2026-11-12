@@ -4,17 +4,17 @@
  * does, so one file reaches the coordinator under one path whatever link or
  * root spelling the tool call used.
  *
- * The expected paths below are literal and match the Python client's
- * `Path(file_path).resolve().relative_to(root)` on the same layout, except
- * where noted: a dangling link skips here (Python sends the missing target),
- * and a differently cased root reaches the coordinator here (Python's
- * `Path.resolve()` keeps the typed case, so it skips). Like `Path.resolve()`,
- * the client keeps the case a name was typed in under a root spelled as the
- * disk spells it.
+ * The expected paths below are literal and match the Python client of the
+ * library release that ships the same change, on the same layout: a dangling
+ * link skips, a '..' is folded by text before links are followed, and a
+ * differently cased root reaches the coordinator. Like Python's
+ * `Path.resolve()`, the client keeps the case a name was typed in under a root
+ * spelled as the disk spells it.
  */
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -31,6 +31,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildPayload,
+  buildPostEdit,
   buildPreEdit,
   buildPreGrep,
   buildPreRead,
@@ -143,6 +144,67 @@ test('a new file under an existing directory resolves the directory and keeps th
     );
     assert.deepEqual(edit, { session_id: SID, path: 'documentation/New-Plan.MD' });
     assert.equal(readPayload(join(root, 'data', 'new', 'deep.md'), root).path, 'data/new/deep.md');
+  } finally {
+    cleanup();
+  }
+});
+
+/**
+ * Adds <root>/sub/plan.md, <root>/other/plan.md (other bytes), <root>/other/new.md
+ * and sub/link -> <root>/other/dir, so sub/link/.. is sub by text and other on disk.
+ */
+function addLinkBeforeDotDot(root: string): void {
+  mkdirSync(join(root, 'sub'));
+  mkdirSync(join(root, 'other', 'dir'), { recursive: true });
+  writeFileSync(join(root, 'sub', 'plan.md'), 'by text');
+  writeFileSync(join(root, 'other', 'plan.md'), 'on disk');
+  writeFileSync(join(root, 'other', 'new.md'), 'on disk');
+  symlinkSync(join(root, 'other', 'dir'), join(root, 'sub', 'link'));
+}
+
+const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
+
+function editPath(filePath: string, root: string): unknown {
+  return buildPreEdit({ session_id: SID, tool_input: { file_path: filePath } }, root).path;
+}
+
+/*
+ * Claude Code folds '..' by text before it opens an absolute tool path,
+ * measured in a live session: a Read of sub/link/../plan.md (link -> other/dir)
+ * returned sub/plan.md, an Edit of it changed sub/plan.md, a Write of
+ * sub/link/../new.md created sub/new.md, and a Write of missing/../w2.md
+ * created w2.md. Only the shell stepped out of the link's target. So the client
+ * keys and hashes the file the tool opens, as the Python client keys it.
+ * The paths are template strings: join() would fold the '..' before the client sees it.
+ */
+test("a '..' after a link is folded by text, as Claude Code opens the path", () => {
+  const { root, cleanup } = makeLinkedWorkspace();
+  try {
+    addLinkBeforeDotDot(root);
+    assert.equal(readPayload(`${root}/sub/link/../plan.md`, root).path, 'sub/plan.md');
+    assert.equal(editPath(`${root}/sub/link/../plan.md`, root), 'sub/plan.md');
+    // other/new.md exists on disk, yet the Write creates sub/new.md.
+    assert.equal(editPath(`${root}/sub/link/../new.md`, root), 'sub/new.md');
+    assert.equal(editPath(`${root}/missing/../w2.md`, root), 'w2.md');
+  } finally {
+    cleanup();
+  }
+});
+
+test("a '..' after a link hashes the file Claude Code opens, not the disk's step", () => {
+  const { root, cleanup } = makeLinkedWorkspace();
+  try {
+    addLinkBeforeDotDot(root);
+    assert.equal(readPayload(`${root}/sub/link/../plan.md`, root).content_hash, sha256('by text'));
+    writeFileSync(join(root, 'w2.md'), 'written');
+    const cc = { session_id: SID, tool_input: { file_path: `${root}/missing/../w2.md` } };
+    const post = buildPostEdit({ ...cc, tool_response: {} }, root);
+    assert.deepEqual(post, {
+      session_id: SID,
+      path: 'w2.md',
+      success: true,
+      content_hash: sha256('written'),
+    });
   } finally {
     cleanup();
   }

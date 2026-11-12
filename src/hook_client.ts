@@ -165,6 +165,8 @@ function relativeInside(root: string, absolutePath: string, realpath: Resolver):
  * outside the root. Still outside: SkipHook (mirrors Python).
  */
 export function toWorkspaceRelative(filePath: string, root: string): string {
+  // Claude Code folds '..' by text before it opens an absolute path, so fold it
+  // before following links: on disk, link/.. is the parent of the link's target.
   const absolutePath = resolve(filePath);
   const rel =
     relativeInside(root, absolutePath, followLinks) ??
@@ -192,6 +194,8 @@ export function buildPreRead(cc: CcPayload, root: string): Record<string, unknow
   // KTD-O: PreToolUse:Read fires BEFORE the read, so tool_response carries no
   // hash — compute it from disk (raw bytes) so the strict gate's hash_differs
   // branch is reachable. Unreadable → omit (falls back to INVALID-only).
+  // Folded by text as for the key: read unfolded, the disk steps link/.. to
+  // the target's parent and hashes a file the tool does not open.
   const contentHash = hashFile(resolve(filePath));
   if (contentHash !== null) body.content_hash = contentHash;
   return withAgentId(cc, body);
@@ -216,6 +220,7 @@ export function buildPostEdit(cc: CcPayload, root: string): Record<string, unkno
   let contentHash =
     typeof toolResponse.content_hash === "string" ? toolResponse.content_hash : null;
   if (success && contentHash === null) {
+    // Folded by text as for the key, so the hash is of the file the tool wrote.
     contentHash = hashFile(resolve(filePath));
   }
   const body: Record<string, unknown> = { session_id: sessionId, path: rel, success };
