@@ -45,15 +45,17 @@ const TOOL = join(PLUGIN_ROOT, 'tools', 'check_release_readiness.js');
 const CI_YML = join(PLUGIN_ROOT, '.github', 'workflows', 'ci.yml');
 
 /**
- * The display names .github/workflows/ci.yml produces today, i.e. the exact
- * strings branch protection must require. Renaming a job or changing the
- * matrix updates this list AND the live required contexts (docs/RELEASE.md §1).
+ * The display names .github/workflows/ci.yml produces today. Renaming a job
+ * or changing the matrix updates this list AND the live required contexts
+ * (docs/RELEASE.md §1). A job branch protection does not require, such as a
+ * new one before the maintainer decides, makes the checker warn, not fail.
  */
 const CI_JOB_NAMES = [
   'Typecheck',
   'Tests (Node 22)',
   'Tests (Node 24)',
   'Tests (Node 25)',
+  'Folding tests (macOS)',
   'Zero-Python install (Node 22)',
   'Zero-Python install (Node 24)',
   'Zero-Python install (Node 25)',

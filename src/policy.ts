@@ -33,12 +33,48 @@
  * live (`reloaded`), and `/policy/untrack` refuses an entry that covers a strict
  * path (`strictPatternsCovering`). The one way to stop enforcing a strict path
  * is to restart the coordinator without its strict entry.
+ *
+ * On a disk that folds names (`caseless`, `nfd`), a file name matches a
+ * pattern when any of three readings does: the pattern as written against the
+ * name as requested, tidied; the pattern as written against the spelling the
+ * disk stores, when the coordinator has one; and the pattern folded
+ * (`foldGlobLiterals`: literal characters folded where they stand, each class
+ * made to accept the fold of every character it accepts) against the folded
+ * name. A disk that folds nothing uses the first reading alone, so folding
+ * only ever adds matches. A key, a name that is not a workspace file, is
+ * matched as requested only.
  */
 import { randomBytes } from "node:crypto";
-import { writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
-import { join, dirname, basename } from "node:path";
+import { writeFileSync, renameSync, mkdirSync, rmSync, lstatSync, realpathSync, type Stats } from "node:fs";
+import { join, dirname, basename, isAbsolute, relative, sep } from "node:path";
 import { dump as yamlDump, load as yamlLoad, type YAMLException } from "js-yaml";
 import { NOT_REGULAR, readRegularFile } from "./disk_content.js";
+import {
+  exceedsFoldLimit,
+  foldOneCodePoint,
+  policyFold,
+  policyFoldText,
+  singleFoldPreimages,
+  tidyPath,
+  type FoldingProfile,
+  type FoldProfile,
+} from "./path_fold.js";
+
+export type NameKind = "file" | "key";
+
+/**
+ * What the coordinator knows about a name it asks the policy about: the fold
+ * profile of the workspace disk, whether the name is a file or a key, and, for
+ * a file, the spelling the disk stores it under (relative to the workspace
+ * root) when it has one.
+ */
+export interface PolicyMatchContext {
+  readonly profile: FoldProfile;
+  readonly kind: NameKind;
+  readonly diskSpelling?: string;
+}
+
+export const UNFOLDED_FILE: PolicyMatchContext = { profile: "none", kind: "file" };
 
 /** Mirror of Python coordinator_server.MAX_POLICY_PATHS_PER_REQUEST. */
 export const MAX_POLICY_PATHS_PER_REQUEST = 20;
@@ -132,10 +168,14 @@ export class TrackedArtifactPolicy {
   readonly strictModePaths: ReadonlyArray<string>;
   readonly rejectedPatterns: ReadonlyArray<RejectedPattern>;
   // What the strict-coverage check reads from the strict and tracked
-  // patterns, built once: an untrack request and the spawn diagnostic decide
-  // every entry against the same patterns.
-  private readonly coverageStrict: ReadonlyArray<Glob>;
-  private readonly coverageTracked: ReadonlyArray<Glob>;
+  // patterns as written, built once: an untrack request and the spawn
+  // diagnostic decide every entry against the same patterns. The folded
+  // patterns a folding disk adds are built on first use, per profile.
+  private readonly coverage: CoverageView;
+  private readonly foldedCoverage = new Map<FoldingProfile, CoverageView>();
+  // Patterns already logged as reaching their files through a link, shared
+  // with every policy reloaded from this one so each is logged once.
+  private readonly linkedPrefixesLogged: Set<string>;
 
   private constructor(args: {
     coordinatorRoot: string;
@@ -144,6 +184,7 @@ export class TrackedArtifactPolicy {
     userAddedPatterns: ReadonlyArray<string>;
     strictModePaths: ReadonlyArray<string>;
     rejectedPatterns: ReadonlyArray<RejectedPattern>;
+    linkedPrefixesLogged: Set<string>;
   }) {
     this.coordinatorRoot = args.coordinatorRoot;
     this.trackedPatterns = args.trackedPatterns;
@@ -151,22 +192,20 @@ export class TrackedArtifactPolicy {
     this.userAddedPatterns = args.userAddedPatterns;
     this.strictModePaths = args.strictModePaths;
     this.rejectedPatterns = args.rejectedPatterns;
-    // A literal strict path no tracked pattern reaches puts nothing in strict
-    // mode (an intersection), so no entry can cover it.
-    this.coverageStrict = this.strictModePaths
-      .map(globOf)
-      .filter((s) => !s.isLiteral || this.matchesTracked(s.pattern));
-    this.coverageTracked = union(this.userAddedPatterns, this.trackedPatterns).map(globOf);
+    this.linkedPrefixesLogged = args.linkedPrefixesLogged;
+    this.coverage = this.buildCoverage("none");
   }
 
   /**
    * Load policy: defaults + .coherence/tracked.yaml opt-in +
    * .coherence/ignored.yaml opt-out + .coherence/strict_mode.yaml
    * strict opt-in (zero-Python Unit 6; mirrors Python policy.py). Names, once
-   * at spawn, any ignored pattern that strict overrides (#261).
+   * at spawn, any ignored pattern that strict overrides (#261), and logs each
+   * pattern whose literal directories pass through a link.
    */
   static load(coordinatorRoot: string): TrackedArtifactPolicy {
-    const policy = TrackedArtifactPolicy.read(coordinatorRoot);
+    const policy = TrackedArtifactPolicy.read(coordinatorRoot, new Set());
+    policy.logLinkedPrefixes();
     const overridden = policy.ignoredPatternsOverriddenByStrict();
     if (overridden.length > 0) {
       process.stderr.write(
@@ -180,7 +219,7 @@ export class TrackedArtifactPolicy {
   }
 
   /** Read the policy files, without `load`'s spawn-time diagnostic. */
-  private static read(coordinatorRoot: string): TrackedArtifactPolicy {
+  private static read(coordinatorRoot: string, linkedPrefixesLogged: Set<string>): TrackedArtifactPolicy {
     const rejected: RejectedPattern[] = [];
     const added = loadYamlPatterns(join(coordinatorRoot, ".coherence", "tracked.yaml"), rejected);
     const ignored = loadYamlPatterns(join(coordinatorRoot, ".coherence", "ignored.yaml"), rejected);
@@ -192,6 +231,7 @@ export class TrackedArtifactPolicy {
       userAddedPatterns: added,
       strictModePaths: strict,
       rejectedPatterns: rejected,
+      linkedPrefixesLogged,
     });
   }
 
@@ -204,9 +244,15 @@ export class TrackedArtifactPolicy {
    * mode needs both — so a hand-edited strict_mode.yaml or tracked.yaml
    * followed by any track or untrack cannot end enforcement mid-run. Additions
    * on disk still apply. Without strict patterns the files are read verbatim.
+   * A pattern that newly reaches its files through a link is logged.
    */
   reloaded(): TrackedArtifactPolicy {
-    const fresh = TrackedArtifactPolicy.read(this.coordinatorRoot);
+    const next = this.mergedWith(TrackedArtifactPolicy.read(this.coordinatorRoot, this.linkedPrefixesLogged));
+    next.logLinkedPrefixes();
+    return next;
+  }
+
+  private mergedWith(fresh: TrackedArtifactPolicy): TrackedArtifactPolicy {
     if (this.strictModePaths.length === 0) return fresh;
     return new TrackedArtifactPolicy({
       coordinatorRoot: fresh.coordinatorRoot,
@@ -215,15 +261,69 @@ export class TrackedArtifactPolicy {
       userAddedPatterns: union(this.userAddedPatterns, fresh.userAddedPatterns),
       strictModePaths: union(this.strictModePaths, fresh.strictModePaths),
       rejectedPatterns: fresh.rejectedPatterns,
+      linkedPrefixesLogged: this.linkedPrefixesLogged,
     });
   }
 
-  private matchesTracked(normalized: string): boolean {
-    return matchesAny(normalized, this.trackedPatterns) || matchesAny(normalized, this.userAddedPatterns);
+  private matchesTracked(name: NameReadings): boolean {
+    return readingsMatch(name, this.trackedPatterns) || readingsMatch(name, this.userAddedPatterns);
   }
 
-  private matchesStrict(normalized: string): boolean {
-    return matchesAny(normalized, this.strictModePaths);
+  private matchesStrict(name: NameReadings): boolean {
+    return readingsMatch(name, this.strictModePaths);
+  }
+
+  /**
+   * The strict and tracked patterns the coverage search reads under
+   * `profile`: as written for `none`, folded (`foldGlobLiterals`) for a
+   * folding profile. Each glob reports the pattern as written.
+   */
+  private buildCoverage(profile: FoldProfile): CoverageView {
+    const globFor = (pattern: string): Glob =>
+      profile === "none"
+        ? globOf(pattern)
+        : globOf(foldPolicyPattern(pattern, profile), pattern, FOLDED_CLASS_MEMBER_LIMIT);
+    return {
+      // A literal strict path no tracked pattern reaches puts nothing in
+      // strict mode (an intersection), so no entry can cover it.
+      strict: this.strictModePaths
+        .filter((p) => !isLiteralGlob(p) || this.matchesTracked(literalReadings(p, profile)))
+        .map(globFor),
+      tracked: union(this.userAddedPatterns, this.trackedPatterns).map(globFor),
+    };
+  }
+
+  private foldedCoverageView(profile: FoldingProfile): CoverageView {
+    let view = this.foldedCoverage.get(profile);
+    if (view === undefined) {
+      view = this.buildCoverage(profile);
+      this.foldedCoverage.set(profile, view);
+    }
+    return view;
+  }
+
+  /**
+   * Log, once, each tracked or strict pattern whose literal segments pass
+   * through a link inside the workspace, a fully literal pattern's last one
+   * included: the hook client follows a link, so its Read, Edit and Write
+   * reach the coordinator under the target's path, which a pattern written
+   * against the link's path does not match. An ignored pattern that misses
+   * only leaves more coordinated, so ignored patterns are not checked.
+   */
+  private logLinkedPrefixes(): void {
+    const labelled: Array<[string, string]> = [
+      ...union(this.trackedPatterns, this.userAddedPatterns).map((p): [string, string] => ["tracked", p]),
+      ...this.strictModePaths.map((p): [string, string] => ["strict", p]),
+    ];
+    for (const [label, pattern] of labelled) {
+      if (this.linkedPrefixesLogged.has(pattern)) continue;
+      const link = firstLinkedSegment(this.coordinatorRoot, literalSegments(pattern));
+      if (link === undefined) continue;
+      this.linkedPrefixesLogged.add(pattern);
+      const subject = `${label} pattern ${JSON.stringify(pattern)}`;
+      const target = linkTargetOf(this.coordinatorRoot, link);
+      process.stderr.write(`${linkedPatternMessage(subject, link, target)}\n`);
+    }
   }
 
   /**
@@ -231,14 +331,15 @@ export class TrackedArtifactPolicy {
    * default or user-added pattern) and matches at least one strict_mode_paths
    * glob. Intersection semantics — strict never applies to a path no tracked
    * pattern matches. An ignored pattern does not take a path out of strict
-   * mode (see `isTracked`). Empty strict_mode_paths short-circuits to false
-   * (v0.1.1 warn-only behavior preserved).
+   * mode (see `isTracked`). Empty strict_mode_paths short-circuits to false.
+   * Every pattern meets the name under each of its readings (`readingsOf`);
+   * without a context the name is a file on a disk that folds nothing.
    */
-  isStrictMode(parentRelativePath: string): boolean {
+  isStrictMode(parentRelativePath: string, context: PolicyMatchContext = UNFOLDED_FILE): boolean {
     if (this.strictModePaths.length === 0) return false;
-    const normalized = normalizeRelative(parentRelativePath);
-    if (normalized === null) return false;
-    return this.matchesTracked(normalized) && this.matchesStrict(normalized);
+    const name = readingsOf(parentRelativePath, context);
+    if (name === null) return false;
+    return this.matchesTracked(name) && this.matchesStrict(name);
   }
 
   /**
@@ -250,14 +351,16 @@ export class TrackedArtifactPolicy {
    * `/policy/untrack` at runtime), never drops a strict path onto the
    * untracked fast path, where a read reports version 0 and a CAS commit is
    * accepted at any expected version. For every path no strict pattern
-   * matches, ignore wins ties as before.
+   * matches, ignore wins ties as before. Tracked, ignored and strict patterns
+   * all meet the name under the same readings, so a spelling that an ignored
+   * pattern reaches is still held by a strict pattern that reaches any other.
    */
-  isTracked(parentRelativePath: string): boolean {
-    const normalized = normalizeRelative(parentRelativePath);
-    if (normalized === null) return false;
-    if (!this.matchesTracked(normalized)) return false;
-    if (!matchesAny(normalized, this.ignoredPatterns)) return true;
-    return this.matchesStrict(normalized);
+  isTracked(parentRelativePath: string, context: PolicyMatchContext = UNFOLDED_FILE): boolean {
+    const name = readingsOf(parentRelativePath, context);
+    if (name === null) return false;
+    if (!this.matchesTracked(name)) return false;
+    if (!readingsMatch(name, this.ignoredPatterns)) return true;
+    return this.matchesStrict(name);
   }
 
   /**
@@ -276,9 +379,13 @@ export class TrackedArtifactPolicy {
    * budget runs out counts as covered, and once the entry's budget runs out so
    * does every strict pattern not yet decided and not ruled out by literal
    * prefixes and suffixes. Empty when no strict path is covered.
+   *
+   * On a folding `profile` the search runs as written first, then again with
+   * both sides folded (`foldGlobLiterals`) for each strict pattern not yet
+   * covered, under the same budgets.
    */
-  strictPatternsCovering(pattern: string): string[] {
-    return this.strictPatternsCoveringEach([pattern])[0]!;
+  strictPatternsCovering(pattern: string, profile: FoldProfile = "none"): string[] {
+    return this.strictPatternsCoveringEach([pattern], profile)[0]!;
   }
 
   /**
@@ -290,10 +397,10 @@ export class TrackedArtifactPolicy {
    * ends do not rule out, so a request of costly entries is refused rather
    * than held past the client's timeout.
    */
-  strictPatternsCoveringEach(patterns: ReadonlyArray<string>): string[][] {
+  strictPatternsCoveringEach(patterns: ReadonlyArray<string>, profile: FoldProfile = "none"): string[][] {
     const requestBudget = new SearchBudget(globIntersectBudgets.request);
     return patterns.map((p) =>
-      this.strictPatternsCoveringWithin(p, new SearchBudget(globIntersectBudgets.call, requestBudget)),
+      this.strictPatternsCoveringWithin(p, new SearchBudget(globIntersectBudgets.call, requestBudget), profile),
     );
   }
 
@@ -307,24 +414,33 @@ export class TrackedArtifactPolicy {
    * erring toward the warning.
    */
   ignoredPatternsOverriddenByStrict(): string[] {
-    if (this.coverageStrict.length === 0) return [];
-    const total = new SearchBudget(globIntersectBudgets.diagnostic);
+    if (this.coverage.strict.length === 0) return [];
+    const search = { tracked: this.coverage.tracked, budget: new SearchBudget(globIntersectBudgets.diagnostic) };
     return this.ignoredPatterns.filter((p) => {
       const entry = entryGlob(p);
-      return this.coverageStrict.some((strict) => this.entryCoversStrict(entry, strict, total));
+      return this.coverage.strict.some((strict) => this.entryCoversStrict(entry, strict, search));
     });
   }
 
-  private strictPatternsCoveringWithin(pattern: string, callBudget: SearchBudget): string[] {
-    if (this.coverageStrict.length === 0) return [];
-    const entry = entryGlob(pattern);
-    return this.coverageStrict
-      .filter((strict) => this.entryCoversStrict(entry, strict, callBudget))
-      .map((strict) => strict.pattern);
+  private strictPatternsCoveringWithin(pattern: string, callBudget: SearchBudget, profile: FoldProfile): string[] {
+    if (this.strictModePaths.length === 0) return [];
+    const covered = this.coveredIn(this.coverage, entryGlob(pattern), callBudget);
+    if (profile === "none") return covered;
+    // A name still matches a pattern as written, so the search as written
+    // keeps every refusal it makes; the folded search only adds refusals.
+    const folded = this.foldedCoverageView(profile);
+    const undecided = { ...folded, strict: folded.strict.filter((s) => !covered.includes(s.source)) };
+    const reported = new Set([...covered, ...this.coveredIn(undecided, entryGlob(pattern, profile), callBudget)]);
+    return this.strictModePaths.filter((p) => reported.has(p));
+  }
+
+  private coveredIn(view: CoverageView, entry: Glob, budget: SearchBudget): string[] {
+    const search = { tracked: view.tracked, budget };
+    return view.strict.filter((strict) => this.entryCoversStrict(entry, strict, search)).map((s) => s.source);
   }
 
   /** Whether `entry` covers a path `strict` puts in strict mode; out of budget counts as covers. */
-  private entryCoversStrict(entry: Glob, strict: Glob, callBudget: SearchBudget): boolean {
+  private entryCoversStrict(entry: Glob, strict: Glob, search: CoverageSearch): boolean {
     // A path both match carries both literal prefixes and suffixes; if they
     // do not nest, the strict pattern is exactly not covered, at no cost.
     if (!affixesNest([entry.affixes, strict.affixes])) return false;
@@ -332,26 +448,26 @@ export class TrackedArtifactPolicy {
       // A literal strict path's language is the one path (tracked: the index
       // keeps no other), so matching it decides it exactly.
       return strict.isLiteral
-        ? matchesCharged(entry, strict.pattern, callBudget)
-        : this.strictGlobCovered(entry, strict, callBudget);
+        ? matchesCharged(entry, strict.pattern, search.budget)
+        : this.strictGlobCovered(entry, strict, search);
     } catch (err) {
       if (err instanceof BudgetExhausted) return true;
       throw err;
     }
   }
 
-  private strictGlobCovered(entry: Glob, strict: Glob, callBudget: SearchBudget): boolean {
+  private strictGlobCovered(entry: Glob, strict: Glob, search: CoverageSearch): boolean {
     // Only a tracked pattern whose literal ends nest with the entry's and the
     // strict glob's can share a path with both; with none, the strict glob is
     // exactly not covered, at no search cost.
-    const tracked = this.coverageTracked.filter((t) =>
+    const tracked = search.tracked.filter((t) =>
       affixesNest([entry.affixes, strict.affixes, t.affixes]),
     );
     if (tracked.length === 0) return false;
     // A budget per strict glob, so one costly pattern (or many cheap ones)
     // never decides the others: a shared budget marks every pattern after the
     // point it ran out as covering.
-    const budget = new SearchBudget(globIntersectBudgets.pattern, callBudget);
+    const budget = new SearchBudget(globIntersectBudgets.pattern, search.budget);
     return (
       globsIntersect([entry.tokens, strict.tokens], budget) &&
       tracked.some((t) => globsIntersect([entry.tokens, strict.tokens, t.tokens], budget))
@@ -400,13 +516,13 @@ export class PolicyRef {
   }
 
   /** Convenience passthrough — the hot-path call every hook handler makes. */
-  isTracked(parentRelativePath: string): boolean {
-    return this.current.isTracked(parentRelativePath);
+  isTracked(parentRelativePath: string, context?: PolicyMatchContext): boolean {
+    return this.current.isTracked(parentRelativePath, context);
   }
 
   /** Strict-mode passthrough (Unit 6) — same read-through-the-ref discipline. */
-  isStrictMode(parentRelativePath: string): boolean {
-    return this.current.isStrictMode(parentRelativePath);
+  isStrictMode(parentRelativePath: string, context?: PolicyMatchContext): boolean {
+    return this.current.isStrictMode(parentRelativePath, context);
   }
 
   /** Convenience passthrough for the /status default tier. */
@@ -644,14 +760,25 @@ function unloadableMessage(
 // ----------------------------------------------------------------------
 
 /**
- * Normalize a relative path: strip leading `./`. Returns null if the path
- * is absolute, contains `..` components, or is empty after stripping.
+ * Normalize a relative name for matching. A file is tidied first (`tidyPath`:
+ * repeated `/` and `.` segments dropped, as the kernel reads them), so
+ * `.//data/x.txt` meets the globs `data/x.txt` meets. A key keeps its exact
+ * name. Returns null if the name is absolute, contains `..` components, or is
+ * empty.
+ */
+export function normalizeRelative(p: string, kind: NameKind = "file"): string | null {
+  return stripLeadingDotSlash(kind === "file" ? tidyPath(p) : p);
+}
+
+/**
+ * Strip a leading `./`. Returns null if the path is absolute, contains `..`
+ * components, or is empty after stripping.
  *
  * Note: uses literal `./` prefix strip (NOT trim of `./`) so dotfiles like
  * `.env` and `.gitignore` are unchanged. Mirrors Python's removeprefix fix
  * documented at policy.py:136-140.
  */
-export function normalizeRelative(p: string): string | null {
+function stripLeadingDotSlash(p: string): string | null {
   if (p === "") return null;
   if (p.startsWith("/")) return null;
   const cleaned = p.startsWith("./") ? p.slice(2) : p;
@@ -661,12 +788,199 @@ export function normalizeRelative(p: string): string | null {
   return cleaned;
 }
 
-function matchesAny(path: string, patterns: ReadonlyArray<string>): boolean {
+function matchesAny(path: string, patterns: ReadonlyArray<string>, patternOf = (p: string) => p): boolean {
   const posixPath = path.replace(/\\/g, "/");
   for (const pattern of patterns) {
-    if (globMatch(posixPath, pattern)) return true;
+    if (globMatch(posixPath, patternOf(pattern))) return true;
   }
   return false;
+}
+
+// ----------------------------------------------------------------------
+// The readings a name is matched under
+// ----------------------------------------------------------------------
+
+interface FoldedName {
+  readonly text: string;
+  readonly profile: FoldingProfile;
+}
+
+/** The readings of one name; a pattern any of them matches matches the name. */
+interface NameReadings {
+  /** As requested: tidied for a file, exact for a key. */
+  readonly requested: string;
+  /**
+   * A file as typed, before tidying, when that differs. A file also matches
+   * as typed, so a glob written with `//` or `/./` keeps matching a request
+   * typed the same way.
+   */
+  readonly asTyped?: string;
+  /** As the disk stores it, on a folding disk, when the coordinator has it. */
+  readonly onDisk: string | undefined;
+  /** Folded, on a folding disk, for the pattern folded the same way. */
+  readonly folded: FoldedName | undefined;
+}
+
+/** The readings of `name` under `context`, or null when it is not a relative name. */
+function readingsOf(name: string, context: PolicyMatchContext): NameReadings | null {
+  const requested = normalizeRelative(name, context.kind);
+  if (requested === null) return null;
+  const typed = context.kind === "file" ? stripLeadingDotSlash(name) : null;
+  const asTyped = typed !== null && typed !== requested ? { asTyped: typed } : {};
+  const profile = foldingProfileOf(requested, context);
+  if (profile === undefined) return { requested, ...asTyped, onDisk: undefined, folded: undefined };
+  return {
+    requested,
+    ...asTyped,
+    onDisk: context.diskSpelling,
+    folded: { text: policyFold(requested, profile), profile },
+  };
+}
+
+/**
+ * The profile a name's disk and folded readings apply under, or undefined
+ * when it is read as requested only: a key is an exact name, a disk that
+ * folds nothing keeps every spelling apart in policy as well, and a name over
+ * the fold limit is never folded (the coordinator refuses such a path, so
+ * only a Bash or Grep token gets here, matched as typed).
+ */
+function foldingProfileOf(name: string, context: PolicyMatchContext): FoldingProfile | undefined {
+  if (context.kind === "key" || context.profile === "none") return undefined;
+  return exceedsFoldLimit(name) ? undefined : context.profile;
+}
+
+/**
+ * A literal strict path's readings for the coverage search: as written, the
+ * way the search reads it, and folded where its characters stand.
+ */
+function literalReadings(path: string, profile: FoldProfile): NameReadings {
+  const folded = profile === "none" ? undefined : { text: policyFoldText(path, profile), profile };
+  return { requested: path, onDisk: undefined, folded };
+}
+
+function readingsMatch(name: NameReadings, patterns: ReadonlyArray<string>): boolean {
+  return (
+    matchesAny(name.requested, patterns) ||
+    (name.asTyped !== undefined && matchesAny(name.asTyped, patterns)) ||
+    (name.onDisk !== undefined && matchesAny(name.onDisk, patterns)) ||
+    (name.folded !== undefined && matchesAnyFolded(name.folded, patterns))
+  );
+}
+
+function matchesAnyFolded(name: FoldedName, patterns: ReadonlyArray<string>): boolean {
+  return matchesAny(name.text, patterns, (pattern) => foldPolicyPattern(pattern, name.profile));
+}
+
+// Untrack entries are folded uncached, so a client cannot grow this cache.
+const foldedPolicyPatterns: Record<FoldingProfile, Map<string, string>> = {
+  caseless: new Map(),
+  nfd: new Map(),
+};
+
+function foldPolicyPattern(pattern: string, profile: FoldingProfile): string {
+  const cache = foldedPolicyPatterns[profile];
+  let folded = cache.get(pattern);
+  if (folded === undefined) {
+    folded = foldGlobLiterals(pattern, profile);
+    cache.set(pattern, folded);
+  }
+  return folded;
+}
+
+/**
+ * `pattern` as the folded name meets it: each run of literal characters folded
+ * where it stands, `*` and `?` kept, and, in a pattern without `**`, each
+ * `[...]` class folded (`foldClass`); with `**`, `[` is a literal. No fold
+ * produces `* ? [ ] ! / -`, so the folded pattern parses into the same
+ * wildcards and classes, and the same matcher reads it. Exported so a check
+ * can compare it with the Python coordinator's `_fold_glob_literals`, which
+ * must write the same text.
+ */
+export function foldGlobLiterals(pattern: string, profile: FoldingProfile): string {
+  const chars = Array.from(pattern);
+  const closeAt = nextIndexOf(chars, "]");
+  const hasClasses = !pattern.includes("**");
+  let folded = "";
+  let literal = "";
+  let i = 0;
+  while (i < chars.length) {
+    const c = chars[i]!;
+    const close = hasClasses && c === "[" ? classClose(chars, closeAt, i + 1) : -1;
+    if (c !== "*" && c !== "?" && close < 0) {
+      literal += c;
+      i += 1;
+      continue;
+    }
+    const wildcard = close < 0 ? c : foldClass(chars.slice(i + 1, close), profile);
+    folded += policyFoldText(literal, profile) + wildcard;
+    literal = "";
+    i = close < 0 ? i + 1 : close + 1;
+  }
+  return folded + policyFoldText(literal, profile);
+}
+
+/**
+ * The class with body `body` as the folded name meets it: made to accept the
+ * fold of every character it accepts, since a folded name holds only folded
+ * characters, so a name one of whose spellings the class accepts as written
+ * is accepted folded, and every spelling gets the same answer. A positive
+ * class gains the fold of each member; a negated one keeps only the members
+ * no character outside it folds to, and with none left is `?`, which accepts
+ * any one character, `/` included, as a negated class does. A member whose
+ * fold is several characters adds nothing: a class, like `?`, meets one
+ * character. A class the fold leaves as it was is copied as written, and so,
+ * as a stated limit, is one too wide for the search to list (`readClass`) or
+ * one holding a reversed range, which fnmatch can read otherwise than its
+ * members say.
+ */
+function foldClass(body: ReadonlyArray<string>, profile: FoldingProfile): string {
+  const written = `[${body.join("")}]`;
+  const { negated, members, hasReversedRange } = readClass(body, CLASS_MEMBER_LIMIT);
+  if (members === undefined || hasReversedRange) return written;
+  const folded = negated ? stillRejected(members, profile) : withSingleFolds(members, profile);
+  // Folding only adds members to a positive class and only drops them from a
+  // negated one, so an unchanged size is an unchanged class.
+  if (folded.size === members.size) return written;
+  return folded.size === 0 ? "?" : classText(folded, negated);
+}
+
+function withSingleFolds(members: ReadonlySet<string>, profile: FoldingProfile): Set<string> {
+  const folded = new Set(members);
+  for (const member of members) {
+    const fold = foldOneCodePoint(member, profile);
+    if (fold !== undefined) folded.add(fold);
+  }
+  return folded;
+}
+
+/**
+ * The members a negated class still rejects folded: those no character outside
+ * it folds to, since a folded name holding one is then spelled only with
+ * characters the class rejects as written.
+ */
+function stillRejected(members: ReadonlySet<string>, profile: FoldingProfile): Set<string> {
+  const rejected = [...members].filter((member) =>
+    singleFoldPreimages(member, profile).every((source) => members.has(source)),
+  );
+  return new Set(rejected);
+}
+
+/**
+ * The class of exactly `members`, each listed once and by code point, so both
+ * coordinators write the same text: `]` first, where it is a member and not
+ * the close, and `-` last, where it makes no range. A `!` first would negate
+ * a positive class, so there it goes last before any `-`; a folded class
+ * always holds a fold, never `!`, so another member comes first.
+ */
+function classText(members: ReadonlySet<string>, negated: boolean): string {
+  const rest = [...members].filter((member) => member !== "]" && member !== "-").sort(byCodePoint);
+  const head = members.has("]") ? "]" : "";
+  if (!negated && head === "" && rest[0] === "!") rest.push(rest.shift()!);
+  return `[${negated ? "!" : ""}${head}${rest.join("")}${members.has("-") ? "-" : ""}]`;
+}
+
+function byCodePoint(left: string, right: string): number {
+  return left.codePointAt(0)! - right.codePointAt(0)!;
 }
 
 /**
@@ -776,9 +1090,28 @@ const LINE_TERMINATORS: ReadonlySet<string> = new Set(["\n", "\r", "\u2028", "\u
  */
 const CLASS_MEMBER_LIMIT = 64;
 
+/**
+ * Characters a class of a folded pattern (`foldGlobLiterals`) may enumerate.
+ * The fold adds at most one member per member to a class of at most
+ * `CLASS_MEMBER_LIMIT`, so the search still reads a class the fold grew member
+ * by member, as it reads the class as written: read as any one character, it
+ * covered names no spelling of the class holds. The Python coordinator's
+ * `_FOLDED_CLASS_MEMBER_LIMIT`.
+ */
+const FOLDED_CLASS_MEMBER_LIMIT = 2 * CLASS_MEMBER_LIMIT;
+
 /** The tokens the overlap search reads; a pattern with `**` is also matched by them. */
 export function globTokens(pattern: string): Token[] {
-  return pattern.includes("**") ? doubleStarTokens(pattern) : fnmatchSearchTokens(pattern);
+  return tokensWithin(pattern, CLASS_MEMBER_LIMIT);
+}
+
+/**
+ * `globTokens` with a class of up to `memberLimit` members listed. Not an
+ * optional parameter of `globTokens`, which callers pass to `map`: the index
+ * would become the limit.
+ */
+function tokensWithin(pattern: string, memberLimit: number): Token[] {
+  return pattern.includes("**") ? doubleStarTokens(pattern) : fnmatchSearchTokens(pattern, memberLimit);
 }
 
 function doubleStarTokens(pattern: string): Token[] {
@@ -808,15 +1141,14 @@ function doubleStarTokens(pattern: string): Token[] {
  * The search's tokens for a pattern without `**`, a port of the Python
  * coordinator's `_glob_tokens`, read per code point: `*` any run, `?` any one
  * character, `[...]` a class, an unterminated `[` a literal. Never used to
- * match (`fnmatchMatcher` matches): as in Python, a class over
- * `CLASS_MEMBER_LIMIT` members reads as any one character, and a reversed
- * range adds no members. fnmatch drops a reversed range with its two ends and,
- * when a `!` follows them, reads the rest of the class as negated (a lone `!`
- * as any one character), so for such a class the search accepts fewer
- * characters than fnmatch and can miss a refusal, as the Python coordinator's
- * search does.
+ * match (`fnmatchMatcher` matches): as in Python, a class over `memberLimit`
+ * members reads as any one character, and a reversed range adds no members.
+ * fnmatch drops a reversed range with its two ends and, when a `!` follows
+ * them, reads the rest of the class as negated (a lone `!` as any one
+ * character), so for such a class the search accepts fewer characters than
+ * fnmatch and can miss a refusal, as the Python coordinator's search does.
  */
-function fnmatchSearchTokens(pattern: string): Token[] {
+function fnmatchSearchTokens(pattern: string, memberLimit: number): Token[] {
   const chars = Array.from(pattern);
   const closeAt = nextIndexOf(chars, "]");
   const tokens: Token[] = [];
@@ -834,7 +1166,7 @@ function fnmatchSearchTokens(pattern: string): Token[] {
         tokens.push({ kind: "lit", ch: "[" });
         continue;
       }
-      tokens.push(searchClass(chars.slice(i, close)));
+      tokens.push(searchClass(chars.slice(i, close), memberLimit));
       i = close + 1;
     } else {
       tokens.push({ kind: "lit", ch: c });
@@ -865,31 +1197,55 @@ function nextIndexOf(chars: ReadonlyArray<string>, target: string): number[] {
   return next;
 }
 
-function searchClass(body: ReadonlyArray<string>): Token {
+function searchClass(body: ReadonlyArray<string>, memberLimit: number): Token {
+  const { negated, members } = readClass(body, memberLimit);
+  // Any one character accepts more than the class does, never less, in either
+  // polarity (a negated class accepts `/` too): the search errs toward "covers".
+  return members === undefined ? ANY_ONE : { kind: "class", negated, members };
+}
+
+/** A class body as `readClass` reads it. */
+interface ClassReading {
+  readonly negated: boolean;
+  /** The characters it names, or undefined when that is more than the limit. */
+  readonly members: ReadonlySet<string> | undefined;
+  /**
+   * Whether it holds a range from a higher character to a lower one, which
+   * names none here. fnmatch drops such a range together with both its ends,
+   * so a `!` right after it can lead what is left and negate it: fnmatch reads
+   * `[z-a!X]` as `[^X]`, not as the members `!` and `X`.
+   */
+  readonly hasReversedRange: boolean;
+}
+
+/**
+ * A class body, as the Python coordinator's `_read_class` reads it: whether a
+ * leading `!` negates it, and the characters it names, up to `memberLimit`. A
+ * leading `]` is a member, `lo-hi` names every character from lo to hi, and a
+ * `-` that ends the body is a member. The search tokens and the class fold
+ * both read a class here, so they agree on it.
+ */
+function readClass(body: ReadonlyArray<string>, memberLimit: number): ClassReading {
   const negated = body[0] === "!";
   const chars = negated ? body.slice(1) : body;
   const members = new Set<string>();
-  let tooWide = false;
+  let hasReversedRange = false;
   let k = 0;
-  while (k < chars.length && !tooWide) {
+  while (k < chars.length) {
     if (k + 2 < chars.length && chars[k + 1] === "-") {
       const lo = chars[k]!.codePointAt(0)!;
       const hi = chars[k + 2]!.codePointAt(0)!;
-      if (hi - lo < CLASS_MEMBER_LIMIT) {
-        for (let cp = lo; cp <= hi; cp++) members.add(String.fromCodePoint(cp));
-      } else {
-        tooWide = true;
-      }
+      if (hi - lo >= memberLimit) return { negated, members: undefined, hasReversedRange };
+      hasReversedRange ||= hi < lo;
+      for (let cp = lo; cp <= hi; cp++) members.add(String.fromCodePoint(cp));
       k += 3;
     } else {
       members.add(chars[k]!);
       k += 1;
     }
-    tooWide ||= members.size > CLASS_MEMBER_LIMIT;
+    if (members.size > memberLimit) return { negated, members: undefined, hasReversedRange };
   }
-  // Any one character accepts more than the class does, never less, in either
-  // polarity (a negated class accepts `/` too): the search errs toward "covers".
-  return tooWide ? ANY_ONE : { kind: "class", negated, members };
+  return { negated, members, hasReversedRange };
 }
 
 // ----------------------------------------------------------------------
@@ -1280,7 +1636,10 @@ function charge(budget: SearchBudget, steps: number): void {
 
 /** A pattern with what the strict-coverage check reads from it. */
 interface Glob {
+  /** The text searched and matched: the pattern as written, or folded. */
   readonly pattern: string;
+  /** The pattern as written, which the coverage check reports. */
+  readonly source: string;
   readonly tokens: ReadonlyArray<Token>;
   readonly affixes: readonly [string, string];
   /**
@@ -1293,16 +1652,31 @@ interface Glob {
   readonly fnmatches: (path: string) => boolean;
 }
 
-function globOf(pattern: string): Glob {
-  const tokens = globTokens(pattern);
+function globOf(pattern: string, source = pattern, memberLimit = CLASS_MEMBER_LIMIT): Glob {
+  const tokens = tokensWithin(pattern, memberLimit);
   let matcher: ((path: string) => boolean) | undefined;
   return {
     pattern,
+    source,
     tokens,
     affixes: literalAffixes(tokens),
-    isLiteral: !/[*?[]/.test(pattern),
+    isLiteral: isLiteralGlob(pattern),
     fnmatches: (path) => (matcher ??= fnmatchMatcher(pattern))(path),
   };
+}
+
+function isLiteralGlob(pattern: string): boolean {
+  return !/[*?[]/.test(pattern);
+}
+
+interface CoverageView {
+  readonly strict: ReadonlyArray<Glob>;
+  readonly tracked: ReadonlyArray<Glob>;
+}
+
+interface CoverageSearch {
+  readonly tracked: ReadonlyArray<Glob>;
+  readonly budget: SearchBudget;
 }
 
 /**
@@ -1319,9 +1693,108 @@ function matchesCharged(entry: Glob, path: string, budget: SearchBudget): boolea
 /**
  * An untrack entry as a glob. Paths are matched with a leading "./" stripped
  * (`normalizeRelative`), so an entry spelled that way names the same paths.
+ * The entry is not tidied, so the search reads it as written. On a
+ * folding `profile` it is folded (`foldGlobLiterals`), as the strict and
+ * tracked patterns it is searched against are.
  */
-function entryGlob(pattern: string): Glob {
-  return globOf(normalizeRelative(pattern) ?? pattern);
+function entryGlob(pattern: string, profile: FoldProfile = "none"): Glob {
+  const entry = stripLeadingDotSlash(pattern) ?? pattern;
+  return profile === "none"
+    ? globOf(entry)
+    : globOf(foldGlobLiterals(entry, profile), entry, FOLDED_CLASS_MEMBER_LIMIT);
+}
+
+// ----------------------------------------------------------------------
+// Patterns whose literal segments pass through a link
+// ----------------------------------------------------------------------
+
+/**
+ * The literal segments of `pattern` a link can sit on: its literal
+ * directories, and its last segment as well when the whole pattern is
+ * literal, since that segment then names one entry, which can be a link to a
+ * file.
+ */
+function literalSegments(pattern: string): string[] {
+  const segments = literalRun(globTokens(pattern)).split("/");
+  const named = isLiteralGlob(pattern) ? segments : segments.slice(0, -1);
+  return named.filter((segment) => segment !== "" && segment !== ".");
+}
+
+function firstLinkedSegment(root: string, segments: ReadonlyArray<string>): string | undefined {
+  for (let depth = 1; depth <= segments.length; depth++) {
+    const prefix = segments.slice(0, depth).join("/");
+    const stats = lstatIfReadable(join(root, prefix));
+    if (stats?.isSymbolicLink()) return prefix;
+    // Past a missing entry or a file, no link further down is on any path.
+    if (stats === undefined || !stats.isDirectory()) return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Resolvers in the order the hook client tries them: links followed with the
+ * typed case kept, then the disk's own spelling for a path the first leaves
+ * outside the root.
+ */
+const LINK_RESOLVERS: ReadonlyArray<(path: string) => string> = [
+  (path) => realpathSync(path),
+  (path) => realpathSync.native(path),
+];
+
+/**
+ * The workspace path the hook client sends for `link`: its target's path
+ * relative to the root, null when the target is outside the workspace (the
+ * client then sends nothing), or undefined when the link does not resolve.
+ */
+function linkTargetOf(root: string, link: string): string | null | undefined {
+  for (const realpath of LINK_RESOLVERS) {
+    let target: string;
+    try {
+      target = relative(realpath(root), realpath(join(root, link)));
+    } catch {
+      return undefined;
+    }
+    if (target !== ".." && !target.startsWith(`..${sep}`) && !isAbsolute(target)) return target;
+  }
+  return null;
+}
+
+/** The log line for a pattern (`subject`) that passes through `link`, by where its target lies. */
+function linkedPatternMessage(subject: string, link: string, target: string | null | undefined): string {
+  const head = `agent-coherence: ${subject} goes through the link ${JSON.stringify(link)}`;
+  if (target === null) {
+    return (
+      `${head}, whose target is outside the workspace. A Read, Edit or Write through it is not ` +
+      `coordinated at all: the hook client sends nothing for a path outside the workspace, so no ` +
+      `rewrite of this entry covers them.`
+    );
+  }
+  if (target === undefined) {
+    return (
+      `${head} inside the workspace, which does not resolve. The hook client sends nothing for a ` +
+      `Read, Edit or Write through it until its target exists, then follows it to the target's ` +
+      `path, which this entry does not match; name the target to cover them.`
+    );
+  }
+  return (
+    `${head} inside the workspace. The hook client follows the link, so a Read, Edit or Write ` +
+    `through it reaches the coordinator under the path of its target ${JSON.stringify(target)}, ` +
+    `which this entry does not match; name the target to cover them.`
+  );
+}
+
+/**
+ * `lstat` of `path`, or undefined when it cannot be read. The link check only
+ * informs, so a name the disk refuses (too long, under an unreadable
+ * directory, holding a NUL from a hand-edited policy file) must not stop the
+ * coordinator starting or a policy reloading.
+ */
+function lstatIfReadable(path: string): Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch {
+    return undefined;
+  }
 }
 
 /** The literal characters `tokens` start with, kept in pattern order when read from the end. */

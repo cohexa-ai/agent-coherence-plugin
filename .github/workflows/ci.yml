@@ -33,6 +33,15 @@ jobs:
       - name: Check manifest versions synced
         run: node tools/check_versions_synced.js
 
+      # The fold table is generated output, so a hand edit or a generator
+      # change committed without its regenerated table must not pass. The
+      # generator fetches the pinned UCD 17.0.0 files from unicode.org and
+      # refuses any whose SHA-256 differs from data/ucd-17.0.0/SHA256SUMS.
+      - name: Reproduce the fold table from the pinned Unicode files
+        run: |
+          node tools/gen_fold_table.js
+          git diff --exit-code -- src/fold_data/fold_table.json
+
       - name: Install dependencies
         run: npm ci
 
@@ -74,6 +83,42 @@ jobs:
           else
             echo "No compiled tests in dist/test/ — skipping until the suite lands."
           fi
+
+  folding-macos:
+    name: Folding tests (macOS)
+    runs-on: macos-latest
+
+    # Every other job runs on Ubuntu, whose disk folds no file name, so there
+    # the folding tests only see the "none" profile. This job runs them on the
+    # runner's case-insensitive APFS disk, where one file has many spellings.
+    # Naming the expected profile makes the probe test FAIL, never skip, when
+    # the runner's disk does not classify as caseless.
+    env:
+      AGENT_COHERENCE_EXPECT_FOLD_PROFILE: caseless
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run the folding tests on the runner's disk
+        run: >-
+          node --test
+          dist/test/path_fold.test.js
+          dist/test/fs_profile.test.js
+          dist/test/registry_fold_merge.test.js
+          dist/test/door_fold.test.js
+          dist/test/policy_fold.test.js
+          dist/test/hook_client_links.test.js
 
   zero-python-install:
     name: Zero-Python install (Node ${{ matrix.node-version }})

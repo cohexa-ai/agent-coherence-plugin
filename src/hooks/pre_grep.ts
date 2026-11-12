@@ -6,6 +6,9 @@
  * stale-read warnings. Unlike pre-bash there is NO first-observation
  * seeding (unknown artifacts are skipped) and the re-grant trigger is
  * "post_stale_grep". Warn-parity in Unit 2; strict lands in Unit 6.
+ *
+ * On a disk that folds names the root reaches every row under any spelling
+ * of it (`artifactsUnderPrefix`); the answer lists the rows' stored names.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { MESIState } from "../states.js";
@@ -13,7 +16,7 @@ import { emitStrictDeny, nowUnix, type StaleSummary } from "../hook_payloads.js"
 import {
   applyRegrants,
   drainNoticeText,
-  isValidPath,
+  isValidRequestPath,
   isValidSessionId,
   nowTick as nowTickFn,
   readJsonBody,
@@ -24,6 +27,7 @@ import {
   writeJson,
 } from "./_common.js";
 import { deliverPendingReground, writeFastAdmit } from "./reground.js";
+import { storedFilePolicy } from "./door.js";
 
 interface PreGrepBody {
   session_id?: unknown;
@@ -45,7 +49,7 @@ export async function handlePreGrep(
     return;
   }
   // "" = workspace root; a non-empty root must be a safe relative path.
-  if (searchRoot !== "" && !isValidPath(searchRoot)) {
+  if (searchRoot !== "" && !isValidRequestPath(searchRoot)) {
     writeError(res, 400, "missing or empty path");
     return;
   }
@@ -57,8 +61,8 @@ export async function handlePreGrep(
     deliverPendingReground(deps, sessionId, body as Record<string, unknown>, result);
 
   // SB-10 U8 (KTD6): the zero-tracked exit goes through writeFastAdmit's compact-pending peek.
-  const trackedPaths = deps.registry.artifactNamesUnderPrefix(searchRoot);
-  if (trackedPaths.length === 0) {
+  const trackedArtifacts = deps.registry.artifactsUnderPrefix(searchRoot);
+  if (trackedArtifacts.length === 0) {
     writeFastAdmit(res, deps, sessionId, body as Record<string, unknown>, { status: "fresh" });
     return;
   }
@@ -69,13 +73,13 @@ export async function handlePreGrep(
   const staleSummaries: Array<{ path: string; current_version: number }> = [];
   let strictStaleFirst: StaleSummary | null = null;
   const regrants: Regrant[] = [];
-  for (const path of trackedPaths) {
-    const existing = deps.registry.getArtifactByName(path);
-    if (existing === null) continue; // no seeding on the grep path
+  const policy = storedFilePolicy(deps);
+  for (const existing of trackedArtifacts) {
+    const path = existing.name;
     const agentState = deps.registry.getAgentState(existing.id, agentId);
     if (agentState !== null && agentState !== MESIState.INVALID) continue;
     staleSummaries.push({ path, current_version: existing.version });
-    if (strictStaleFirst === null && deps.policy.isStrictMode(path)) {
+    if (strictStaleFirst === null && deps.policy.isStrictMode(path, policy)) {
       // R7: the registry's handle for the writer, not a recovered session id.
       const lastWriterAgent = existing.last_writer_id;
       strictStaleFirst = {

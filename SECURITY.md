@@ -123,6 +123,55 @@ The check is not proof of the secret, and it cannot see everything:
 - A Node coordinator's pid, once another process carries it, reads as that
   coordinator.
 
+### Other spellings of one file
+
+A session whose copy of a strict file is stale is denied a Read, Edit or
+Write of it. Both coordinators matched strict patterns against the path
+exactly as a request sent it, so that session could reach the file under
+another spelling and be admitted: `PLAN.MD` for a strict `plan.md` on a macOS
+disk that folds case, a composed or a decomposed accent, or `.//plan.md` on
+any disk ([Cohexa-ai/agent-coherence#506](https://github.com/Cohexa-ai/agent-coherence/issues/506)).
+The Node coordinator now tidies `./` and `//` in every hook route and keys the
+name by the fold the workspace disk applies before strict mode and the
+records see it (`src/hooks/door.ts`), so every spelling the disk opens as
+that file is denied alike. On a disk that folds nothing, only `./` and `//`
+are tidied. The Python coordinator does the same in `agent-coherence`
+releases after 0.15.0.
+
+The coordinator learns the disk's fold once per start (`src/fs_profile.ts`):
+
+- it probes only while it holds the workspace lock, and creates nothing
+  outside `.coherence`;
+- it compares `.COHERENCE` with `.coherence` by `lstat`, so a committed
+  `.COHERENCE` link to `.coherence` reads as a link, not as case folding;
+- it creates each probe file with `O_CREAT | O_EXCL` and mode `0600` in a
+  fresh `0700` directory under `.coherence` named `fold-probe-<pid>-<random>`,
+  and compares two spellings by the device and inode `lstat` reports, never
+  following a link;
+- from a `fold-probe-` directory a crashed start left, it removes the regular
+  files directly inside, then the directory once it is empty; it leaves
+  anything else under that prefix in place, a link included, without
+  following it.
+
+A planted entry under the probe prefix, a `.coherence` on another device than
+the workspace, or a probe step that fails at worst makes the start
+cannot-tell: the coordinator then folds nothing, as before this change, and
+logs why.
+
+Not covered:
+
+- A hook Read, Edit or Write through a link inside the workspace that points
+  outside it, or through a link that does not resolve. The Node hook client
+  stays out of such a call, as for any path outside the workspace, so no
+  grant, warning or strict-mode deny applies to it; a repository can commit
+  such a link.
+- A Bash command's file arguments, which are matched as typed: through a
+  link, a Bash read reaches the link's own path, not the file it names.
+- A hard link, which is a second name with a record of its own.
+- A disk the coordinator cannot classify, or a coordinator running without
+  its lock: there another spelling of a strict file is still a different
+  file, except for `./` and `//`.
+
 ### Out of scope
 
 - **Multiple developers sharing the same workstation.** The plugin assumes

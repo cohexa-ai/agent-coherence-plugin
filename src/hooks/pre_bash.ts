@@ -34,6 +34,13 @@ import {
   writeJson,
 } from "./_common.js";
 import { deliverPendingReground, writeFastAdmit } from "./reground.js";
+import {
+  findRequested,
+  isStrictRequest,
+  isTrackedRequest,
+  resolveRequested,
+  tokenRequests,
+} from "./door.js";
 
 const MAX_COMMAND_LENGTH = 16384;
 
@@ -67,8 +74,15 @@ export async function handlePreBash(
   const withReground = (result: object): Record<string, unknown> =>
     deliverPendingReground(deps, sessionId, body as Record<string, unknown>, result);
 
+  // The policy gate and the collapse of spellings by key both read a token's
+  // door name, so each token passes the door once.
+  const nameOf = tokenRequests(deps);
   // Policy gate — untracked commands exit via writeFastAdmit's SB-10 U8 compact-pending peek.
-  const trackedPaths = detectTrackedPaths(command, (p) => deps.policy.isTracked(p));
+  const trackedPaths = detectTrackedPaths(
+    command,
+    (p) => isTrackedRequest(deps, nameOf(p)),
+    (p) => nameOf(p).file.key,
+  );
   if (trackedPaths.length === 0) {
     writeFastAdmit(res, deps, sessionId, body as Record<string, unknown>, { status: "fresh" });
     return;
@@ -87,12 +101,13 @@ export async function handlePreBash(
   const regrants: Regrant[] = [];
   const held: string[] = [];
   for (const path of trackedPaths) {
-    const existing = deps.registry.getArtifactByName(path);
+    const name = nameOf(path);
+    const existing = findRequested(deps, name);
     if (existing === null) {
       // First observation per KTD-9 — seed v1 + SHARED so subsequent reads are
-      // fresh. detectTrackedPaths deduplicates, so deferring the grant cannot
-      // make a later iteration read this path as stale.
-      const artifactId = deps.registry.resolveOrRegisterArtifact(path, "");
+      // fresh. detectTrackedPaths deduplicates by key, so deferring the grant
+      // cannot make a later iteration read this file as stale.
+      const artifactId = resolveRequested(deps, name, "");
       regrants.push({ artifactId, trigger: "first_bash_read" });
       continue;
     }
@@ -102,7 +117,7 @@ export async function handlePreBash(
       continue; // fresh on this path
     }
     staleSummaries.push({ path, current_version: existing.version });
-    if (strictStaleFirst === null && deps.policy.isStrictMode(path)) {
+    if (strictStaleFirst === null && isStrictRequest(deps, name)) {
       // R7: the registry's handle for the writer, not a recovered session id.
       const lastWriterAgent = existing.last_writer_id;
       strictStaleFirst = {

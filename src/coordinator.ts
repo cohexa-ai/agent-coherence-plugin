@@ -21,7 +21,7 @@
  *   - /status three-tier (KTD-K)
  *   - hook handler routes (Unit 3)
  */
-import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { hostname } from "node:os";
 import { ensureSecret } from "./auth.js";
@@ -32,6 +32,8 @@ import { PolicyRef } from "./policy.js";
 import { SessionRegistry } from "./sessions.js";
 import { readPackageVersion } from "./version.js";
 import { lockPidFile, pidFileDeparture, rewritePidFile } from "./coordinator_lock.js";
+import { foldProfileLogLine, probeFoldProfile } from "./fs_profile.js";
+import { prepareFoldIndex } from "./fold_merge.js";
 
 const PID_FILE_CHECK_MS = 5000;
 
@@ -111,6 +113,13 @@ async function main(): Promise<void> {
     // that dead port while this one starts.
     rewritePidFile(pidLock.fd, "");
   }
+  const foldProfile = probeFoldProfile({
+    root: workspace.root,
+    coherenceDir: workspace.coherenceDir,
+    lockState: pidLock.state,
+    log: logInfo,
+  });
+  logInfo(foldProfileLogLine(foldProfile));
   // KTD-13 + README "auto-gitignored" claim: write .coherence/.gitignore
   // containing `*` so a careless `git add .` doesn't accidentally commit
   // state.db (MESI state + agent UUIDs), hook.secret (a credential), or
@@ -135,6 +144,13 @@ async function main(): Promise<void> {
       `(schema_version=${registry.getStats().schemaVersion}, ` +
       `migrations_applied=${registry.getStats().migrationsApplied})`,
   );
+  prepareFoldIndex({
+    registry,
+    root: workspace.root,
+    foldProfile,
+    lockHeld: pidLock.state === "held",
+    log: logInfo,
+  });
 
   const policy = PolicyRef.load(workspace.root);
   const policySummary = policy.summary();
@@ -147,6 +163,11 @@ async function main(): Promise<void> {
 
   const sessions = new SessionRegistry();
 
+  // The door relativizes each request's disk spelling against the root, so
+  // the root needs the disk's spelling too: as given it may run through a
+  // link (/var on macOS) or be typed in another case than the disk keeps.
+  const canonicalRoot = realpathSync.native(workspace.root);
+
   const server = createServer({
     secret,
     startedAtMs,
@@ -154,6 +175,8 @@ async function main(): Promise<void> {
     registry,
     policy,
     sessions,
+    foldProfile,
+    canonicalRoot,
   });
 
   // What this coordinator published, once it has: on shutdown an unlocked

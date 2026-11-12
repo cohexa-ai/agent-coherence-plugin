@@ -12,6 +12,7 @@ import type { Artifact, ArtifactRegistry } from "../registry.js";
 import type { PolicyRef } from "../policy.js";
 import type { SessionRegistry } from "../sessions.js";
 import { isValidSubagentId } from "../agent_id.js";
+import { exceedsFoldLimit } from "../path_fold.js";
 import {
   hasReclaimNotice,
   preemptionNoticeText,
@@ -28,6 +29,7 @@ export interface HookDeps {
    */
   policy: PolicyRef;
   sessions: SessionRegistry;
+  canonicalRoot?: string;
 }
 
 export function writeJson(res: ServerResponse, status: number, body: unknown): void {
@@ -208,6 +210,15 @@ export function isValidPath(p: unknown): p is string {
   return typeof p === "string" && p.length > 0 && !p.startsWith("/") && !p.split("/").includes("..");
 }
 
+/**
+ * A request's path: `isValidPath`, and no longer than the 1024 code points
+ * the Python coordinator accepts. Such a name would never be folded, so a
+ * longer one is refused rather than given an identity of its own.
+ */
+export function isValidRequestPath(p: unknown): p is string {
+  return isValidPath(p) && !exceedsFoldLimit(p);
+}
+
 export function isValidContentHashOrAbsent(h: unknown): h is string | undefined | null {
   if (h === undefined || h === null) return true;
   return typeof h === "string" && CONTENT_HASH_RE.test(h);
@@ -316,9 +327,10 @@ export function drainNoticeText(
 
 /**
  * better-sqlite3's busy error, matched by its exact code, as
- * `resolveOrRegisterArtifact` matches its constraint code. The extended busy
- * codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`) are deliberately
- * not matched: only a held `BEGIN IMMEDIATE` has been observed here.
+ * `isUniqueViolation` in registry.ts matches its constraint code. The
+ * extended busy codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`) are
+ * deliberately not matched: only a held `BEGIN IMMEDIATE` has been observed
+ * here.
  */
 function isSqliteBusy(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && err.code === "SQLITE_BUSY";

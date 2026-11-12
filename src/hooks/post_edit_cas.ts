@@ -30,12 +30,14 @@ import {
   nowTick as nowTickFn,
   readSubagentId,
 } from "./_common.js";
+import { findRequested, isTrackedRequest, readRequestName } from "./door.js";
 
 interface PostEditCasBody {
   session_id?: unknown;
   path?: unknown;
   content_hash?: unknown;
   expected_version?: unknown;
+  name_kind?: unknown;
 }
 
 export async function handlePostEditCas(
@@ -47,8 +49,8 @@ export async function handlePostEditCas(
     writeError(res, 400, "missing session_id");
     return;
   }
-  const path = body.path ?? "";
-  if (typeof path !== "string" || path === "" || path.startsWith("/") || path.split("/").includes("..")) {
+  const name = readRequestName(body as Record<string, unknown>, deps);
+  if (name === null) {
     writeError(res, 400, "missing or empty path");
     return;
   }
@@ -66,13 +68,13 @@ export async function handlePostEditCas(
     return;
   }
 
-  if (!deps.policy.isTracked(path)) {
+  if (!isTrackedRequest(deps, name)) {
     writeJson(res, 200, { ok: true });
     return;
   }
 
   const agentId = deps.sessions.registerSession(body.session_id, readSubagentId(body as Record<string, unknown>));
-  const artifact = deps.registry.getArtifactByName(path);
+  const artifact = findRequested(deps, name);
   if (artifact === null) {
     writeJson(res, 200, { ok: true, note: "untracked-at-commit" });
     return;
