@@ -235,6 +235,66 @@ export function policyFoldText(text: string, profile: FoldingProfile): string {
   );
 }
 
+/**
+ * `policyFoldText` of one code point when the fold is one code point too, else
+ * undefined: a glob class stands for one character, so only such a fold can
+ * be written into one. Looked up, not worked out: a class fold asks this of
+ * every member of every class, and an untrack request's entries can hold
+ * thousands of them.
+ */
+export function foldOneCodePoint(character: string, profile: FoldingProfile): string | undefined {
+  const { folds } = singleFoldIndex(profile);
+  return folds.has(character) ? folds.get(character) : character;
+}
+
+/** Every code point whose `foldOneCodePoint` is `target`, over all of Unicode. */
+export function singleFoldPreimages(target: string, profile: FoldingProfile): readonly string[] {
+  const others = singleFoldIndex(profile).preimages.get(target) ?? [];
+  return foldOneCodePoint(target, profile) === target ? [target, ...others] : others;
+}
+
+/** The one-code-point folds of the code points the table maps, both ways. */
+interface SingleFoldIndex {
+  /** Each one's `foldOneCodePoint`. */
+  readonly folds: ReadonlyMap<string, string | undefined>;
+  /** The ones that fold to another code point, by what they fold to. */
+  readonly preimages: ReadonlyMap<string, string[]>;
+}
+
+// Built on first use, so a disk of one profile never pays for the other's.
+const singleFoldIndexes = new Map<FoldingProfile, SingleFoldIndex>();
+
+function singleFoldIndex(profile: FoldingProfile): SingleFoldIndex {
+  let index = singleFoldIndexes.get(profile);
+  if (index === undefined) {
+    index = buildSingleFoldIndex(profile);
+    singleFoldIndexes.set(profile, index);
+  }
+  return index;
+}
+
+/**
+ * Only a code point the table maps can fold to anything but itself (a Hangul
+ * syllable decomposes and recomposes to itself), so reading the table's keys
+ * finds every fold that is not the code point itself; both coordinators read
+ * the same table, so they find the same ones.
+ */
+function buildSingleFoldIndex(profile: FoldingProfile): SingleFoldIndex {
+  const folds = new Map<string, string | undefined>();
+  const preimages = new Map<string, string[]>();
+  for (const codePoint of new Set([...DECOMPOSITION.keys(), ...CASE_FOLDING.keys()])) {
+    const source = String.fromCodePoint(codePoint);
+    const folded = policyFoldText(source, profile);
+    const fold = toCodePoints(folded).length === 1 ? folded : undefined;
+    folds.set(source, fold);
+    if (fold === undefined || fold === source) continue;
+    const sources = preimages.get(fold);
+    if (sources === undefined) preimages.set(fold, [source]);
+    else sources.push(source);
+  }
+  return { folds, preimages };
+}
+
 export function exceedsFoldLimit(text: string): boolean {
   // A code point takes one or two UTF-16 units, so a string this short cannot be over.
   if (text.length <= FOLD_LENGTH_LIMIT) return false;

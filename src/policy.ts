@@ -37,10 +37,12 @@
  * On a disk that folds names (`caseless`, `nfd`), a file name matches a
  * pattern when any of three readings does: the pattern as written against the
  * name as requested, tidied; the pattern as written against the spelling the
- * disk stores, when the coordinator has one; and the pattern with its literal
- * characters folded against the folded name. A disk that folds nothing uses
- * the first reading alone, so folding only ever adds matches. A key, a name
- * that is not a workspace file, is matched as requested only.
+ * disk stores, when the coordinator has one; and the pattern folded
+ * (`foldGlobLiterals`: literal characters folded where they stand, each class
+ * made to accept the fold of every character it accepts) against the folded
+ * name. A disk that folds nothing uses the first reading alone, so folding
+ * only ever adds matches. A key, a name that is not a workspace file, is
+ * matched as requested only.
  */
 import { randomBytes } from "node:crypto";
 import { writeFileSync, renameSync, mkdirSync, rmSync, lstatSync, realpathSync, type Stats } from "node:fs";
@@ -49,8 +51,10 @@ import { dump as yamlDump, load as yamlLoad, type YAMLException } from "js-yaml"
 import { NOT_REGULAR, readRegularFile } from "./disk_content.js";
 import {
   exceedsFoldLimit,
+  foldOneCodePoint,
   policyFold,
   policyFoldText,
+  singleFoldPreimages,
   tidyPath,
   type FoldingProfile,
   type FoldProfile,
@@ -271,12 +275,14 @@ export class TrackedArtifactPolicy {
 
   /**
    * The strict and tracked patterns the coverage search reads under
-   * `profile`: as written for `none`, with their literal characters folded
-   * for a folding profile. Each glob reports the pattern as written.
+   * `profile`: as written for `none`, folded (`foldGlobLiterals`) for a
+   * folding profile. Each glob reports the pattern as written.
    */
   private buildCoverage(profile: FoldProfile): CoverageView {
     const globFor = (pattern: string): Glob =>
-      profile === "none" ? globOf(pattern) : globOf(foldPolicyPattern(pattern, profile), pattern);
+      profile === "none"
+        ? globOf(pattern)
+        : globOf(foldPolicyPattern(pattern, profile), pattern, FOLDED_CLASS_MEMBER_LIMIT);
     return {
       // A literal strict path no tracked pattern reaches puts nothing in
       // strict mode (an intersection), so no entry can cover it.
@@ -375,8 +381,8 @@ export class TrackedArtifactPolicy {
    * prefixes and suffixes. Empty when no strict path is covered.
    *
    * On a folding `profile` the search runs as written first, then again with
-   * the literal characters of both sides folded for each strict pattern not
-   * yet covered, under the same budgets.
+   * both sides folded (`foldGlobLiterals`) for each strict pattern not yet
+   * covered, under the same budgets.
    */
   strictPatternsCovering(pattern: string, profile: FoldProfile = "none"): string[] {
     return this.strictPatternsCoveringEach([pattern], profile)[0]!;
@@ -882,13 +888,15 @@ function foldPolicyPattern(pattern: string, profile: FoldingProfile): string {
 }
 
 /**
- * `pattern` with each run of literal characters folded where it stands: `*`,
- * `?` and, in a pattern without `**`, each `[...]` class stay as written (with
- * `**`, `[` is a literal). No fold produces `* ? [ ] ! /`, so the folded
- * pattern parses into the same wildcards and classes, and the same matcher
- * reads it.
+ * `pattern` as the folded name meets it: each run of literal characters folded
+ * where it stands, `*` and `?` kept, and, in a pattern without `**`, each
+ * `[...]` class folded (`foldClass`); with `**`, `[` is a literal. No fold
+ * produces `* ? [ ] ! / -`, so the folded pattern parses into the same
+ * wildcards and classes, and the same matcher reads it. Exported so a check
+ * can compare it with the Python coordinator's `_fold_glob_literals`, which
+ * must write the same text.
  */
-function foldGlobLiterals(pattern: string, profile: FoldingProfile): string {
+export function foldGlobLiterals(pattern: string, profile: FoldingProfile): string {
   const chars = Array.from(pattern);
   const closeAt = nextIndexOf(chars, "]");
   const hasClasses = !pattern.includes("**");
@@ -903,12 +911,76 @@ function foldGlobLiterals(pattern: string, profile: FoldingProfile): string {
       i += 1;
       continue;
     }
-    const end = close < 0 ? i + 1 : close + 1;
-    folded += policyFoldText(literal, profile) + chars.slice(i, end).join("");
+    const wildcard = close < 0 ? c : foldClass(chars.slice(i + 1, close), profile);
+    folded += policyFoldText(literal, profile) + wildcard;
     literal = "";
-    i = end;
+    i = close < 0 ? i + 1 : close + 1;
   }
   return folded + policyFoldText(literal, profile);
+}
+
+/**
+ * The class with body `body` as the folded name meets it: made to accept the
+ * fold of every character it accepts, since a folded name holds only folded
+ * characters, so a name one of whose spellings the class accepts as written
+ * is accepted folded, and every spelling gets the same answer. A positive
+ * class gains the fold of each member; a negated one keeps only the members
+ * no character outside it folds to, and with none left is `?`, which accepts
+ * any one character, `/` included, as a negated class does. A member whose
+ * fold is several characters adds nothing: a class, like `?`, meets one
+ * character. A class the fold leaves as it was is copied as written, and so,
+ * as a stated limit, is one too wide for the search to list (`readClass`) or
+ * one holding a reversed range, which fnmatch can read otherwise than its
+ * members say.
+ */
+function foldClass(body: ReadonlyArray<string>, profile: FoldingProfile): string {
+  const written = `[${body.join("")}]`;
+  const { negated, members, hasReversedRange } = readClass(body, CLASS_MEMBER_LIMIT);
+  if (members === undefined || hasReversedRange) return written;
+  const folded = negated ? stillRejected(members, profile) : withSingleFolds(members, profile);
+  // Folding only adds members to a positive class and only drops them from a
+  // negated one, so an unchanged size is an unchanged class.
+  if (folded.size === members.size) return written;
+  return folded.size === 0 ? "?" : classText(folded, negated);
+}
+
+function withSingleFolds(members: ReadonlySet<string>, profile: FoldingProfile): Set<string> {
+  const folded = new Set(members);
+  for (const member of members) {
+    const fold = foldOneCodePoint(member, profile);
+    if (fold !== undefined) folded.add(fold);
+  }
+  return folded;
+}
+
+/**
+ * The members a negated class still rejects folded: those no character outside
+ * it folds to, since a folded name holding one is then spelled only with
+ * characters the class rejects as written.
+ */
+function stillRejected(members: ReadonlySet<string>, profile: FoldingProfile): Set<string> {
+  const rejected = [...members].filter((member) =>
+    singleFoldPreimages(member, profile).every((source) => members.has(source)),
+  );
+  return new Set(rejected);
+}
+
+/**
+ * The class of exactly `members`, each listed once and by code point, so both
+ * coordinators write the same text: `]` first, where it is a member and not
+ * the close, and `-` last, where it makes no range. A `!` first would negate
+ * a positive class, so there it goes last before any `-`; a folded class
+ * always holds a fold, never `!`, so another member comes first.
+ */
+function classText(members: ReadonlySet<string>, negated: boolean): string {
+  const rest = [...members].filter((member) => member !== "]" && member !== "-").sort(byCodePoint);
+  const head = members.has("]") ? "]" : "";
+  if (!negated && head === "" && rest[0] === "!") rest.push(rest.shift()!);
+  return `[${negated ? "!" : ""}${head}${rest.join("")}${members.has("-") ? "-" : ""}]`;
+}
+
+function byCodePoint(left: string, right: string): number {
+  return left.codePointAt(0)! - right.codePointAt(0)!;
 }
 
 /**
@@ -1018,9 +1090,28 @@ const LINE_TERMINATORS: ReadonlySet<string> = new Set(["\n", "\r", "\u2028", "\u
  */
 const CLASS_MEMBER_LIMIT = 64;
 
+/**
+ * Characters a class of a folded pattern (`foldGlobLiterals`) may enumerate.
+ * The fold adds at most one member per member to a class of at most
+ * `CLASS_MEMBER_LIMIT`, so the search still reads a class the fold grew member
+ * by member, as it reads the class as written: read as any one character, it
+ * covered names no spelling of the class holds. The Python coordinator's
+ * `_FOLDED_CLASS_MEMBER_LIMIT`.
+ */
+const FOLDED_CLASS_MEMBER_LIMIT = 2 * CLASS_MEMBER_LIMIT;
+
 /** The tokens the overlap search reads; a pattern with `**` is also matched by them. */
 export function globTokens(pattern: string): Token[] {
-  return pattern.includes("**") ? doubleStarTokens(pattern) : fnmatchSearchTokens(pattern);
+  return tokensWithin(pattern, CLASS_MEMBER_LIMIT);
+}
+
+/**
+ * `globTokens` with a class of up to `memberLimit` members listed. Not an
+ * optional parameter of `globTokens`, which callers pass to `map`: the index
+ * would become the limit.
+ */
+function tokensWithin(pattern: string, memberLimit: number): Token[] {
+  return pattern.includes("**") ? doubleStarTokens(pattern) : fnmatchSearchTokens(pattern, memberLimit);
 }
 
 function doubleStarTokens(pattern: string): Token[] {
@@ -1050,15 +1141,14 @@ function doubleStarTokens(pattern: string): Token[] {
  * The search's tokens for a pattern without `**`, a port of the Python
  * coordinator's `_glob_tokens`, read per code point: `*` any run, `?` any one
  * character, `[...]` a class, an unterminated `[` a literal. Never used to
- * match (`fnmatchMatcher` matches): as in Python, a class over
- * `CLASS_MEMBER_LIMIT` members reads as any one character, and a reversed
- * range adds no members. fnmatch drops a reversed range with its two ends and,
- * when a `!` follows them, reads the rest of the class as negated (a lone `!`
- * as any one character), so for such a class the search accepts fewer
- * characters than fnmatch and can miss a refusal, as the Python coordinator's
- * search does.
+ * match (`fnmatchMatcher` matches): as in Python, a class over `memberLimit`
+ * members reads as any one character, and a reversed range adds no members.
+ * fnmatch drops a reversed range with its two ends and, when a `!` follows
+ * them, reads the rest of the class as negated (a lone `!` as any one
+ * character), so for such a class the search accepts fewer characters than
+ * fnmatch and can miss a refusal, as the Python coordinator's search does.
  */
-function fnmatchSearchTokens(pattern: string): Token[] {
+function fnmatchSearchTokens(pattern: string, memberLimit: number): Token[] {
   const chars = Array.from(pattern);
   const closeAt = nextIndexOf(chars, "]");
   const tokens: Token[] = [];
@@ -1076,7 +1166,7 @@ function fnmatchSearchTokens(pattern: string): Token[] {
         tokens.push({ kind: "lit", ch: "[" });
         continue;
       }
-      tokens.push(searchClass(chars.slice(i, close)));
+      tokens.push(searchClass(chars.slice(i, close), memberLimit));
       i = close + 1;
     } else {
       tokens.push({ kind: "lit", ch: c });
@@ -1107,31 +1197,55 @@ function nextIndexOf(chars: ReadonlyArray<string>, target: string): number[] {
   return next;
 }
 
-function searchClass(body: ReadonlyArray<string>): Token {
+function searchClass(body: ReadonlyArray<string>, memberLimit: number): Token {
+  const { negated, members } = readClass(body, memberLimit);
+  // Any one character accepts more than the class does, never less, in either
+  // polarity (a negated class accepts `/` too): the search errs toward "covers".
+  return members === undefined ? ANY_ONE : { kind: "class", negated, members };
+}
+
+/** A class body as `readClass` reads it. */
+interface ClassReading {
+  readonly negated: boolean;
+  /** The characters it names, or undefined when that is more than the limit. */
+  readonly members: ReadonlySet<string> | undefined;
+  /**
+   * Whether it holds a range from a higher character to a lower one, which
+   * names none here. fnmatch drops such a range together with both its ends,
+   * so a `!` right after it can lead what is left and negate it: fnmatch reads
+   * `[z-a!X]` as `[^X]`, not as the members `!` and `X`.
+   */
+  readonly hasReversedRange: boolean;
+}
+
+/**
+ * A class body, as the Python coordinator's `_read_class` reads it: whether a
+ * leading `!` negates it, and the characters it names, up to `memberLimit`. A
+ * leading `]` is a member, `lo-hi` names every character from lo to hi, and a
+ * `-` that ends the body is a member. The search tokens and the class fold
+ * both read a class here, so they agree on it.
+ */
+function readClass(body: ReadonlyArray<string>, memberLimit: number): ClassReading {
   const negated = body[0] === "!";
   const chars = negated ? body.slice(1) : body;
   const members = new Set<string>();
-  let tooWide = false;
+  let hasReversedRange = false;
   let k = 0;
-  while (k < chars.length && !tooWide) {
+  while (k < chars.length) {
     if (k + 2 < chars.length && chars[k + 1] === "-") {
       const lo = chars[k]!.codePointAt(0)!;
       const hi = chars[k + 2]!.codePointAt(0)!;
-      if (hi - lo < CLASS_MEMBER_LIMIT) {
-        for (let cp = lo; cp <= hi; cp++) members.add(String.fromCodePoint(cp));
-      } else {
-        tooWide = true;
-      }
+      if (hi - lo >= memberLimit) return { negated, members: undefined, hasReversedRange };
+      hasReversedRange ||= hi < lo;
+      for (let cp = lo; cp <= hi; cp++) members.add(String.fromCodePoint(cp));
       k += 3;
     } else {
       members.add(chars[k]!);
       k += 1;
     }
-    tooWide ||= members.size > CLASS_MEMBER_LIMIT;
+    if (members.size > memberLimit) return { negated, members: undefined, hasReversedRange };
   }
-  // Any one character accepts more than the class does, never less, in either
-  // polarity (a negated class accepts `/` too): the search errs toward "covers".
-  return tooWide ? ANY_ONE : { kind: "class", negated, members };
+  return { negated, members, hasReversedRange };
 }
 
 // ----------------------------------------------------------------------
@@ -1522,7 +1636,7 @@ function charge(budget: SearchBudget, steps: number): void {
 
 /** A pattern with what the strict-coverage check reads from it. */
 interface Glob {
-  /** The text searched and matched: the pattern as written, or with its literals folded. */
+  /** The text searched and matched: the pattern as written, or folded. */
   readonly pattern: string;
   /** The pattern as written, which the coverage check reports. */
   readonly source: string;
@@ -1538,8 +1652,8 @@ interface Glob {
   readonly fnmatches: (path: string) => boolean;
 }
 
-function globOf(pattern: string, source = pattern): Glob {
-  const tokens = globTokens(pattern);
+function globOf(pattern: string, source = pattern, memberLimit = CLASS_MEMBER_LIMIT): Glob {
+  const tokens = tokensWithin(pattern, memberLimit);
   let matcher: ((path: string) => boolean) | undefined;
   return {
     pattern,
@@ -1580,12 +1694,14 @@ function matchesCharged(entry: Glob, path: string, budget: SearchBudget): boolea
  * An untrack entry as a glob. Paths are matched with a leading "./" stripped
  * (`normalizeRelative`), so an entry spelled that way names the same paths.
  * The entry is not tidied, so the search reads it as written. On a
- * folding `profile` its literal characters are folded, as the strict and
+ * folding `profile` it is folded (`foldGlobLiterals`), as the strict and
  * tracked patterns it is searched against are.
  */
 function entryGlob(pattern: string, profile: FoldProfile = "none"): Glob {
   const entry = stripLeadingDotSlash(pattern) ?? pattern;
-  return profile === "none" ? globOf(entry) : globOf(foldGlobLiterals(entry, profile), entry);
+  return profile === "none"
+    ? globOf(entry)
+    : globOf(foldGlobLiterals(entry, profile), entry, FOLDED_CLASS_MEMBER_LIMIT);
 }
 
 // ----------------------------------------------------------------------
