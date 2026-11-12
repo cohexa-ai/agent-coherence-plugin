@@ -508,7 +508,7 @@ test("after a refusal the holder commits and its next read is fresh", async () =
     assertRefusal(await optedIn(s, SID_B, "plan.md"), sessionToAgentId(SID_A));
     await commitEdit(s, SID_A, "plan.md", "v2\n");
     const r = await s.request("/hooks/pre-read", { session_id: SID_A, path: "plan.md", content_hash: sha256("v2\n") });
-    assert.deepEqual(r.body, { status: "fresh" });
+    assert.deepEqual(r.body, { status: "fresh", version: 2 });
   } finally {
     await s.cleanup();
   }

@@ -375,10 +375,14 @@ export interface FreshResponse {
   status: "fresh";
 }
 
-export interface FreshWithNoticeResponse {
-  status: "fresh";
-  hookSpecificOutput: HookSpecificOutput;
-}
+/**
+ * A pre-read's fresh answer on a tracked file: `version` is the version of
+ * the record the read was classified against, and `hash_differs` is set only
+ * when the reader's bytes differ from that record.
+ */
+export type TrackedFreshAnswer = { status: "fresh"; version: number; hash_differs?: true };
+
+export type FreshWithNoticeResponse = TrackedFreshAnswer & { hookSpecificOutput: HookSpecificOutput };
 
 /** Single source of truth for "now" in unix-seconds; tests can mock later. */
 export function nowUnix(): number {
@@ -599,9 +603,10 @@ export function buildCollisionResponse(
   };
 }
 
-export function buildFreshWithNotice(notice: string): FreshWithNoticeResponse {
+/** `fresh` with the notice in an allow envelope; every key of `fresh` is kept. */
+export function buildFreshWithNotice(notice: string, fresh: TrackedFreshAnswer): FreshWithNoticeResponse {
   return {
-    status: "fresh",
+    ...fresh,
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "allow",

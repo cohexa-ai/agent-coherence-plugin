@@ -239,14 +239,14 @@ test("pending flag + tracked pre-read allow → re-ground block attached once; n
       // long as no state moved in between.
       additionalContext: armedText,
     });
-    // Consumed: the very next admit is today's bare fresh bytes.
+    // Consumed: the very next admit is the bare fresh bytes of a tracked file.
     const r2 = await post("/hooks/pre-read", {
       session_id: SID_A,
       path: "CLAUDE.md",
       content_hash: HASH_1,
     });
     assert.equal(r2.status, 200);
-    assert.equal(r2.text, '{"status":"fresh"}');
+    assert.equal(r2.text, '{"status":"fresh","version":1}');
   } finally {
     await cleanup();
   }
@@ -392,7 +392,7 @@ test("SubagentStop keeps the flag; a parent session-stop expires it (R2)", async
       content_hash: HASH_1,
     });
     assert.equal(r.status, 200);
-    assert.equal(r.text, '{"status":"fresh"}');
+    assert.equal(r.text, '{"status":"fresh","version":1}');
   } finally {
     await cleanup();
   }
@@ -417,7 +417,7 @@ test("a second session-start re-marks idempotently: still exactly one delivery",
       path: "CLAUDE.md",
       content_hash: HASH_1,
     });
-    assert.equal(after.text, '{"status":"fresh"}');
+    assert.equal(after.text, '{"status":"fresh","version":1}');
   } finally {
     await cleanup();
   }

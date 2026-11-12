@@ -155,6 +155,18 @@ export interface PolicySummary {
   rejected_pattern_count: number;
 }
 
+/**
+ * The four pattern lists the operator view publishes, under the names the
+ * Python coordinator's operator view uses. A rejected pattern is in none of
+ * them; it shows only in `PolicySummary.rejected_pattern_count`.
+ */
+export interface PolicyPatternLists {
+  tracked_patterns: ReadonlyArray<string>;
+  user_added_patterns: ReadonlyArray<string>;
+  ignored_patterns: ReadonlyArray<string>;
+  strict_mode_patterns: ReadonlyArray<string>;
+}
+
 export interface RejectedPattern {
   pattern: string;
   reason: string;
@@ -484,6 +496,21 @@ export class TrackedArtifactPolicy {
       rejected_pattern_count: this.rejectedPatterns.length,
     };
   }
+
+  /**
+   * The patterns this policy enforces, each as written: what a client checks
+   * its own globs against. Not part of `summary()`, whose counts every
+   * `/status` tier carries: a pattern list is the operator's directory
+   * layout, so only the operator view asks for these.
+   */
+  patternLists(): PolicyPatternLists {
+    return {
+      tracked_patterns: this.trackedPatterns,
+      user_added_patterns: this.userAddedPatterns,
+      ignored_patterns: this.ignoredPatterns,
+      strict_mode_patterns: this.strictModePaths,
+    };
+  }
 }
 
 /**
@@ -528,6 +555,16 @@ export class PolicyRef {
   /** Convenience passthrough for the /status default tier. */
   summary(): PolicySummary {
     return this.current.summary();
+  }
+
+  /**
+   * The current policy's pattern lists, for the operator view. Read through
+   * the ref on each request, never from the files: a reload keeps every strict
+   * and user-added pattern the running policy enforces, even one the files no
+   * longer list, and the view reports what is enforced.
+   */
+  patternLists(): PolicyPatternLists {
+    return this.current.patternLists();
   }
 
   /**

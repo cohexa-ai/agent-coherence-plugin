@@ -100,7 +100,7 @@ test("a strict file edited, committed and released at Stop reads fresh and edits
     assert.equal(stateOf(s, STRICT, sessionToAgentId(SID_A)), MESIState.SHARED);
 
     const read = await s.post("/hooks/pre-read", { session_id: SID_A, path: STRICT, content_hash: HASH_2 });
-    assert.deepEqual(read, { status: "fresh" });
+    assert.deepEqual(read, { status: "fresh", version: 2 });
     assert.deepEqual(await s.post("/hooks/pre-edit", { session_id: SID_A, path: STRICT }), { ok: true });
   } finally {
     await s.cleanup();
@@ -114,7 +114,7 @@ test("a warn file released at Stop reads with no stale warning on the next turn"
     await s.post("/hooks/session-stop", { session_id: SID_A });
 
     const read = await s.post("/hooks/pre-read", { session_id: SID_A, path: WARN, content_hash: HASH_2 });
-    assert.deepEqual(read, { status: "fresh" });
+    assert.deepEqual(read, { status: "fresh", version: 2 });
   } finally {
     await s.cleanup();
   }
@@ -130,7 +130,7 @@ test("a failed edit answers as before and leaves the holder reading fresh", asyn
     assert.equal(stateOf(s, STRICT, sessionToAgentId(SID_A)), MESIState.SHARED);
 
     const read = await s.post("/hooks/pre-read", { session_id: SID_A, path: STRICT, content_hash: HASH_1 });
-    assert.deepEqual(read, { status: "fresh" });
+    assert.deepEqual(read, { status: "fresh", version: 1 });
   } finally {
     await s.cleanup();
   }
@@ -156,7 +156,7 @@ test("SubagentStop leaves the subagent a reader and the parent's rows untouched"
       path: STRICT,
       content_hash: HASH_2,
     });
-    assert.deepEqual(read, { status: "fresh" });
+    assert.deepEqual(read, { status: "fresh", version: 2 });
   } finally {
     await s.cleanup();
   }
@@ -224,13 +224,13 @@ test("a reader's failed edit leaves it a reader", async () => {
   const s = await makeServer();
   try {
     const first = await s.post("/hooks/pre-read", { session_id: SID_A, path: STRICT, content_hash: HASH_1 });
-    assert.deepEqual(first, { status: "fresh" });
+    assert.deepEqual(first, { status: "fresh", version: 1 });
     const failed = await s.post("/hooks/post-edit", { session_id: SID_A, path: STRICT, success: false });
     assert.deepEqual(failed, { ok: true, released: true });
     assert.equal(stateOf(s, STRICT, sessionToAgentId(SID_A)), MESIState.SHARED);
 
     const read = await s.post("/hooks/pre-read", { session_id: SID_A, path: STRICT, content_hash: HASH_1 });
-    assert.deepEqual(read, { status: "fresh" });
+    assert.deepEqual(read, { status: "fresh", version: 1 });
   } finally {
     await s.cleanup();
   }
@@ -328,7 +328,7 @@ test("a failed edit reported after a peer took the file and committed leaves the
  */
 async function editAfterPeerCommit(s: Server, path: string): Promise<Record<string, unknown>> {
   const read = await s.post("/hooks/pre-read", { session_id: SID_A, path, content_hash: HASH_1 });
-  assert.deepEqual(read, { status: "fresh" });
+  assert.deepEqual(read, { status: "fresh", version: 1 });
   await editAndCommit(s, { session_id: SID_B, path }, HASH_2);
   assert.equal(stateOf(s, path, sessionToAgentId(SID_A)), MESIState.INVALID);
   return s.post("/hooks/pre-edit", { session_id: SID_A, path });
@@ -367,7 +367,7 @@ for (const [name, release] of [
       await release(s);
       assert.equal(stateOf(s, WARN, sessionToAgentId(SID_A)), MESIState.SHARED);
       const read = await s.post("/hooks/pre-read", { session_id: SID_A, path: WARN, content_hash: HASH_2 });
-      assert.deepEqual(read, { status: "fresh" });
+      assert.deepEqual(read, { status: "fresh", version: 2 });
     } finally {
       await s.cleanup();
     }

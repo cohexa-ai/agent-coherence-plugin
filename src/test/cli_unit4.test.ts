@@ -13,7 +13,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { ArtifactRegistry } from "../registry.js";
-import { PolicyRef } from "../policy.js";
+import { DEFAULT_TRACKED_PATTERNS, PolicyRef } from "../policy.js";
 import { SessionRegistry } from "../sessions.js";
 import { createServer } from "../server.js";
 import { normalizeWorkspacePath } from "../cli.js";
@@ -416,9 +416,9 @@ test("a response cut off mid-body exits 2, not a silent 0", async () => {
   }
 });
 
-test("--detail full against the Node coordinator surfaces its 501, exit 2", async () => {
-  // The Node coordinator has no operator tier; its 501 must reach the operator
-  // as such rather than as an unexplained rejection.
+test("--detail full against the Node coordinator prints its operator view, exit 0", async () => {
+  // The CLI sends the opt-in header, so the Node coordinator answers with its
+  // operator view: the default body plus the pattern lists its policy enforces.
   const root = mkdtempSync(join(tmpdir(), "cli-status-node-"));
   const secret = "s".repeat(32);
   const registry = new ArtifactRegistry(join(root, ".coherence", "state.db"));
@@ -437,16 +437,14 @@ test("--detail full against the Node coordinator surfaces its 501, exit 2", asyn
     writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
 
     const full = await runCli("cli_status.js", ["--detail", "full", "--root", root], root);
-    assert.equal(full.status, 2);
-    // The relayed text is the operator's only clue, so it must say where the
-    // tier is served. It must not prescribe a backend switch: this store is
-    // Node-owned, and the Python coordinator fails closed on it.
-    assert.match(
-      full.stderr,
-      /^agent-coherence-status: HTTP 501: detail=full \(the operator tier\) is served by the Python coordinator only; this Node coordinator serves the default and metrics tiers$/m,
-    );
-    assert.doesNotMatch(full.stderr, /coordinator_backend/);
-    assert.equal(full.stdout, "");
+    assert.equal(full.status, 0, full.stderr);
+    assert.equal(full.stderr, "");
+    const body = JSON.parse(full.stdout) as Record<string, unknown>;
+    assert.equal(body.backend, "node");
+    assert.equal(body.pre_edit_if_unheld, true);
+    const summary = body.policy_summary as Record<string, unknown>;
+    assert.deepEqual(summary.tracked_patterns, [...DEFAULT_TRACKED_PATTERNS]);
+    assert.deepEqual(summary.user_added_patterns, []);
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
     registry.close();
