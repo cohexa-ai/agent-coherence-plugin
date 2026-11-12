@@ -311,7 +311,8 @@ test('a key keeps its exact name, is listed as a key, and stays out of the index
   assert.notEqual(upper, lower);
   assert.equal(registry.resolveOrRegisterKey('WS-42', ''), upper);
   assert.equal(registry.findKeyArtifact('ws-42')?.id, lower);
-  assert.equal(registry.findFileArtifact({ key: 'ws-42', tidied: 'ws-42' }), null);
+  // Out of the index: a file spelling that is not the key's exact name misses it.
+  assert.equal(registry.findFileArtifact({ key: 'ws-42', tidied: 'Ws-42' }), null);
 
   const raw = openRaw(t, store.dbPath);
   const listed = raw
@@ -336,6 +337,41 @@ test('a key request meeting a file row of the same exact name shares it', (t) =>
   assert.equal(registry.findKeyArtifact('data/x.txt')?.id, file);
   const raw = openRaw(t, store.dbPath);
   assert.deepEqual(raw.prepare(`SELECT * FROM artifact_name_kinds`).all(), []);
+});
+
+test("a file request of a key row's exact name finds the row its register returns, holder and all", (t) => {
+  const registry = openRegistry(t, makeStore(t).dbPath);
+  registry.buildFoldIndex('caseless');
+  const key = registry.resolveOrRegisterKey('docs/plan.md', '');
+  const file = { key: foldKey('docs/plan.md', 'caseless'), tidied: 'docs/plan.md' };
+
+  assert.equal(registry.findFileArtifact(file)?.id, key);
+  const registered = registry.resolveOrRegisterFile(file, '');
+  assert.equal(registered, key);
+  registry.acquireExclusive(registered, AGENT_A, NOW);
+  const found = registry.findFileArtifact(file);
+  assert.ok(found !== null, 'the file lookup missed the row its register returned');
+  assert.deepEqual(registry.acquireExclusiveIfUnheld(found.id, AGENT_B, NOW), {
+    kind: 'other_holder',
+    holderAgentId: AGENT_A,
+  });
+  assert.equal(registry.listArtifacts().length, 1);
+});
+
+test("a file request whose disk spelling is a key row's exact name finds the row its register returns", (t) => {
+  const registry = openRegistry(t, makeStore(t).dbPath);
+  registry.buildFoldIndex('caseless');
+  const key = registry.resolveOrRegisterKey('Docs/plan.md', '');
+  const file = {
+    key: foldKey('docs/plan.md', 'caseless'),
+    tidied: 'docs/plan.md',
+    diskSpelling: 'Docs/plan.md',
+  };
+
+  assert.equal(registry.findFileArtifact(file)?.id, key);
+  assert.equal(registry.resolveOrRegisterFile(file, ''), key);
+  assert.equal(registry.findFileArtifact(file)?.id, key);
+  assert.equal(registry.listArtifacts().length, 1);
 });
 
 test('the side table is created at open with no user_version change, and the foreign-ledger guard accepts it', (t) => {

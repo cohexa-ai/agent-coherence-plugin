@@ -650,6 +650,27 @@ test('a key keeps every byte it was sent with', async (t) => {
   assert.deepEqual(rowNames(door), [key, 's3:/bucket/Key']);
 });
 
+test("a file edit of a key row's exact name commits to the row the key shares", async (t) => {
+  const root = makeWorkspace(t, TRACK_ALL);
+  const door = await openDoor(t, root, { foldProfile: CASELESS });
+  const key = { path: 'docs/plan.md', name_kind: 'key' };
+  await door.post('/hooks/pre-read', { session_id: SID_A, ...key, content_hash: HASH_1 });
+
+  const edit = await door.post('/hooks/pre-edit', { session_id: SID_B, path: 'docs/plan.md' });
+  const commit = await door.post('/hooks/post-edit', {
+    session_id: SID_B,
+    path: 'docs/plan.md',
+    success: true,
+    content_hash: HASH_2,
+  });
+  const keyRead = await door.post('/hooks/pre-read', { session_id: SID_A, ...key });
+
+  assert.deepEqual([edit.body, commit.body], [{ ok: true }, { ok: true }]);
+  assert.equal(keyRead.body['status'], 'stale');
+  const versions = door.registry.listArtifacts().map((row) => [row.name, row.version]);
+  assert.deepEqual(versions, [['docs/plan.md', 2]]);
+});
+
 test('a name_kind other than file or key is refused with the route path error', async (t) => {
   const root = makeWorkspace(t, TRACK_ALL);
   const door = await openDoor(t, root);

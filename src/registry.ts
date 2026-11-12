@@ -133,6 +133,11 @@ function isCurrentHolder(holder: RowWriter, nowTick: number): boolean {
   return holder.grantedAtTick === null || nowTick - holder.grantedAtTick < MAX_HOLD_SEC;
 }
 
+/** The name a new row for a file request takes: the disk's spelling, else the tidied request. */
+function storedNameOf(name: FileName): string {
+  return name.diskSpelling ?? name.tidied;
+}
+
 function listIndexed(index: FoldIndex, id: string, storedName: string): void {
   const key = indexKeyOf(storedName, index.profile);
   const ids = index.byKey.get(key) ?? [];
@@ -353,9 +358,15 @@ export class ArtifactRegistry {
    * key reaches the key's lowest-rowid row, so a bucket (rows a merge left
    * apart) acts as one file; without it the tidied spelling is looked up
    * exactly.
+   *
+   * An index miss then looks up the name a new row would take. Key rows are
+   * not indexed, yet the register's INSERT collides with a key row of that
+   * exact name and returns it: without this lookup a holder recorded there
+   * would be invisible to every later lookup of the file.
    */
   findFileArtifact(name: FileName): Artifact | null {
-    return this.foldIndex === null ? this.selectByName(name.tidied) : this.indexedArtifact(name.key);
+    if (this.foldIndex === null) return this.selectByName(name.tidied);
+    return this.indexedArtifact(name.key) ?? this.selectByName(storedNameOf(name));
   }
 
   /**
@@ -364,7 +375,7 @@ export class ArtifactRegistry {
    * the tidied request, and never joins a key that already has a row.
    */
   resolveOrRegisterFile(name: FileName, contentHash: string): string {
-    const stored = name.diskSpelling ?? name.tidied;
+    const stored = storedNameOf(name);
     const result = this.resolveOrInsert({
       existing: () => this.findFileArtifact(name),
       name: stored,
