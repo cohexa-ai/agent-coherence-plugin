@@ -99,6 +99,7 @@ test("pre-read, warn: a SHARED reader whose bytes changed out of band gets hash_
     const r = await readA(post, HASH_2);
     assert.deepEqual(r, {
       status: "fresh",
+      version: 1,
       hash_differs: true,
       hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: notice("CLAUDE.md", 1) },
     });
@@ -127,7 +128,7 @@ test("pre-read, warn: a MODIFIED holder's own recent commit sets hash_differs wi
     const agentA = sessions.registerSession(SID_A);
     registry.acquireExclusive(id, agentA, 10);
     registry.commit(id, agentA, HASH_2, 11);
-    assert.deepEqual(await readA(post, HASH_3), { status: "fresh", hash_differs: true });
+    assert.deepEqual(await readA(post, HASH_3), { status: "fresh", version: 2, hash_differs: true });
     ageLastCommit(6);
     const aged = await readA(post, HASH_3);
     assert.equal(aged.hash_differs, true);
@@ -206,7 +207,7 @@ test("pre-read, strict: a MODIFIED holder's own recent commit is not denied (#20
     const agentA = sessions.registerSession(SID_A);
     registry.acquireExclusive(id, agentA, 10);
     registry.commit(id, agentA, HASH_2, 11);
-    assert.deepEqual(await readA(post, HASH_3), { status: "fresh", hash_differs: true });
+    assert.deepEqual(await readA(post, HASH_3), { status: "fresh", version: 2, hash_differs: true });
   } finally {
     await cleanup();
   }
@@ -330,7 +331,7 @@ test("pre-read: a record with no content claim never reports an out-of-band chan
         const id = registry.resolveOrRegisterArtifact(path, recorded);
         registry.grantShared(id, sessions.registerSession(SID_A), 10);
         const r = await post("/hooks/pre-read", { session_id: SID_A, path, content_hash: HASH_2 });
-        assert.deepEqual(r, { status: "fresh" }, `${path} strict=${strict.length > 0}`);
+        assert.deepEqual(r, { status: "fresh", version: 1 }, `${path} strict=${strict.length > 0}`);
       }
     } finally {
       await cleanup();

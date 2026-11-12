@@ -272,7 +272,7 @@ test('post-edit-cas and post-edit through an alias commit the file the alias nam
   const commitFields = { path: 'Data/x.TXT', success: true, content_hash: HASH_1 };
   const commit = await a('/hooks/post-edit', commitFields);
 
-  assert.deepEqual([read.body, commit.body], [{ status: 'fresh' }, { ok: true }]);
+  assert.deepEqual([read.body, commit.body], [{ status: 'fresh', version: 1 }, { ok: true }]);
   const versions = door.registry.listArtifacts().map((row) => [row.name, row.version]);
   if (!foldsCase(door)) {
     // The aliases name other files, which data/** does not track.
@@ -644,9 +644,9 @@ test('a key keeps every byte it was sent with', async (t) => {
     content_hash: HASH_1,
   });
 
-  assert.deepEqual(read.body, { status: 'fresh' });
+  assert.deepEqual(read.body, { status: 'fresh', version: 1 });
   assert.deepEqual(cas.body, { ok: true, version: 2 });
-  assert.deepEqual(asFile.body, { status: 'fresh' });
+  assert.deepEqual(asFile.body, { status: 'fresh', version: 1 });
   assert.deepEqual(rowNames(door), [key, 's3:/bucket/Key']);
 });
 

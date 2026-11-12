@@ -8,8 +8,10 @@
  * Wire-shape parity with Python per KTD-B:
  * - Request body: `{session_id, path, content_hash?}` (snake_case, KTD-B.3 C3)
  * - Response shapes:
- *   - Fresh: `{status: "fresh"}`, plus `hash_differs: true` when a valid
- *     grant's bytes differ from the record (#205)
+ *   - Fresh: `{status: "fresh"}` on an untracked file; on a tracked one
+ *     `{status: "fresh", version}`, the version of the record the read was
+ *     classified against, plus `hash_differs: true` when a valid grant's
+ *     bytes differ from the record (#205)
  *   - Fresh with pending notice or an out-of-band notice: `{status: "fresh", ..., hookSpecificOutput: {...}}`
  *   - Stale: `{hookSpecificOutput: {...}, status: "stale", summary: {...}}`
  *   - 400: `{error: "<lowercase phrase>"}` per KTD-B.3 C1
@@ -27,7 +29,9 @@ import {
   nowUnix,
   outOfBandChangeNotice,
   type StaleSummary,
+  type TrackedFreshAnswer,
 } from "../hook_payloads.js";
+import type { Artifact } from "../registry.js";
 import {
   drainNoticeText,
   holdsContentClaim,
@@ -109,14 +113,17 @@ export async function handlePreRead(
     // Grant SHARED to the first reader so subsequent reads see themselves as
     // known-fresh.
     deps.registry.grantShared(artifactId, agentId, nowTick, "first_read");
+    // The version is read from the record after the grant, the order the
+    // Python coordinator keeps. Nothing awaits between the lookup and here
+    // and one coordinator owns the store, so no commit lands in between: this
+    // is the row this read created, and grantShared has just checked that it
+    // exists.
+    const created = deps.registry.getArtifactById(artifactId) as Artifact;
+    const fresh: TrackedFreshAnswer = { status: "fresh", version: created.version };
     // Even on first observation, check if THIS session has pending notices
     // from prior interactions on OTHER artifacts.
     const notice = drainNoticeText(deps, agentId);
-    if (notice !== null) {
-      writeJson(res, 200, withReground(buildFreshWithNotice(notice)));
-      return;
-    }
-    writeJson(res, 200, withReground({ status: "fresh" }));
+    writeJson(res, 200, withReground(notice === null ? fresh : buildFreshWithNotice(notice, fresh)));
     return;
   }
 
@@ -130,8 +137,9 @@ export async function handlePreRead(
     // disk-hash mismatch is either this session's own commit→disk-flush lag
     // (≤5s: flag only) or a change made outside the coordinator (strict →
     // deny; warn → flag plus a context-only notice). Sentinel recorded hashes
-    // carry no content claim and must not fire.
-    const fresh: Record<string, unknown> = { status: "fresh" };
+    // carry no content claim and must not fire. The version is the one this
+    // read was classified against, read in this same synchronous section.
+    const fresh: TrackedFreshAnswer = { status: "fresh", version: existingArtifact.version };
     let outOfBandVersion: number | null = null;
     if (
       contentHash !== null &&
@@ -166,7 +174,7 @@ export async function handlePreRead(
         });
         return;
       }
-      fresh["hash_differs"] = true;
+      fresh.hash_differs = true;
       if (!isSelfCommitLag) outOfBandVersion = existingArtifact.version;
     }
     // Reader has a valid grant (SHARED, EXCLUSIVE, or MODIFIED) on the
@@ -179,9 +187,7 @@ export async function handlePreRead(
     // pending re-grounding.
     const notice = drainNoticeText(deps, agentId);
     let result: Record<string, unknown> =
-      notice === null
-        ? fresh
-        : { ...fresh, hookSpecificOutput: buildFreshWithNotice(notice).hookSpecificOutput };
+      notice === null ? fresh : buildFreshWithNotice(notice, fresh);
     if (outOfBandVersion !== null) {
       result = attachPreToolUseContext(result, outOfBandChangeNotice(path, outOfBandVersion));
     }

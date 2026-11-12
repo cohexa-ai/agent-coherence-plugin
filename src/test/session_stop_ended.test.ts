@@ -114,7 +114,7 @@ async function attemptEditsAndReads(s: Server): Promise<string> {
     path: WARN,
     content_hash: HASH_1,
   });
-  assert.deepEqual(read, { status: 'fresh' });
+  assert.deepEqual(read, { status: 'fresh', version: 1 });
   return attempt;
 }
 
@@ -272,7 +272,7 @@ for (const [name, who] of [
     const s = await makeServer();
     try {
       const read = await s.post('/hooks/pre-read', { ...who, path: STRICT, content_hash: HASH_1 });
-      assert.deepEqual(read, { status: 'fresh' });
+      assert.deepEqual(read, { status: 'fresh', version: 1 });
       assert.deepEqual(await s.post('/hooks/session-stop', who), {
         ok: true,
         released_artifacts: [],
