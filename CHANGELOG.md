@@ -6,6 +6,12 @@ Alpha — APIs and the `hooks.json` wire shape may change before `v1.0`.
 
 The canonical release-notes surface is [GitHub Releases](https://github.com/Cohexa-ai/agent-coherence-plugin/releases); this file mirrors that history in a structured format for operators who prefer a single browsable timeline.
 
+## [Unreleased]
+
+### Changed
+
+- **On the built-in Node coordinator, a pre-edit that opts in to acquire-or-fail with a malformed subagent id is now refused with `HTTP 400` ([Cohexa-ai/agent-coherence#519](https://github.com/Cohexa-ai/agent-coherence/issues/519)).** A pre-edit that sends `"if_unheld": true` asks whether the caller's own agent identity may take the file. When its `agent_id` was present but not 1 to 64 characters of `[A-Za-z0-9_-]`, such as `"bad id!"`, a 65-character string, a number or a list, the Node coordinator read it as the parent session and answered for the parent, so a subagent whose parent held the file was admitted as the parent's own repeat. Now such a request answers `HTTP 400` with `{"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}`, the wording the Python coordinator uses for the same fault, and changes nothing. The check runs before the tracked-path check, so an untracked path answers the same. An empty or `null` `agent_id` still means no subagent id, a well-formed one, including a `CoherentVolume`'s 32-hex attempt id, is unchanged, and a pre-edit that does not opt in still reads a malformed id as the parent. The plugin's own hooks do not send `if_unheld`.
+
 ## [0.7.0] — 2026-11-13
 
 **On the built-in Node coordinator, a workspace now runs one coordinator, at the repository root, that stops once no client can reach it; a session keeps a read of each file it releases, so it can edit that file again on its next turn; every spelling a disk treats as one file reaches one record; an opted-in pre-edit is refused while another agent holds the file; and `/status` serves the operator view, so a `CoherentVolume` with `managed` globs attaches. On either backend, a session start refuses a `.coherence` that is or holds a symlink and tells the model, and the plugin's hook client and commands send nothing to a coordinator that has exited. Each entry names the `agent-coherence` release that brings a change to a Python-backend workspace.**
