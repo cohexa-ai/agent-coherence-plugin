@@ -13,14 +13,18 @@ still lists each session as `claude-session-<session id>` and shows the
 absolute workspace root.
 
 If the command exits non-zero, surface the exit code and the stderr message
-without commentary — the operator can act on it. Two messages have a known
+without commentary — the operator can act on it. Three messages have a known
 meaning:
 
-- A stderr line saying no coordinator is running for this workspace is the
-  normal state before any session has touched a tracked file. The bundled
-  Node CLI exits 2 with it and the Python console script exits 0. Report it as
-  "no coordinator currently running for this workspace — the next file
-  Read/Edit in any session will lazy-spawn one."
+- A stderr line saying no coordinator is running for this workspace means
+  none is serving it. The bundled Node CLI exits 2 with it and the Python
+  console script exits 0. When the line ends `start one`, the coordinator
+  `.coherence/server.pid` names has exited. Report it as "no coordinator
+  currently running for this workspace. Starting or resuming a Claude Code
+  session in it starts one."
+- An exit 2 whose message ends `; nothing was sent` means the coordinator
+  the command found exited or was replaced before the request went out.
+  Report it, and suggest running the command again.
 - An exit 2 saying the coordinator's registry is busy means the coordinator
   answered but could not read its registry in time, so the output cannot say
   what is tracked. Report that, and suggest running the command again shortly.

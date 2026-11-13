@@ -1,6 +1,6 @@
 {
   "name": "agent-coherence",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Coherence for the prose subset of project rules that can't be expressed as policy. Surfaces stale-spec collisions across parallel Claude Code sessions (Agent View, claude agents, multi-terminal). Warns when a session reads a tracked artifact (CLAUDE.md, plan.md, spec files) that another session has updated.",
   "author": {
     "name": "Vlad Parakhin",
