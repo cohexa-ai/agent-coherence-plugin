@@ -32,10 +32,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { writeExecutable } from './executable_fixture.js';
 
 // __dirname at runtime is dist/test/; plugin root is two levels up
 const __filename = fileURLToPath(import.meta.url);
@@ -44,15 +45,17 @@ const TOOL = join(PLUGIN_ROOT, 'tools', 'check_release_readiness.js');
 const CI_YML = join(PLUGIN_ROOT, '.github', 'workflows', 'ci.yml');
 
 /**
- * The display names .github/workflows/ci.yml produces today, i.e. the exact
- * strings branch protection must require. Renaming a job or changing the
- * matrix updates this list AND the live required contexts (docs/RELEASE.md §1).
+ * The display names .github/workflows/ci.yml produces today. Renaming a job
+ * or changing the matrix updates this list AND the live required contexts
+ * (docs/RELEASE.md §1). A job branch protection does not require, such as a
+ * new one before the maintainer decides, makes the checker warn, not fail.
  */
 const CI_JOB_NAMES = [
   'Typecheck',
   'Tests (Node 22)',
   'Tests (Node 24)',
   'Tests (Node 25)',
+  'Folding tests (macOS)',
   'Zero-Python install (Node 22)',
   'Zero-Python install (Node 24)',
   'Zero-Python install (Node 25)',
@@ -271,8 +274,7 @@ function writeFakeGh(dir: string, rscMain: RscBehavior, rscDev: RscBehavior): st
     'esac',
   ].join('\n');
   const ghPath = join(binDir, 'gh');
-  writeFileSync(ghPath, `${script}\n`);
-  chmodSync(ghPath, 0o755);
+  writeExecutable(ghPath, `${script}\n`);
   return binDir;
 }
 

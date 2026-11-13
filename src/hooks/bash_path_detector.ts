@@ -19,7 +19,8 @@
  *    reader command, e.g. `xargs cat`) → `isTracked(arg)` ⇒ yield.
  * 4. Eval bodies (`python|python3 -c "…"`, `perl -e "…"`, `ruby -e "…"`)
  *    → regex-scan for `name.ext` tokens → `isTracked` filter.
- * Dedupe, first-occurrence order.
+ * Dedupe, first-occurrence order: two tokens one `keyOf` key names (two
+ * spellings of one file) yield the first tracked one only.
  */
 
 const READER_COMMANDS = new Set([
@@ -84,22 +85,28 @@ function shellTokens(segment: string): string[] {
 
 /**
  * Extract tracked paths a Bash command would read. `isTracked` is the policy
- * gate (called per candidate; the caller never touches SQLite for a fully
- * untracked command).
+ * gate (called once per distinct token; the caller never touches SQLite for a
+ * fully untracked command). `keyOf` names the file a tracked token reaches:
+ * the route registers a token's file and grants it only after the loop, so a
+ * second spelling of a file the first just registered would read as stale.
  */
 export function detectTrackedPaths(
   command: string,
   isTracked: (path: string) => boolean,
+  keyOf: (path: string) => string = (path) => path,
 ): string[] {
   const found: string[] = [];
-  const seen = new Set<string>();
+  const seenTokens = new Set<string>();
+  const seenKeys = new Set<string>();
   const push = (p: string) => {
-    if (!seen.has(p) && isTracked(p)) {
-      seen.add(p);
-      found.push(p);
-    } else {
-      seen.add(p);
-    }
+    if (seenTokens.has(p)) return;
+    seenTokens.add(p);
+    if (!isTracked(p)) return;
+    // Among tracked tokens only: an untracked first spelling hides no later one.
+    const key = keyOf(p);
+    if (seenKeys.has(key)) return;
+    seenKeys.add(key);
+    found.push(p);
   };
 
   const segments = command.split(/\|\||&&|[|;&]/g);

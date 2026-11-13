@@ -13,11 +13,12 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { ArtifactRegistry } from "../registry.js";
-import { PolicyRef } from "../policy.js";
+import { DEFAULT_TRACKED_PATTERNS, PolicyRef } from "../policy.js";
 import { SessionRegistry } from "../sessions.js";
 import { createServer } from "../server.js";
 import { normalizeWorkspacePath } from "../cli.js";
 import { CLI_REQUEST_TIMEOUT_MS, HOOK_REQUEST_TIMEOUT_MS } from "../hook_client_transport.js";
+import { writeStandInPidFile } from "./coordinator_stand_in.js";
 
 const DIST = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -76,7 +77,7 @@ test("end-to-end: a refused write reaches the operator as HTTP <status>: <error>
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   try {
     const port = (server.address() as AddressInfo).port;
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
     writeFileSync(join(root, ".coherence", "tracked.yaml"), "- keep.md\n- *.log\n");
 
@@ -110,7 +111,7 @@ test("end-to-end: a refusal with no string error prints its status; a non-JSON s
   try {
     const port = (fake.address() as AddressInfo).port;
     mkdirSync(join(root, ".coherence"), { recursive: true });
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
 
     const refused = await runCli("cli_untrack.js", ["notes.md", "--root", root], root);
@@ -147,7 +148,7 @@ test("end-to-end: track writes YAML + prints; untrack uses `removed`; status ren
   try {
     const port = (server.address() as AddressInfo).port;
     mkdirSync(join(root, ".coherence"), { recursive: true });
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`); // 2-line Python format
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`); // 2-line Python format
     writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
 
     // track: one valid relative + one absolute-inside (normalized) + one outside (client-rejected).
@@ -281,7 +282,7 @@ async function startPythonStatusStub(): Promise<StatusStub> {
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   const port = (server.address() as AddressInfo).port;
   mkdirSync(join(root, ".coherence"), { recursive: true });
-  writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+  writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
   writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
   const stub: StatusStub = {
     root,
@@ -397,7 +398,7 @@ test("a response cut off mid-body exits 2, not a silent 0", async () => {
   try {
     const port = (server.address() as AddressInfo).port;
     mkdirSync(join(root, ".coherence"), { recursive: true });
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
 
     const cut = await runCli("cli_status.js", ["--root", root], root);
@@ -415,9 +416,9 @@ test("a response cut off mid-body exits 2, not a silent 0", async () => {
   }
 });
 
-test("--detail full against the Node coordinator surfaces its 501, exit 2", async () => {
-  // The Node coordinator has no operator tier; its 501 must reach the operator
-  // as such rather than as an unexplained rejection.
+test("--detail full against the Node coordinator prints its operator view, exit 0", async () => {
+  // The CLI sends the opt-in header, so the Node coordinator answers with its
+  // operator view: the default body plus the pattern lists its policy enforces.
   const root = mkdtempSync(join(tmpdir(), "cli-status-node-"));
   const secret = "s".repeat(32);
   const registry = new ArtifactRegistry(join(root, ".coherence", "state.db"));
@@ -432,20 +433,18 @@ test("--detail full against the Node coordinator surfaces its 501, exit 2", asyn
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   try {
     const port = (server.address() as AddressInfo).port;
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
 
     const full = await runCli("cli_status.js", ["--detail", "full", "--root", root], root);
-    assert.equal(full.status, 2);
-    // The relayed text is the operator's only clue, so it must say where the
-    // tier is served. It must not prescribe a backend switch: this store is
-    // Node-owned, and the Python coordinator fails closed on it.
-    assert.match(
-      full.stderr,
-      /^agent-coherence-status: HTTP 501: detail=full \(the operator tier\) is served by the Python coordinator only; this Node coordinator serves the default and metrics tiers$/m,
-    );
-    assert.doesNotMatch(full.stderr, /coordinator_backend/);
-    assert.equal(full.stdout, "");
+    assert.equal(full.status, 0, full.stderr);
+    assert.equal(full.stderr, "");
+    const body = JSON.parse(full.stdout) as Record<string, unknown>;
+    assert.equal(body.backend, "node");
+    assert.equal(body.pre_edit_if_unheld, true);
+    const summary = body.policy_summary as Record<string, unknown>;
+    assert.deepEqual(summary.tracked_patterns, [...DEFAULT_TRACKED_PATTERNS]);
+    assert.deepEqual(summary.user_added_patterns, []);
   } finally {
     await new Promise<void>((r) => server.close(() => r()));
     registry.close();
@@ -555,7 +554,7 @@ test("the Node coordinator's default tier publishes the workspace root nowhere",
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   try {
     const port = (server.address() as AddressInfo).port;
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${secret}\n`);
 
     for (const tier of [[], ["--detail", "minimal"]]) {
@@ -642,7 +641,7 @@ async function startCannedCoordinator(): Promise<CannedCoordinator> {
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
   const port = (server.address() as AddressInfo).port;
   mkdirSync(join(root, ".coherence"), { recursive: true });
-  writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
+  writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${port}\n`);
   writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
   return {
     root,
@@ -688,6 +687,105 @@ test("untrack: the strict refusal is read on any error status, and never by trac
     await coord.close();
   }
 });
+
+test("untrack: a strict refusal also prints the answer's rejections and the CLI's own, before the closing line (#212)", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    coord.answers.set("/policy/untrack", [
+      409,
+      { ...STRICT_REFUSAL, rejected: [{ path: "\\x", reason: "path must be relative (no leading \\)" }] },
+    ]);
+    const run = await runCli("cli_untrack.js", ["data/a.txt", "\\x", "../outside", "--root", coord.root], coord.root);
+    assert.equal(run.status, 3, run.stderr);
+    assert.equal(run.stdout, "");
+    assert.equal(
+      run.stderr,
+      "agent-coherence-untrack: refused 'data/a.txt': enforced in strict mode by data/**\n" +
+        "agent-coherence-untrack: rejected '\\\\x': path must be relative (no leading \\)\n" +
+        "agent-coherence-untrack: rejected '../outside': contains '..'\n" +
+        STRICT_RESTART_LINE +
+        "\n",
+    );
+  } finally {
+    await coord.close();
+  }
+});
+
+test("untrack: a strict refusal whose rejected list has the wrong shape still exits 3 with the CLI's own rejections (#212)", async () => {
+  const coord = await startCannedCoordinator();
+  try {
+    for (const rejected of ["\\x", [{ path: "\\x", reason: "no leading \\" }, "\\y"]]) {
+      coord.answers.set("/policy/untrack", [409, { ...STRICT_REFUSAL, rejected }]);
+      const run = await runCli("cli_untrack.js", ["data/a.txt", "../outside", "--root", coord.root], coord.root);
+      assert.equal(run.status, 3, run.stderr);
+      assert.equal(
+        run.stderr,
+        "agent-coherence-untrack: refused 'data/a.txt': enforced in strict mode by data/**\n" +
+          "agent-coherence-untrack: rejected '../outside': contains '..'\n" +
+          STRICT_RESTART_LINE +
+          "\n",
+      );
+    }
+  } finally {
+    await coord.close();
+  }
+});
+
+for (const prog of ["track", "untrack"] as const) {
+  test(`${prog}: an exit 2 after the request still prints the CLI's own rejections (#212)`, async () => {
+    const coord = await startCannedCoordinator();
+    const route = `/policy/${prog}`;
+    try {
+      for (const [status, body, line] of [
+        [500, { error: "internal: Error" }, `HTTP 500: internal: Error`],
+        [200, { ok: true, [prog === "track" ? "added" : "removed"]: "notes.md" }, `unexpected ${route} answer shape`],
+      ] as const) {
+        coord.answers.set(route, [status, body]);
+        const run = await runCli(`cli_${prog}.js`, ["notes.md", "../outside", "--root", coord.root], coord.root);
+        assert.equal(run.status, 2, run.stderr);
+        assert.equal(
+          run.stderr,
+          `agent-coherence-${prog}: ${line}\n` + `agent-coherence-${prog}: rejected '../outside': contains '..'\n`,
+        );
+      }
+    } finally {
+      await coord.close();
+    }
+  });
+
+  test(`${prog}: a request cut off before its answer prints the CLI's own rejections, no coordinator does not (#212)`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "cli-policy-cut-"));
+    const server = createNetServer((socket) => {
+      socket.on("error", () => {});
+      socket.once("data", () => {
+        socket.end("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n" + '{"ok":');
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const argv = ["notes.md", "../outside", "--root", root];
+    try {
+      // No port file: nothing was sent, which library #379 lets stay silent.
+      const absent = await runCli(`cli_${prog}.js`, argv, root);
+      assert.equal(absent.status, 2, absent.stderr);
+      assert.match(absent.stderr, new RegExp(`^agent-coherence-${prog}: no coordinator running for this workspace`));
+      assert.doesNotMatch(absent.stderr, /rejected/);
+
+      mkdirSync(join(root, ".coherence"), { recursive: true });
+      writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${(server.address() as AddressInfo).port}\n`);
+      writeFileSync(join(root, ".coherence", "hook.secret"), `${"s".repeat(32)}\n`);
+      const cut = await runCli(`cli_${prog}.js`, argv, root);
+      assert.equal(cut.status, 2, cut.stderr);
+      assert.equal(
+        cut.stderr,
+        `agent-coherence-${prog}: coordinator closed the connection before the response was complete\n` +
+          `agent-coherence-${prog}: rejected '../outside': contains '..'\n`,
+      );
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("untrack: a hostile strict refusal prints its path quoted and every field escaped", async () => {
   const coord = await startCannedCoordinator();

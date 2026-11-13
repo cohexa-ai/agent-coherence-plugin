@@ -16,6 +16,7 @@
  * Per KTD-13: NEVER include content bytes, content hashes, or diff text
  * in the response surface. Stale-read summary is structural metadata only.
  */
+import { MAX_HOLD_SEC, RECLAMATION_PREEMPTER_ID } from "./acquire_or_fail.js";
 
 export interface StaleSummary {
   path: string;
@@ -167,6 +168,45 @@ export const GRANT_CHANGE_DENY_REASON_TEMPLATE =
   "denial.";
 
 /**
+ * BYTE-IDENTICAL to Python `OUT_OF_BAND_DENY_REASON_TEMPLATE` (#205): a
+ * reader holding a valid grant hashed bytes the coordinator never recorded,
+ * at the version it already holds, so no session committed the change. It
+ * names no writer, and tells the session not to undo what may be its user's
+ * own edit.
+ */
+export const OUT_OF_BAND_DENY_REASON_TEMPLATE =
+  "Stale read denied: {path} on disk no longer matches v{current_version}, " +
+  "the version you last read, and no session committed the change, so it " +
+  "was made outside the coordinator. Do not restore or overwrite {path}: " +
+  "the change may be your user's work. Tell your user that {path} changed " +
+  "outside the coordinator; the read stays denied until the change is " +
+  "committed through the coordinator. This denial is structural (v0.2 " +
+  "strict mode); retrying the same operation will produce the same denial.";
+
+/**
+ * BYTE-IDENTICAL to Python `OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE` (#205): the
+ * warn-mode read notice and pre-edit's disk notice, carried context-only.
+ */
+export const OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE =
+  "⚠ {path} on disk differs from v{version}, the last content committed " +
+  "through the coordinator, and no session committed the change: it was " +
+  "made outside the coordinator. Read {path} before relying on it, and do " +
+  "not write it from an earlier read; that write would replace the change.";
+
+export function outOfBandChangeNotice(path: string, version: number): string {
+  return fmt(OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE, { path, version: String(version) });
+}
+
+/**
+ * Python `summary_reports_an_out_of_band_change`: the caller's bytes differ
+ * from the record while the version it last observed is still current.
+ */
+export function summaryReportsAnOutOfBandChange(summary: StaleSummary): boolean {
+  const prior = summary.prior_version_seen_by_session;
+  return prior !== null && summary.hash_differs && summary.current_version === prior;
+}
+
+/**
  * Does this summary support the claim that the artifact was WRITTEN?
  * Mirrors Python `hook_payloads.summary_reports_a_write` exactly.
  *
@@ -276,8 +316,24 @@ export function fmt(template: string, subs: Record<string, string>): string {
  * - timestamp via `pythonIsoUtc` (never toISOString);
  * - NO additionalContext key.
  * The `source` arg is kept for call-site telemetry parity with Python.
+ * `outOfBand` is Python's `out_of_band=True`: only the valid-grant read arm
+ * asks for it, and the summary must still confirm the change (#205).
  */
-export function emitStrictDeny(args: { source: string; summary: StaleSummary }): HookSpecificOutput {
+export function emitStrictDeny(args: {
+  source: string;
+  summary: StaleSummary;
+  outOfBand?: boolean;
+}): HookSpecificOutput {
+  if (args.outOfBand === true && summaryReportsAnOutOfBandChange(args.summary)) {
+    return {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: fmt(OUT_OF_BAND_DENY_REASON_TEMPLATE, {
+        path: args.summary.path,
+        current_version: String(args.summary.current_version),
+      }),
+    };
+  }
   if (!summaryReportsAWrite(args.summary)) {
     return {
       hookEventName: "PreToolUse",
@@ -319,10 +375,14 @@ export interface FreshResponse {
   status: "fresh";
 }
 
-export interface FreshWithNoticeResponse {
-  status: "fresh";
-  hookSpecificOutput: HookSpecificOutput;
-}
+/**
+ * A pre-read's fresh answer on a tracked file: `version` is the version of
+ * the record the read was classified against, and `hash_differs` is set only
+ * when the reader's bytes differ from that record.
+ */
+export type TrackedFreshAnswer = { status: "fresh"; version: number; hash_differs?: true };
+
+export type FreshWithNoticeResponse = TrackedFreshAnswer & { hookSpecificOutput: HookSpecificOutput };
 
 /** Single source of truth for "now" in unix-seconds; tests can mock later. */
 export function nowUnix(): number {
@@ -461,6 +521,8 @@ export function editCollisionWarning(
 export function preemptionNoticeText(
   notices: ReadonlyArray<{
     artifactPath: string;
+    /** The notice row's full preempter id; a reclaim is told apart by it. */
+    preempterAgentId?: string;
     preempterAgentShort: string;
     preemptedAtUnixTs: number;
   }>,
@@ -476,17 +538,41 @@ export function preemptionNoticeText(
    * rendering only `ADMIT_NOTICE_VERBATIM_CAP` of it.
    */
   totalCount: number = notices.length,
+  /**
+   * Whether the WHOLE pending queue holds a reclaim, not just the slice
+   * rendered: a reclaim past the verbatim cap still makes "silently revoked
+   * by another session" untrue, so a capped caller passes it explicitly.
+   */
+  queueHasReclaim: boolean = hasReclaimNotice(notices),
 ): string {
   if (notices.length === 0) return "";
-  const lines = notices.map(
-    (n) =>
-      `  • ${n.artifactPath} preempted by agent ${n.preempterAgentShort} at ${pythonIsoUtc(n.preemptedAtUnixTs)}`,
-  );
-  const intro =
-    totalCount === 1
-      ? "⚠ Your EXCLUSIVE grant on this artifact was silently revoked by another session:"
-      : `⚠ ${totalCount} of your EXCLUSIVE grants were silently revoked by other sessions:`;
-  return `${intro}\n${lines.join("\n")}`;
+  const lines = notices.map((n) => {
+    const at = pythonIsoUtc(n.preemptedAtUnixTs);
+    return isReclaimNotice(n.preempterAgentId)
+      ? `  • ${n.artifactPath} reclaimed at ${at}: held ${MAX_HOLD_SEC / 60} minutes or more while another agent asked for it; read the file again before editing it`
+      : `  • ${n.artifactPath} preempted by agent ${n.preempterAgentShort} at ${at}`;
+  });
+  return `${preemptionIntro(totalCount, queueHasReclaim)}\n${lines.join("\n")}`;
+}
+
+function isReclaimNotice(preempterAgentId: string | undefined): boolean {
+  return preempterAgentId === RECLAMATION_PREEMPTER_ID;
+}
+
+/** Whether any notice in `notices` is a reclaim; callers that render a capped slice pass the whole queue. */
+export function hasReclaimNotice(notices: ReadonlyArray<{ preempterAgentId?: string }>): boolean {
+  return notices.some((n) => isReclaimNotice(n.preempterAgentId));
+}
+
+function preemptionIntro(totalCount: number, queueHasReclaim: boolean): string {
+  if (queueHasReclaim) {
+    return totalCount === 1
+      ? "⚠ Your EXCLUSIVE grant on this artifact was revoked:"
+      : `⚠ ${totalCount} of your EXCLUSIVE grants were revoked:`;
+  }
+  return totalCount === 1
+    ? "⚠ Your EXCLUSIVE grant on this artifact was silently revoked by another session:"
+    : `⚠ ${totalCount} of your EXCLUSIVE grants were silently revoked by other sessions:`;
 }
 
 export function buildStaleResponse(summary: StaleSummary): StaleResponse {
@@ -517,9 +603,10 @@ export function buildCollisionResponse(
   };
 }
 
-export function buildFreshWithNotice(notice: string): FreshWithNoticeResponse {
+/** `fresh` with the notice in an allow envelope; every key of `fresh` is kept. */
+export function buildFreshWithNotice(notice: string, fresh: TrackedFreshAnswer): FreshWithNoticeResponse {
   return {
-    status: "fresh",
+    ...fresh,
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "allow",

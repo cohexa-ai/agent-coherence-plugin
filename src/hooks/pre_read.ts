@@ -8,8 +8,11 @@
  * Wire-shape parity with Python per KTD-B:
  * - Request body: `{session_id, path, content_hash?}` (snake_case, KTD-B.3 C3)
  * - Response shapes:
- *   - Fresh: `{status: "fresh"}`
- *   - Fresh with pending notice: `{status: "fresh", hookSpecificOutput: {...}}`
+ *   - Fresh: `{status: "fresh"}` on an untracked file; on a tracked one
+ *     `{status: "fresh", version}`, the version of the record the read was
+ *     classified against, plus `hash_differs: true` when a valid grant's
+ *     bytes differ from the record (#205)
+ *   - Fresh with pending notice or an out-of-band notice: `{status: "fresh", ..., hookSpecificOutput: {...}}`
  *   - Stale: `{hookSpecificOutput: {...}, status: "stale", summary: {...}}`
  *   - 400: `{error: "<lowercase phrase>"}` per KTD-B.3 C1
  *
@@ -24,17 +27,16 @@ import {
   buildFreshWithNotice,
   emitStrictDeny,
   nowUnix,
+  outOfBandChangeNotice,
   type StaleSummary,
+  type TrackedFreshAnswer,
 } from "../hook_payloads.js";
-
-/** Synthetic launch-gate sentinel hash — carries no content claim (Python `_F_SENTINEL_CONTENT_HASH`). */
-const F_SENTINEL_CONTENT_HASH = "f".repeat(64);
-/** Survivor #6 R2: self-commit → disk-flush lag window (Python `_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC`). */
-const SHARED_FOREIGN_DENY_LAG_WINDOW_SEC = 5.0;
+import type { Artifact } from "../registry.js";
 import {
   drainNoticeText,
+  holdsContentClaim,
+  isRecentSelfCommitLag,
   isValidContentHashOrAbsent,
-  isValidPath,
   isValidSessionId,
   readJsonBody,
   readSubagentId,
@@ -42,7 +44,14 @@ import {
   writeError,
   writeJson,
 } from "./_common.js";
-import { deliverPendingReground, writeFastAdmit } from "./reground.js";
+import { attachPreToolUseContext, deliverPendingReground, writeFastAdmit } from "./reground.js";
+import {
+  findRequested,
+  isStrictRequest,
+  isTrackedRequest,
+  readRequestName,
+  resolveRequested,
+} from "./door.js";
 
 export type PreReadDeps = HookDeps;
 
@@ -50,6 +59,7 @@ interface PreReadBody {
   session_id?: unknown;
   path?: unknown;
   content_hash?: unknown;
+  name_kind?: unknown;
 }
 
 export async function handlePreRead(
@@ -62,7 +72,8 @@ export async function handlePreRead(
     writeError(res, 400, "missing session_id");
     return;
   }
-  if (!isValidPath(body.path)) {
+  const name = readRequestName(body as Record<string, unknown>, deps);
+  if (name === null) {
     writeError(res, 400, "missing or empty path");
     return;
   }
@@ -72,7 +83,7 @@ export async function handlePreRead(
   }
 
   const sessionId: string = body.session_id;
-  const path: string = body.path;
+  const path: string = name.requested;
   const contentHash: string | null = (body.content_hash as string | null | undefined) ?? null;
 
   // SB-10 U8 (KTD6): the allow-attach seam — runs after every deny
@@ -83,7 +94,7 @@ export async function handlePreRead(
 
   // Tracked-policy gate (R8 budget): untracked paths fast-path to {fresh}
   // via writeFastAdmit's SB-10 U8 compact-pending peek.
-  if (!deps.policy.isTracked(path)) {
+  if (!isTrackedRequest(deps, name)) {
     writeFastAdmit(res, deps, sessionId, body as Record<string, unknown>, { status: "fresh" });
     return;
   }
@@ -92,24 +103,27 @@ export async function handlePreRead(
   const nowTick = Math.floor(Date.now() / 1000);
 
   // Lookup artifact by path. None → KTD-9 first observation.
-  const existingArtifact = deps.registry.getArtifactByName(path);
+  const existingArtifact = findRequested(deps, name);
 
   if (existingArtifact === null) {
     // First observation per KTD-9 — seed v1 with the on-disk hash if the
     // caller supplied one, else use empty string sentinel (matches Python).
     const seedHash = contentHash ?? "";
-    const artifactId = deps.registry.resolveOrRegisterArtifact(path, seedHash);
+    const artifactId = resolveRequested(deps, name, seedHash);
     // Grant SHARED to the first reader so subsequent reads see themselves as
     // known-fresh.
     deps.registry.grantShared(artifactId, agentId, nowTick, "first_read");
+    // The version is read from the record after the grant, the order the
+    // Python coordinator keeps. Nothing awaits between the lookup and here
+    // and one coordinator owns the store, so no commit lands in between: this
+    // is the row this read created, and grantShared has just checked that it
+    // exists.
+    const created = deps.registry.getArtifactById(artifactId) as Artifact;
+    const fresh: TrackedFreshAnswer = { status: "fresh", version: created.version };
     // Even on first observation, check if THIS session has pending notices
     // from prior interactions on OTHER artifacts.
     const notice = drainNoticeText(deps, agentId);
-    if (notice !== null) {
-      writeJson(res, 200, withReground(buildFreshWithNotice(notice)));
-      return;
-    }
-    writeJson(res, 200, withReground({ status: "fresh" }));
+    writeJson(res, 200, withReground(notice === null ? fresh : buildFreshWithNotice(notice, fresh)));
     return;
   }
 
@@ -117,39 +131,31 @@ export async function handlePreRead(
   const agentState = deps.registry.getAgentState(artifactId, agentId);
 
   if (agentState !== null && agentState !== MESIState.INVALID) {
-    // Survivor #6 v1 SHARED-holder foreign-edit arm (Unit 6, mirrors Python
-    // pre-read): a still-SHARED reader proves no peer commit since its grant,
-    // so a disk-hash mismatch is either this session's own commit→disk-flush
-    // lag (≤5s, suppress) or a foreign out-of-band edit (strict → deny).
-    // Sentinel recorded hashes carry no content claim and must not fire.
+    // Valid-grant out-of-band arm (Survivor #6, #205; mirrors Python
+    // `decide_tracked_read`): a reader holding any valid grant (SHARED,
+    // EXCLUSIVE or MODIFIED) proves no peer commit since its grant, so a
+    // disk-hash mismatch is either this session's own commit→disk-flush lag
+    // (≤5s: flag only) or a change made outside the coordinator (strict →
+    // deny; warn → flag plus a context-only notice). Sentinel recorded hashes
+    // carry no content claim and must not fire. The version is the one this
+    // read was classified against, read in this same synchronous section.
+    const fresh: TrackedFreshAnswer = { status: "fresh", version: existingArtifact.version };
+    let outOfBandVersion: number | null = null;
     if (
-      agentState === MESIState.SHARED &&
       contentHash !== null &&
       contentHash !== "" &&
-      existingArtifact.content_hash !== "" &&
-      existingArtifact.content_hash !== F_SENTINEL_CONTENT_HASH &&
-      contentHash !== existingArtifact.content_hash &&
-      deps.policy.isStrictMode(path)
+      holdsContentClaim(existingArtifact.content_hash) &&
+      contentHash !== existingArtifact.content_hash
     ) {
       const now = nowUnix();
       // R7: name the writer by the agent id the registry stores, not by the
       // session id that id was derived from.
       const lastWriterAgent = existingArtifact.last_writer_id;
-      // P1: compare the raw writer identity against THIS caller's composite
-      // agentId — NOT the session id the writer's agent id was derived from.
-      // SB-25 made that (now removed, R7) reverse lookup return a subagent's
-      // bare attribution id, so the old session-string comparison could never
-      // match for a subagent's own commit and its immediate self-re-read was
-      // wrongly denied as a "foreign edit." (lastWriterAgent is kept only for
-      // the summary field.)
-      const isSelfCommitLag =
-        existingArtifact.last_writer_id === agentId &&
-        now - existingArtifact.updated_at <= SHARED_FOREIGN_DENY_LAG_WINDOW_SEC;
-      if (!isSelfCommitLag) {
+      const isSelfCommitLag = isRecentSelfCommitLag(existingArtifact, agentId, now);
+      if (isStrictRequest(deps, name) && !isSelfCommitLag) {
         const sharedSummary: StaleSummary = {
           path,
           current_version: existingArtifact.version,
-          // A SHARED holder was granted on the current version.
           prior_version_seen_by_session: existingArtifact.version,
           last_writer_session_id: lastWriterAgent ?? "<unknown>",
           last_writer_at_unix_ts: existingArtifact.updated_at,
@@ -161,24 +167,31 @@ export async function handlePreRead(
           hookSpecificOutput: emitStrictDeny({
             source: "pre_read_shared_hash_deny",
             summary: sharedSummary,
+            outOfBand: true,
           }),
           status: "stale",
           summary: sharedSummary,
         });
         return;
       }
+      fresh.hash_differs = true;
+      if (!isSelfCommitLag) outOfBandVersion = existingArtifact.version;
     }
     // Reader has a valid grant (SHARED, EXCLUSIVE, or MODIFIED) on the
     // current version. Fresh, and the read is allowed. A SHARED grant that a
     // denied Bash / Grep command re-armed certifies no read, so this one is
     // the read to record (mirrors Python pre-read's fresh arm).
     if (agentState === MESIState.SHARED) deps.registry.recordObservation(artifactId, agentId);
+    // Python's order: drained notices ride an allow envelope, the out-of-band
+    // notice is appended to it (or becomes a context-only one), then any
+    // pending re-grounding.
     const notice = drainNoticeText(deps, agentId);
-    if (notice !== null) {
-      writeJson(res, 200, withReground(buildFreshWithNotice(notice)));
-      return;
+    let result: Record<string, unknown> =
+      notice === null ? fresh : buildFreshWithNotice(notice, fresh);
+    if (outOfBandVersion !== null) {
+      result = attachPreToolUseContext(result, outOfBandChangeNotice(path, outOfBandVersion));
     }
-    writeJson(res, 200, withReground({ status: "fresh" }));
+    writeJson(res, 200, withReground(result));
     return;
   }
 
@@ -233,7 +246,7 @@ export async function handlePreRead(
   // KTD-T: do NOT re-grant SHARED on deny — the state stays INVALID/None so
   // every retry produces the same byte-stable deny text.
   if (
-    deps.policy.isStrictMode(path) &&
+    isStrictRequest(deps, name) &&
     (agentState === MESIState.INVALID || (agentState === null && hashDiffers))
   ) {
     writeJson(res, 200, {

@@ -6,9 +6,10 @@
  * cleanly without leaving the database in an inconsistent state).
  */
 import { MESIState, M_OR_E_STATES } from "./states.js";
+import { CoherenceError } from "./coherence_error.js";
 
 /** Raised when an invariant check fails. Caller's catch should ROLLBACK + propagate. */
-export class InvariantViolationError extends Error {
+export class InvariantViolationError extends CoherenceError {
   constructor(message: string) {
     super(message);
     this.name = "InvariantViolationError";

@@ -26,6 +26,8 @@ import { MESIState } from "../states.js";
 import {
   emitAllow,
   emitStrictDeny,
+  OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE,
+  OUT_OF_BAND_DENY_REASON_TEMPLATE,
   pythonIsoUtc,
   STRICT_MODE_DENY_REASON_TEMPLATE,
   type StaleSummary,
@@ -33,6 +35,7 @@ import {
   editCollisionWarning,
   preemptionNoticeText,
   shortSessionId,
+  summaryReportsAnOutOfBandChange,
   summaryReportsAWrite,
 } from "../hook_payloads.js";
 
@@ -258,6 +261,15 @@ test("template placeholder set is locked (KTD-P)", () => {
   assert.deepEqual(placeholders, ["path", "last_writer_short", "last_writer_ts_iso", "path"]);
 });
 
+test("out-of-band templates: placeholder sets and bytes are locked to Python's (#205)", () => {
+  const placeholders = (template: string) => [...template.matchAll(/\{(\w+)\}/g)].map((m) => m[1]);
+  assert.deepEqual(placeholders(OUT_OF_BAND_DENY_REASON_TEMPLATE), ["path", "current_version", "path", "path"]);
+  assert.deepEqual(placeholders(OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE), ["path", "version", "path"]);
+  // U+26A0 with no variation selector, as Python writes it.
+  assert.equal(OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.codePointAt(0), 0x26a0);
+  assert.equal(OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE.codePointAt(1), 0x20);
+});
+
 test("KTD-U: emitAllow refuses to convert a terminal denial class", () => {
   assert.throws(
     () => emitAllow({ source: "test", denialClass: "permissions_deny_strict_mode" }),
@@ -270,13 +282,20 @@ test("KTD-U: emitAllow refuses to convert a terminal denial class", () => {
 
 // -------------------------------------------------------- gate truth table
 
-async function makeStrictServer(strictPatterns: string[]) {
+async function makeStrictServer(strictPatterns: string[], ignoredPatterns: string[] = []) {
   const tmp = mkdtempSync(join(tmpdir(), "strict6-test-"));
   mkdirSync(join(tmp, ".coherence"), { recursive: true });
   if (strictPatterns.length > 0) {
     writeFileSync(
       join(tmp, ".coherence", "strict_mode.yaml"),
       strictPatterns.map((p) => `- ${p}`).join("\n") + "\n",
+      "utf8",
+    );
+  }
+  if (ignoredPatterns.length > 0) {
+    writeFileSync(
+      join(tmp, ".coherence", "ignored.yaml"),
+      ignoredPatterns.map((p) => `- ${JSON.stringify(p)}`).join("\n") + "\n",
       "utf8",
     );
   }
@@ -421,6 +440,28 @@ test("pre-edit strict gate is INVALID-only: first-time editor acquires; preempte
   }
 });
 
+for (const ignored of ["CLAUDE.md", "**"]) {
+  test(`strict wins over ignore: a strict path under an ignored ${ignored} is still denied when stale`, async () => {
+    // Cohexa-ai/agent-coherence#261: an ignore entry, however broad, put a
+    // strict path on the untracked fast path, where every hook admits.
+    const { registry, sessions, post, cleanup } = await makeStrictServer(["CLAUDE.md"], [ignored]);
+    try {
+      const id = registry.resolveOrRegisterArtifact("CLAUDE.md", HASH_1);
+      assert.equal((await post("/hooks/pre-edit", { session_id: SID_A, path: "CLAUDE.md" })).ok, true);
+      // Tracked, so the pre-edit took a write claim: the fast path takes none.
+      assert.equal(registry.getAgentState(id, sessionToAgentId(SID_A)), MESIState.EXCLUSIVE);
+      assert.equal((await post("/hooks/pre-edit", { session_id: SID_B, path: "CLAUDE.md" })).ok, true);
+      registry.commit(id, sessions.registerSession(SID_B), HASH_2, 30);
+
+      const denied = await post("/hooks/pre-edit", { session_id: SID_A, path: "CLAUDE.md" });
+      assert.equal(denied.ok, false);
+      assert.equal(decision(denied), "deny");
+    } finally {
+      await cleanup();
+    }
+  });
+}
+
 test("pre-bash strict short-circuit: strict stale path → deny with stale_paths", async () => {
   const { registry, sessions, post, cleanup } = await makeStrictServer(["CLAUDE.md"]);
   try {
@@ -457,6 +498,10 @@ test("SHARED-hash arm: foreign out-of-band edit denies; recent self-commit lag s
       content_hash: HASH_2,
     });
     assert.equal(decision(foreign), "deny");
+    assert.equal(
+      (foreign.hookSpecificOutput as Record<string, unknown>).permissionDecisionReason,
+      OUT_OF_BAND_DENY_REASON_TEMPLATE.replaceAll("{path}", "CLAUDE.md").replace("{current_version}", "1"),
+    );
 
     // Self-commit lag: B holds SHARED after its own commit_cas WIN (<5s ago);
     // B's disk still has old bytes → suppressed (allow), not denied.
@@ -469,10 +514,11 @@ test("SHARED-hash arm: foreign out-of-band edit denies; recent self-commit lag s
       path: "CLAUDE.md",
       content_hash: HASH_1, // stale disk bytes ≠ canonical HASH_2
     });
-    // Suppression falls through to the plain fresh response (no deny, no
-    // hookSpecificOutput) — same as Python's warn-mode fall-through.
+    // Suppression falls through to the fresh response with the flag but no
+    // notice and no decision — same as Python's lag arm (#205).
     assert.equal(lag.status, "fresh");
-    assert.equal(decision(lag), undefined);
+    assert.equal(lag.hash_differs, true);
+    assert.equal(lag.hookSpecificOutput, undefined);
   } finally {
     await cleanup();
   }
@@ -580,6 +626,25 @@ function grantChangeSummary(): StaleSummary {
     hash_differs: false,
   };
 }
+
+test("summaryReportsAnOutOfBandChange: both directions (#205)", () => {
+  const s = { ...grantChangeSummary(), hash_differs: true };
+  assert.equal(summaryReportsAnOutOfBandChange(s), true);
+  assert.equal(summaryReportsAnOutOfBandChange({ ...s, hash_differs: false }), false);
+  assert.equal(summaryReportsAnOutOfBandChange({ ...s, prior_version_seen_by_session: null }), false);
+  assert.equal(summaryReportsAnOutOfBandChange({ ...s, current_version: 2 }), false);
+});
+
+test("emitStrictDeny: the out-of-band text only when asked for AND the summary confirms it (#205)", () => {
+  const outOfBand = { ...grantChangeSummary(), hash_differs: true };
+  const reason = (args: Parameters<typeof emitStrictDeny>[0]) => emitStrictDeny(args).permissionDecisionReason;
+  assert.ok(reason({ source: "t", summary: outOfBand, outOfBand: true })!.includes("no session committed the change"));
+  // Not asked for: the write template, as every other deny site gets.
+  assert.ok(reason({ source: "t", summary: outOfBand })!.includes("was updated by agent"));
+  // Asked for, but a commit landed since the reader's version: still the write template.
+  const committed = { ...outOfBand, current_version: 2 };
+  assert.ok(reason({ source: "t", summary: committed, outOfBand: true })!.includes("was updated by agent"));
+});
 
 test("summaryReportsAWrite: both directions, because one direction proves nothing", () => {
   const s = grantChangeSummary();

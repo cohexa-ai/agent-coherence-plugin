@@ -48,8 +48,8 @@ export class SessionRegistry {
    *
    * R2 attribution: a subagent gets an agent id DISTINCT from its parent's,
    * so the `[:8]` short form in warn/deny prose names the actual writer. The
-   * parent linkage stays in `nameByAgentId`; /status does not render it (R6:
-   * this coordinator serves no operator tier).
+   * parent linkage stays in `nameByAgentId`; /status does not render it at
+   * any tier, the operator view included.
    */
   registerSession(sessionId: string, subagentId?: string | null): string {
     const cacheKey =
@@ -89,6 +89,19 @@ export class SessionRegistry {
   /** All currently-known agent_ids. For /status diagnostics. */
   knownAgentIds(): string[] {
     return [...this.byAgentId.keys()];
+  }
+
+  /**
+   * Drop an ended identity from every map keyed or valued by its agent_id,
+   * after `ArtifactRegistry.forgetAgent` deleted its rows. The compact-pending
+   * flag is keyed by the parent session, which has not ended, so it stays.
+   */
+  forget(agentId: string): void {
+    for (const [cacheKey, cached] of this.bySessionId) {
+      if (cached === agentId) this.bySessionId.delete(cacheKey);
+    }
+    this.byAgentId.delete(agentId);
+    this.nameByAgentId.delete(agentId);
   }
 
   /**

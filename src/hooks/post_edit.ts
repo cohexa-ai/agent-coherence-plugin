@@ -2,8 +2,8 @@
  * POST /hooks/post-edit handler.
  *
  * Mirrors Python `_handle_post_edit` at coordinator_server.py:616 — commit
- * on success (bumps artifact.version), release on failure (invalidate
- * without version bump). Per KTD-1: PreToolUse Edit/Write acquires E;
+ * on success (bumps artifact.version), release on failure (the holder keeps
+ * a read, without version bump). Per KTD-1: PreToolUse Edit/Write acquires E;
  * PostToolUse Edit/Write commits or releases.
  *
  * Wire shape per KTD-B / KTD-B.3 C3:
@@ -14,17 +14,18 @@
  *   on success=false release; `{ok: false, reason}` on protocol error.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { CoherenceError } from "../coherence_error.js";
 import {
   type HookDeps,
   writeJson,
   writeError,
   readJsonBody,
   isValidSessionId,
-  isValidPath,
   isValidContentHashRequired,
   isValidContentHashOrAbsent,
   readSubagentId,
 } from "./_common.js";
+import { findRequested, isTrackedRequest, readRequestName } from "./door.js";
 
 export type PostEditDeps = HookDeps;
 
@@ -33,6 +34,7 @@ interface PostEditBody {
   path?: unknown;
   success?: unknown;
   content_hash?: unknown;
+  name_kind?: unknown;
 }
 
 export async function handlePostEdit(
@@ -44,7 +46,8 @@ export async function handlePostEdit(
     writeError(res, 400, "missing session_id");
     return;
   }
-  if (!isValidPath(body.path)) {
+  const name = readRequestName(body as Record<string, unknown>, deps);
+  if (name === null) {
     writeError(res, 400, "missing or empty path");
     return;
   }
@@ -63,10 +66,9 @@ export async function handlePostEdit(
   }
 
   const sessionId: string = body.session_id;
-  const path: string = body.path;
   const contentHash: string | null = (body.content_hash as string | null | undefined) ?? null;
 
-  if (!deps.policy.isTracked(path)) {
+  if (!isTrackedRequest(deps, name)) {
     writeJson(res, 200, { ok: true });
     return;
   }
@@ -74,7 +76,7 @@ export async function handlePostEdit(
   const agentId = deps.sessions.registerSession(sessionId, readSubagentId(body as Record<string, unknown>));
   const nowTick = Math.floor(Date.now() / 1000);
 
-  const existing = deps.registry.getArtifactByName(path);
+  const existing = findRequested(deps, name);
   if (existing === null) {
     // No prior pre-edit / pre-read; nothing to commit against. Matches Python.
     writeJson(res, 200, { ok: true, note: "untracked-at-commit" });
@@ -83,11 +85,12 @@ export async function handlePostEdit(
   const artifactId = existing.id;
 
   if (!success) {
-    // Tool failure path — release the grant without bumping version.
+    // Tool failure path — release the grant to a read without bumping version.
     try {
-      deps.registry.invalidate(artifactId, agentId, nowTick, "post_edit_failure");
+      deps.registry.releaseToReader(artifactId, agentId, nowTick);
     } catch (err) {
-      writeJson(res, 200, { ok: false, reason: (err as Error).message });
+      if (!(err instanceof CoherenceError)) throw err;
+      writeJson(res, 200, { ok: false, reason: err.message });
       return;
     }
     writeJson(res, 200, { ok: true, released: true });
@@ -98,7 +101,8 @@ export async function handlePostEdit(
   try {
     deps.registry.commit(artifactId, agentId, contentHash!, nowTick, null);
   } catch (err) {
-    writeJson(res, 200, { ok: false, reason: (err as Error).message });
+    if (!(err instanceof CoherenceError)) throw err;
+    writeJson(res, 200, { ok: false, reason: err.message });
     return;
   }
   writeJson(res, 200, { ok: true });

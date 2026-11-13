@@ -10,30 +10,37 @@
  *   - ensure .coherence/ dir + hook.secret
  *   - start HTTP server on ephemeral port (R21 body cap + auth wired)
  *   - write server.pid with 3-line format (KTD-A.5 point 1 backend field)
- *   - graceful shutdown on SIGINT/SIGTERM (removes server.pid; closes server)
+ *   - graceful shutdown on SIGINT/SIGTERM (drops the port from server.pid; closes server)
+ *
+ * Since #217 it also locks server.pid for its whole life (coordinator_lock.ts),
+ * so a workspace has one coordinator of either backend.
  *
  * NOT in this commit (deferred to subsequent Unit 1 commits / Unit 2):
- *   - fcntl flock on server.pid (KTD-A.5 mutex enforcement)
  *   - lifecycle: idle-shutdown, race-safe spawn-or-join
  *   - SQLite registry + migration runner (Unit 2)
  *   - /status three-tier (KTD-K)
  *   - hook handler routes (Unit 3)
  */
-import { existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { hostname } from "node:os";
 import { ensureSecret } from "./auth.js";
+import { checkCoherenceDir, coherenceDirRefusalMessage, EXIT_REFUSED } from "./coherence_dir.js";
 import { createServer, BIND_HOST } from "./server.js";
 import { ArtifactRegistry } from "./registry.js";
 import { PolicyRef } from "./policy.js";
 import { SessionRegistry } from "./sessions.js";
 import { readPackageVersion } from "./version.js";
+import { lockPidFile, pidFileDeparture, rewritePidFile } from "./coordinator_lock.js";
+import { foldProfileLogLine, probeFoldProfile } from "./fs_profile.js";
+import { prepareFoldIndex } from "./fold_merge.js";
+
+const PID_FILE_CHECK_MS = 5000;
 
 interface Workspace {
   root: string;
   coherenceDir: string;
   pidFile: string;
-  portFile: string;
   databasePath: string;
 }
 
@@ -44,23 +51,24 @@ function resolveWorkspace(): Workspace {
     root,
     coherenceDir,
     pidFile: join(coherenceDir, "server.pid"),
-    portFile: join(coherenceDir, "server.port"),
     databasePath: join(coherenceDir, "state.db"),
   };
 }
 
-function writePidFile(pidFile: string, pid: number, port: number, backend: "node"): void {
+function pidFileContent(pid: number, port: number, backend: "node"): string {
   // 3-line format: extends v0.1's <pid>\n<port>\n with a backend= field per
   // KTD-A.5 point 1. Python's read_port_from_file picks line 2 as port and
   // ignores subsequent lines for backwards compatibility; v0.1.1 Python
   // coordinator (Unit 6) gains backend-discrimination via the third line.
-  const payload = `${pid}\n${port}\nbackend=${backend}\n`;
-  writeFileSync(pidFile, payload, { mode: 0o600 });
+  return `${pid}\n${port}\nbackend=${backend}\n`;
 }
 
-function writePortFile(portFile: string, port: number): void {
-  // Mirror Python coordinator's <workspace>/.coherence/server.port (single-line port).
-  writeFileSync(portFile, `${port}\n`, { mode: 0o600 });
+function readFileOrNull(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
 }
 
 function logInfo(message: string): void {
@@ -78,16 +86,52 @@ async function main(): Promise<void> {
   const version = readPackageVersion();
   const workspace = resolveWorkspace();
 
+  // #251: before anything below creates, locks or writes under .coherence.
+  // Each of those follows a link, so a repository that commits one there
+  // would choose where they land; a refused start changes nothing.
+  const refusal = checkCoherenceDir(workspace.coherenceDir);
+  if (refusal !== null) {
+    logInfo(coherenceDirRefusalMessage(refusal, workspace.coherenceDir));
+    process.exitCode = EXIT_REFUSED;
+    return;
+  }
   mkdirSync(workspace.coherenceDir, { recursive: true, mode: 0o700 });
+  // #217: one coordinator per workspace. Locked before anything else here
+  // touches the workspace, so a start that loses leaves the store and the
+  // serving coordinator's files alone.
+  const pidLock = await lockPidFile(workspace.pidFile);
+  if (pidLock.state === "contended") {
+    // The pid tells a session's bootstrap that the coordinator it started lost.
+    logInfo(`another coordinator holds ${workspace.pidFile}; exiting (pid=${process.pid})`);
+    return;
+  }
+  if (pidLock.state === "unlocked") {
+    logInfo(`${workspace.pidFile} is not locked: ${pidLock.reason}; nothing stops a second coordinator for this workspace`);
+  } else {
+    // Lines a coordinator that died without stopping left behind. Cleared
+    // before binding, as the Python coordinator does, so no client dials
+    // that dead port while this one starts.
+    rewritePidFile(pidLock.fd, "");
+  }
+  const foldProfile = probeFoldProfile({
+    root: workspace.root,
+    coherenceDir: workspace.coherenceDir,
+    lockState: pidLock.state,
+    log: logInfo,
+  });
+  logInfo(foldProfileLogLine(foldProfile));
   // KTD-13 + README "auto-gitignored" claim: write .coherence/.gitignore
   // containing `*` so a careless `git add .` doesn't accidentally commit
   // state.db (MESI state + agent UUIDs), hook.secret (a credential), or
   // server.pid. Mirrors lifecycle._ensure_coherence_dir in the library's
   // Python coordinator. Idempotent — only write if missing so operator
-  // customizations are never clobbered.
+  // customizations are never clobbered. "wx" creates it exclusively, which
+  // also fails on a link, dangling or not, planted since the check above.
   const gitignorePath = join(workspace.coherenceDir, ".gitignore");
-  if (!existsSync(gitignorePath)) {
-    writeFileSync(gitignorePath, "*\n", { mode: 0o600 });
+  try {
+    writeFileSync(gitignorePath, "*\n", { mode: 0o600, flag: "wx" });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
   }
   const secret = ensureSecret(workspace.coherenceDir);
 
@@ -100,6 +144,13 @@ async function main(): Promise<void> {
       `(schema_version=${registry.getStats().schemaVersion}, ` +
       `migrations_applied=${registry.getStats().migrationsApplied})`,
   );
+  prepareFoldIndex({
+    registry,
+    root: workspace.root,
+    foldProfile,
+    lockHeld: pidLock.state === "held",
+    log: logInfo,
+  });
 
   const policy = PolicyRef.load(workspace.root);
   const policySummary = policy.summary();
@@ -112,6 +163,11 @@ async function main(): Promise<void> {
 
   const sessions = new SessionRegistry();
 
+  // The door relativizes each request's disk spelling against the root, so
+  // the root needs the disk's spelling too: as given it may run through a
+  // link (/var on macOS) or be typed in another case than the disk keeps.
+  const canonicalRoot = realpathSync.native(workspace.root);
+
   const server = createServer({
     secret,
     startedAtMs,
@@ -119,7 +175,13 @@ async function main(): Promise<void> {
     registry,
     policy,
     sessions,
+    foldProfile,
+    canonicalRoot,
   });
+
+  // What this coordinator published, once it has: on shutdown an unlocked
+  // coordinator touches server.pid only while it still holds this.
+  let publishedPidFile: string | null = null;
 
   // Bind to ephemeral port on loopback. Per KTD-A.5 + Open Questions:
   // BIND_HOST = "127.0.0.1" is a code-level invariant; no operator override.
@@ -138,11 +200,12 @@ async function main(): Promise<void> {
     const port = address.port;
 
     try {
-      writePidFile(workspace.pidFile, process.pid, port, "node");
-      writePortFile(workspace.portFile, port);
+      // Through the locked descriptor: the lock is on this inode.
+      publishedPidFile = pidFileContent(process.pid, port, "node");
+      rewritePidFile(pidLock.fd, publishedPidFile);
     } catch (err) {
       process.stderr.write(
-        `agent-coherence-coordinator: fatal: failed to write pid/port file: ${String(err)}\n`,
+        `agent-coherence-coordinator: fatal: failed to write pid file: ${String(err)}\n`,
       );
       process.exit(1);
     }
@@ -151,24 +214,37 @@ async function main(): Promise<void> {
     logInfo(`workspace=${workspace.root}; pid_file=${workspace.pidFile}`);
   });
 
-  // Graceful shutdown. Removes pid+port files so peer hook clients see no
-  // stale references; closes the HTTP server (in-flight requests get drained
-  // by Node's default close-on-idle behavior — Unit 5 lands the explicit
-  // in-flight semaphore drain per KTD-I).
-  const shutdown = (signal: NodeJS.Signals): void => {
-    logInfo(`shutting down on ${signal}`);
-    try {
-      unlinkSync(workspace.pidFile);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        logInfo(`unlink pidFile failed: ${String(err)}`);
+  // Graceful shutdown. Drops the port from server.pid so peer hook clients
+  // see no stale reference; closes the HTTP server
+  // (in-flight requests get drained by Node's default close-on-idle behavior
+  // — Unit 5 lands the explicit in-flight semaphore drain per KTD-I).
+  // A locked server.pid stays: the lock is on its inode, and the next
+  // coordinator must lock the same file (#217). Its port goes before the exit
+  // releases the lock, as on the Python coordinator, so a start that takes
+  // the lock next finds no port to dial. Unlocked, server.pid is removed as
+  // before #217, and only while it still holds what this coordinator wrote:
+  // it may be another coordinator's. It runs once: a signal that arrives while
+  // it runs, or a second signal, would otherwise close the server twice.
+  let stopping = false;
+  const shutdown = (reason: string): void => {
+    if (stopping) return;
+    stopping = true;
+    clearInterval(pidFileWatch);
+    logInfo(`shutting down ${reason}`);
+    const holdsLock = pidLock.state === "held";
+    if (holdsLock && publishedPidFile !== null) {
+      try {
+        rewritePidFile(pidLock.fd, `${process.pid}\n`);
+      } catch (err) {
+        logInfo(`dropping the port from pidFile failed: ${String(err)}`);
       }
-    }
-    try {
-      unlinkSync(workspace.portFile);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        logInfo(`unlink portFile failed: ${String(err)}`);
+    } else if (publishedPidFile !== null && readFileOrNull(workspace.pidFile) === publishedPidFile) {
+      try {
+        unlinkSync(workspace.pidFile);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          logInfo(`unlink pidFile failed: ${String(err)}`);
+        }
       }
     }
     server.close((closeErr) => {
@@ -185,8 +261,20 @@ async function main(): Promise<void> {
     });
   };
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  // #234: a coordinator no client can reach stops instead of running for
+  // ever. Clients find it only through server.pid, so once that is gone with
+  // its workspace (a removed git worktree), replaced, or rewritten by another
+  // coordinator, this one has nothing left to serve. Checked as often as the
+  // Python coordinator's watcher ticks.
+  const pidFileWatch = setInterval(() => {
+    if (publishedPidFile === null) return;
+    const departure = pidFileDeparture(workspace.pidFile, pidLock.fd, publishedPidFile);
+    if (departure !== null) shutdown(`because ${departure}`);
+  }, PID_FILE_CHECK_MS);
+  pidFileWatch.unref();
+
+  process.on("SIGINT", () => shutdown("on SIGINT"));
+  process.on("SIGTERM", () => shutdown("on SIGTERM"));
 }
 
 main().catch((err: unknown) => {

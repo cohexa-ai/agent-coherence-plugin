@@ -14,10 +14,10 @@
  * Shape notes (byte-parity with Python):
  * - Empty session → literal `{}` and NO flag (R5): the deferred path must
  *   stay unarmed when there is nothing to deliver.
- * - Internal build failure → literal `{}` (KTD7 degraded shape): advisory
- *   re-grounding must never block, and a degraded response leaves the
- *   deferred path unarmed (the flag is set only AFTER a successful
- *   non-empty build).
+ * - Internal build failure → the failure envelope `{ok: false, reason:
+ *   "internal: <Type>"}`, as Python's session-start work raises into it
+ *   (#214); a failed build leaves the deferred path unarmed (the flag is
+ *   set only AFTER a successful non-empty build).
  * - Optional `agent_id` resolves per SB-25 like the read paths, but the
  *   payload and the flag are SESSION-scoped either way — the parent agent
  *   id is derivable without prior registration, and the payload always
@@ -33,6 +33,7 @@ import { sessionToAgentId } from "../agent_id.js";
 import {
   emitSessionStart,
   fmt,
+  hasReclaimNotice,
   preemptionNoticeText,
   shortSessionId,
   SESSION_START_HEADER,
@@ -223,8 +224,8 @@ export function buildSessionStartContext(
         return {
           artifactPath: artifactNameById.get(n.artifactId) ?? "<unknown-artifact>",
           // Raw preempter id, not the resolved session: the prose builder
-          // matches it against the sweep-reclamation sentinel so a coordinator
-          // sweep is named as such rather than rendered as a peer session.
+          // matches it against the reclamation preempter so a reclaim is
+          // named as such rather than rendered as a peer session.
           preempterAgentId: n.preempterAgentId,
           // R7: the agent id, not a session id recovered from it.
           preempterAgentShort: shortSessionId(n.preempterAgentId),
@@ -232,6 +233,7 @@ export function buildSessionStartContext(
         };
       }),
       notices.length,
+      hasReclaimNotice(notices),
     );
     const noticeOverflow = notices.length - verbatimNotices.length;
     if (noticeOverflow > 0) {
@@ -285,17 +287,7 @@ export async function handleSessionStart(
     deps.sessions.registerSession(sessionId, subagentId);
   }
 
-  let built: SessionStartContext;
-  try {
-    built = buildSessionStartContext(deps, sessionId);
-  } catch (err) {
-    // KTD7 degraded shape: a failed build answers the empty payload — never
-    // block, never claim state it could not read — and the compact-pending
-    // flag stays unarmed (nothing to deliver later that was never built).
-    process.stderr.write(`agent-coherence: session-start build failed: ${String(err)}\n`);
-    writeJson(res, 200, {});
-    return;
-  }
+  const built = buildSessionStartContext(deps, sessionId);
   if (neverSeen && built.workspaceHasState) {
     // R8: a compact event for a session this coordinator never saw, while
     // the workspace demonstrably holds coordination state, is the signature
@@ -312,8 +304,8 @@ export async function handleSessionStart(
     return;
   }
   // Non-empty payload → arm deferred delivery (KTD5). Ordering matters: the
-  // flag is set only AFTER a successful build, so a degraded or failed
-  // request leaves the deferred path unarmed.
+  // flag is set only AFTER a successful build, so a failed request leaves
+  // the deferred path unarmed.
   deps.sessions.markCompactPending(sessionId);
   writeJson(res, 200, {
     hookSpecificOutput: emitSessionStart({ additionalContext: built.text }),

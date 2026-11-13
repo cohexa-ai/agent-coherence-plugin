@@ -239,14 +239,14 @@ test("pending flag + tracked pre-read allow → re-ground block attached once; n
       // long as no state moved in between.
       additionalContext: armedText,
     });
-    // Consumed: the very next admit is today's bare fresh bytes.
+    // Consumed: the very next admit is the bare fresh bytes of a tracked file.
     const r2 = await post("/hooks/pre-read", {
       session_id: SID_A,
       path: "CLAUDE.md",
       content_hash: HASH_1,
     });
     assert.equal(r2.status, 200);
-    assert.equal(r2.text, '{"status":"fresh"}');
+    assert.equal(r2.text, '{"status":"fresh","version":1}');
   } finally {
     await cleanup();
   }
@@ -279,12 +279,15 @@ test("pending flag + untracked pre-read → delivered via envelope; next untrack
 
 test("no flag + untracked pre-read → byte-identical fast path with ZERO artifact-registry access (KTD6)", async () => {
   // The ArtifactRegistry is swapped for a proxy that explodes on ANY
-  // property access — a touched registry would 500 the request. Only the
-  // SessionRegistry's process-local peek is allowed on this path.
+  // property access — a touched registry would answer the failure envelope. Only the
+  // SessionRegistry's process-local peek is allowed on this path, and the fold
+  // profile: an in-memory value fixed at start, which reads no store, that the
+  // policy check needs to match a name the way the workspace disk folds it.
   const tmp = mkdtempSync(join(tmpdir(), "reground8-noreg-"));
   const realRegistry = new ArtifactRegistry(join(tmp, ".coherence", "state.db"));
   const exploding = new Proxy(realRegistry, {
-    get(_target, prop) {
+    get(target, prop) {
+      if (prop === "foldIndexProfile") return () => target.foldIndexProfile();
       throw new Error(`registry touched on untracked fast path: ${String(prop)}`);
     },
   });
@@ -389,7 +392,7 @@ test("SubagentStop keeps the flag; a parent session-stop expires it (R2)", async
       content_hash: HASH_1,
     });
     assert.equal(r.status, 200);
-    assert.equal(r.text, '{"status":"fresh"}');
+    assert.equal(r.text, '{"status":"fresh","version":1}');
   } finally {
     await cleanup();
   }
@@ -414,7 +417,7 @@ test("a second session-start re-marks idempotently: still exactly one delivery",
       path: "CLAUDE.md",
       content_hash: HASH_1,
     });
-    assert.equal(after.text, '{"status":"fresh"}');
+    assert.equal(after.text, '{"status":"fresh","version":1}');
   } finally {
     await cleanup();
   }
@@ -632,7 +635,7 @@ test("pre-edit attach point: the UNTRACKED fast path delivers; next call byte-ma
 test("a rebuild failure AFTER the claim forfeits the delivery — the admit keeps its bytes (KD3)", async () => {
   // The claim is won, then `buildSessionStartContext` throws. R2 permits
   // at-most-once → zero, so the delivery is dropped rather than turning an
-  // otherwise-successful admit into a 500.
+  // otherwise-successful admit into a failure.
   const tmp = mkdtempSync(join(tmpdir(), "reground8-forfeit-"));
   mkdirSync(join(tmp, ".coherence"), { recursive: true });
   const realRegistry = new ArtifactRegistry(join(tmp, ".coherence", "state.db"));

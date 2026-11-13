@@ -25,11 +25,17 @@ import {
   existsSync,
   readFileSync,
   renameSync,
+  lstatSync,
+  readlinkSync,
 } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { writeExecutable } from './executable_fixture.js';
+import { makeFifo, runCommandBounded } from './fifo_fixture.js';
+import { LOCK_MODULE_URL, holdPidFileLock, killAndWait } from './pid_lock_fixture.js';
+import { shimRefusal } from './shim_refusal_fixture.js';
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -52,12 +58,24 @@ const STUB_TSCONFIG = JSON.stringify({
   include: ['src/**/*'],
 });
 
-// The inline `declare` keeps the stub compilable with no @types/node in the
-// stub's (empty) node_modules; the runtime global exists in Node regardless.
+// What the bootstrap waits for before calling a coordinator spawned: it writes
+// server.pid naming itself, as the real one does once its port is bound.
+const SERVE_LIKE_A_COORDINATOR =
+  'const dir = (process.env.AGENT_COHERENCE_WORKSPACE ?? process.cwd()) + "/.coherence";\n' +
+  'mkdirSync(dir, { recursive: true });\n' +
+  'writeFileSync(dir + "/server.pid", `${process.pid}\\n0\\nbackend=node\\n`);\n' +
+  'setInterval(() => {}, 60_000);\n';
+// The inline `declare`s and the unchecked import keep the stub compilable with
+// no @types/node in the stub's (empty) node_modules; Node provides them at run
+// time regardless.
 const HEALTHY_COORDINATOR_TS =
-  'declare function setInterval(cb: () => void, ms: number): unknown;\nsetInterval(() => {}, 60_000);\n';
+  '// @ts-ignore -- the stub package has no @types/node; Node provides the module.\n' +
+  'import { mkdirSync, writeFileSync } from "node:fs";\n' +
+  'declare const process: { pid: number; env: Record<string, string | undefined>; cwd(): string };\n' +
+  'declare function setInterval(cb: () => void, ms: number): unknown;\n' +
+  SERVE_LIKE_A_COORDINATOR;
 const CRASHING_COORDINATOR_TS = 'throw new Error("stub coordinator crash on boot");\n';
-const HEALTHY_PREBUILT_JS = 'setInterval(() => {}, 60_000);\n';
+const HEALTHY_PREBUILT_JS = 'import { mkdirSync, writeFileSync } from "node:fs";\n' + SERVE_LIKE_A_COORDINATOR;
 
 // The exact crash a Node-major change produces once node_modules holds a
 // binary built for the previous ABI — the failure this file's ABI-stamp
@@ -158,6 +176,8 @@ test('REGRESSION: dist-less package (marketplace clone) self-builds src/ and spa
       );
       const m = /spawned Node coordinator \(pid=(\d+)/.exec(r.stderr);
       assert.ok(m, `no spawn line in stderr:\n${r.stderr}`);
+      // Let through because it serves, not because the deadline passed.
+      assert.doesNotMatch(r.stderr, /has not started serving/);
       // The bootstrap's own liveness gate passed; the pid must still be up.
       assert.doesNotThrow(() => process.kill(Number(m[1]), 0));
       // First successful provision of a VIRGIN workspace stamps the backend,
@@ -197,6 +217,7 @@ test('provisioning is keyed: an unchanged package skips the rebuild and just spa
       assert.doesNotMatch(second.stderr, /building src\//);
       assert.doesNotMatch(second.stderr, /Node ABI changed/);
       assert.match(second.stderr, /spawned Node coordinator/);
+      assert.doesNotMatch(second.stderr, /has not started serving/);
       assert.equal(readFileSync(join(data, ABI_STAMP), 'utf8').trim(), RUNNING_ABI);
     } finally {
       killSpawned(second.stderr ?? '');
@@ -228,7 +249,7 @@ test("LIVENESS GATE: a coordinator that dies on boot → exit 1 with a log excer
   try {
     const r = runBootstrap(root, data, ws);
     assert.equal(r.status, 1, `expected loud failure:\n${r.stdout}\n${r.stderr}`);
-    assert.match(r.stderr, /exited immediately after spawn/);
+    assert.match(r.stderr, /exited before it started serving/);
     // The crash log tail is surfaced so the failure is diagnosable from the
     // hook output alone.
     assert.match(r.stderr, /stub coordinator crash on boot/);
@@ -240,6 +261,362 @@ test("LIVENESS GATE: a coordinator that dies on boot → exit 1 with a log excer
     // an ordinary coordinator bug into a full npm reinstall every session.
     assert.equal(readFileSync(join(data, ABI_STAMP), 'utf8').trim(), RUNNING_ABI);
     assert.doesNotMatch(r.stderr, /next session reprovisions/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test("LIVENESS GATE: a coordinator that dies after half a second, before it serves → exit 1, NO false 'spawned', no stamp", () => {
+  // A real coordinator fails start-up only after loading its native module
+  // and opening state.db: measured at 1.3-1.7 s under heavy load. A fixed
+  // half-second check let such a coordinator through as spawned and pinned a
+  // fresh workspace to the Node backend.
+  const lateCrash = 'setTimeout(() => { throw new Error("stub coordinator crash after 1.5 s"); }, 1500);\n';
+  const root = makeStubRoot({ prebuiltDistJs: lateCrash });
+  const { data, ws, cleanup } = makeDirs();
+  try {
+    const r = runBootstrap(root, data, ws);
+    try {
+      assert.equal(r.status, 1, `expected loud failure:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /exited before it started serving/);
+      assert.match(r.stderr, /stub coordinator crash after 1\.5 s/);
+      assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
+      assert.equal(existsSync(join(ws, '.coherence', 'coordinator_backend')), false);
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('LIVENESS GATE: a coordinator still alive but not serving after the deadline is warned about, then let through', () => {
+  // Only a coordinator that exits counts as failed: one that is merely slow
+  // keeps today's handling (spawned, and a fresh workspace stamped node).
+  const root = makeStubRoot({ prebuiltDistJs: 'setInterval(() => {}, 60_000);\n' });
+  const { data, ws, cleanup } = makeDirs();
+  try {
+    const r = runBootstrap(root, data, ws);
+    try {
+      assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /has not started serving after 10s; it may still be starting/);
+      assert.match(r.stderr, /spawned Node coordinator/);
+      assert.equal(readFileSync(join(ws, '.coherence', 'coordinator_backend'), 'utf8').trim(), 'node');
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test("LIVENESS GATE: under a `node` launcher that does not exec, the coordinator's own pid is reported", () => {
+  // A version manager's shim can run node as a child instead of exec'ing it.
+  // The coordinator then runs under a pid other than the one the shell
+  // started, and that one exits once the coordinator is detached; the
+  // bootstrap reports the coordinator's.
+  const root = makeStubRoot({ prebuiltDistJs: HEALTHY_PREBUILT_JS });
+  const { data, ws, cleanup } = makeDirs();
+  const launcherBin = mkdtempSync(join(tmpdir(), 'provision-launcher-'));
+  writeExecutable(join(launcherBin, 'node'), `#!/usr/bin/env bash\n"${process.execPath}" "$@"\nexit $?\n`);
+  const pidFile = join(ws, '.coherence', 'server.pid');
+  try {
+    const r = runBootstrapIn(root, data, ws, launcherBin);
+    try {
+      assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+      const spawned = /spawned Node coordinator \(pid=(\d+)/.exec(r.stderr)?.[1];
+      assert.equal(spawned, readFileSync(pidFile, 'utf8').split('\n')[0]);
+      assert.doesNotMatch(r.stderr, /has not started serving/);
+    } finally {
+      killSpawned(r.stderr ?? '');
+      if (existsSync(pidFile)) {
+        try {
+          process.kill(Number(readFileSync(pidFile, 'utf8').split('\n')[0]), 'SIGKILL');
+        } catch {
+          // already exited
+        }
+      }
+    }
+  } finally {
+    rmSync(launcherBin, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+/**
+ * A stub coordinator that takes server.pid's lock as the real one does
+ * (#217): it retries a held lock for up to 2 s, exits when another holds it
+ * on, and otherwise publishes its pid and a port through the locked file.
+ * The triggers are files it creates, so a test's lock holder can act at the
+ * moment this coordinator starts (`started`) or gives up (`lost`).
+ */
+function lockingCoordinatorJs(triggers: { started?: string; lost?: string } = {}): string {
+  const touch = (path: string | undefined, indent = ''): string =>
+    path === undefined ? '' : `${indent}writeFileSync(${JSON.stringify(path)}, "");\n`;
+  return (
+    'import { mkdirSync, writeFileSync } from "node:fs";\n' +
+    `const { lockPidFile, rewritePidFile } = await import(${JSON.stringify(LOCK_MODULE_URL)});\n` +
+    'const dir = (process.env.AGENT_COHERENCE_WORKSPACE ?? process.cwd()) + "/.coherence";\n' +
+    'mkdirSync(dir, { recursive: true });\n' +
+    touch(triggers.started) +
+    'const lock = await lockPidFile(dir + "/server.pid");\n' +
+    'if (lock.state === "contended") {\n' +
+    '  process.stderr.write("another coordinator holds " + dir + "/server.pid; exiting (pid=" + process.pid + ")\\n");\n' +
+    touch(triggers.lost, '  ') +
+    '  process.exit(0);\n' +
+    '}\n' +
+    'rewritePidFile(lock.fd, `${process.pid}\\n0\\nbackend=node\\n`);\n' +
+    'setInterval(() => {}, 60_000);\n'
+  );
+}
+
+/** Kill the coordinator a joined session started, which exits on its own soon after. */
+function killJoinedStart(stderr: string): void {
+  const m = /the one started here \(pid=(\d+)\) exits/.exec(stderr);
+  if (m) {
+    try {
+      process.kill(Number(m[1]), 'SIGKILL');
+    } catch {
+      // already exited
+    }
+  }
+}
+
+test('LIVENESS GATE: a session whose coordinator loses the start is told another serves it, not that it spawned', async () => {
+  // Two sessions starting at once each spawn a coordinator. The winner
+  // publishes while the loser still waits for the lock, and the loser exits
+  // about 2 s later; its session is served by the winner all the same. The
+  // stamp follows the winner's backend line: a Node store is pinned to node,
+  // a Python coordinator's file (no backend line) pins nothing.
+  for (const [published, stamped] of [
+    ['PID\n4242\nbackend=node\n', true],
+    ['PID\n4242\n', false],
+  ] as const) {
+    const { data, ws, cleanup } = makeDirs();
+    const trigger = join(ws, 'coordinator-started');
+    const root = makeStubRoot({ prebuiltDistJs: lockingCoordinatorJs({ started: trigger }) });
+    mkdirSync(join(ws, '.coherence'), { recursive: true });
+    const winner = await holdPidFileLock(join(ws, '.coherence', 'server.pid'), { publish: published, publishWhen: trigger });
+    try {
+      const r = runBootstrapIn(root, data, ws);
+      const label = `published=${JSON.stringify(published)}\n${r.stdout}\n${r.stderr}`;
+      try {
+        assert.equal(r.status, 0, label);
+        assert.match(r.stderr, /serves no port \(starting or stopping\); starting one that waits for it/, label);
+        assert.match(r.stderr, new RegExp(`another coordinator already serves this workspace \\(pid=${winner.pid}\\)`), label);
+        assert.doesNotMatch(r.stderr, /spawned Node coordinator|exited before it started serving/, label);
+        assert.equal(existsSync(join(ws, '.coherence', 'coordinator_backend')), stamped, label);
+      } finally {
+        killJoinedStart(r.stderr ?? '');
+      }
+    } finally {
+      await killAndWait(winner);
+      rmSync(root, { recursive: true, force: true });
+      cleanup();
+    }
+  }
+});
+
+test('STAGE 3: a coordinator holding the lock with its port published counts as running', async () => {
+  const root = makeStubRoot({ prebuiltDistJs: lockingCoordinatorJs() });
+  const { data, ws, cleanup } = makeDirs();
+  mkdirSync(join(ws, '.coherence'), { recursive: true });
+  const holder = await holdPidFileLock(join(ws, '.coherence', 'server.pid'), { publish: 'PID\n4242\nbackend=node\n' });
+  try {
+    const r = runBootstrapIn(root, data, ws);
+    try {
+      assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, new RegExp(`coordinator already running \\(pid=${holder.pid}\\)`));
+      assert.doesNotMatch(r.stderr, /stale pid file|spawned Node coordinator/);
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
+  } finally {
+    await killAndWait(holder);
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('STAGE 3: a coordinator holding the lock without a port is replaced once it lets go', async () => {
+  // A coordinator that is stopping has dropped its port but holds the lock
+  // until it exits; one that dies during start-up holds it with no port at
+  // all. Treating either as running left the session with no coordinator.
+  // The one started here waits for the lock and serves.
+  const { data, ws, cleanup } = makeDirs();
+  const trigger = join(ws, 'coordinator-started');
+  const root = makeStubRoot({ prebuiltDistJs: lockingCoordinatorJs({ started: trigger }) });
+  mkdirSync(join(ws, '.coherence'), { recursive: true });
+  const pidFile = join(ws, '.coherence', 'server.pid');
+  const stopping = await holdPidFileLock(pidFile, { publish: 'PID\n', exitWhen: trigger });
+  try {
+    const r = runBootstrapIn(root, data, ws);
+    try {
+      assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /serves no port \(starting or stopping\); starting one that waits for it/);
+      const spawned = /spawned Node coordinator \(pid=(\d+)/.exec(r.stderr)?.[1];
+      assert.equal(spawned, readFileSync(pidFile, 'utf8').split('\n')[0]);
+      assert.doesNotMatch(r.stderr, /already running|another coordinator already serves/);
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
+  } finally {
+    await killAndWait(stopping);
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('LIVENESS GATE: a session whose coordinator gave up waiting joins the holder once it serves', async () => {
+  // A holder still starting when ours gives up its 2 s wait for the lock:
+  // ours has exited, but the holder will serve, so the session waits for it.
+  const { data, ws, cleanup } = makeDirs();
+  const lost = join(ws, 'coordinator-lost');
+  const root = makeStubRoot({ prebuiltDistJs: lockingCoordinatorJs({ lost }) });
+  mkdirSync(join(ws, '.coherence'), { recursive: true });
+  const holder = await holdPidFileLock(join(ws, '.coherence', 'server.pid'), {
+    publish: 'PID\n4242\nbackend=node\n',
+    publishWhen: lost,
+  });
+  try {
+    const r = runBootstrapIn(root, data, ws);
+    try {
+      assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, new RegExp(`another coordinator already serves this workspace \\(pid=${holder.pid}\\)`));
+      assert.doesNotMatch(r.stderr, /exited before it started serving|spawned Node coordinator/);
+      assert.equal(readFileSync(join(ws, '.coherence', 'coordinator_backend'), 'utf8').trim(), 'node');
+    } finally {
+      killJoinedStart(r.stderr ?? '');
+    }
+  } finally {
+    await killAndWait(holder);
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('LIVENESS GATE: when the holder lets go only after ours gave up, one more coordinator is started and serves', async () => {
+  // A coordinator stopping slower than ours waits for the lock: ours gives up
+  // and exits, then the lock frees with nothing served. Reporting that as a
+  // failed start left the session with no coordinator.
+  const { data, ws, cleanup } = makeDirs();
+  const lost = join(ws, 'coordinator-lost');
+  const root = makeStubRoot({ prebuiltDistJs: lockingCoordinatorJs({ lost }) });
+  mkdirSync(join(ws, '.coherence'), { recursive: true });
+  const pidFile = join(ws, '.coherence', 'server.pid');
+  const stopping = await holdPidFileLock(pidFile, { publish: 'PID\n', exitWhen: lost });
+  try {
+    const r = runBootstrapIn(root, data, ws);
+    try {
+      assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /let go without serving; starting another/);
+      const spawned = /spawned Node coordinator \(pid=(\d+)/.exec(r.stderr)?.[1];
+      assert.equal(spawned, readFileSync(pidFile, 'utf8').split('\n')[0]);
+      assert.doesNotMatch(r.stderr, /exited before it started serving/);
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
+  } finally {
+    await killAndWait(stopping);
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('LIVENESS GATE: a holder that never serves while ours gave up is warned about at the deadline, not failed', async () => {
+  // Ours exited on finding the lock held and the holder publishes nothing
+  // within the deadline. The holder may only be slow, as at the PR #232
+  // deadline, so the session is let through with a warning, and nothing is
+  // stamped: the holder's file names no backend.
+  const { data, ws, cleanup } = makeDirs();
+  const root = makeStubRoot({ prebuiltDistJs: lockingCoordinatorJs() });
+  mkdirSync(join(ws, '.coherence'), { recursive: true });
+  const holder = await holdPidFileLock(join(ws, '.coherence', 'server.pid'));
+  try {
+    const r = runBootstrapIn(root, data, ws);
+    assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+    assert.match(r.stderr, /another coordinator holds .*server\.pid but has not started serving after 10s/);
+    assert.doesNotMatch(r.stderr, /exited before it started serving|spawned Node coordinator/);
+    assert.equal(existsSync(join(ws, '.coherence', 'coordinator_backend')), false);
+  } finally {
+    await killAndWait(holder);
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('STAGE 3: a server.pid naming a live process that is not a coordinator does not pass for one', () => {
+  // The pid of a coordinator that died is reused by whatever starts next;
+  // `kill -0` alone took that process for the coordinator and started none.
+  const root = makeStubRoot({ prebuiltDistJs: HEALTHY_PREBUILT_JS });
+  const { data, ws, cleanup } = makeDirs();
+  const sleeper = spawn('sleep', ['60'], { stdio: 'ignore' });
+  mkdirSync(join(ws, '.coherence'), { recursive: true });
+  writeFileSync(join(ws, '.coherence', 'server.pid'), `${sleeper.pid}\n4242\nbackend=node\n`);
+  try {
+    const r = runBootstrapIn(root, data, ws);
+    try {
+      assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+      assert.match(r.stderr, /stale pid file/);
+      assert.match(r.stderr, /spawned Node coordinator/);
+      assert.doesNotMatch(r.stderr, /already running/);
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
+  } finally {
+    sleeper.kill('SIGKILL');
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('STAGE 3: a running coordinator that holds no lock, as before #217, still counts as running', () => {
+  // After a plugin update the coordinator the previous version started keeps
+  // serving, and it never locks server.pid. Starting another beside it would
+  // put two coordinators on one store; the stub here locks nothing either.
+  const root = makeStubRoot({ prebuiltDistJs: HEALTHY_PREBUILT_JS });
+  const { data, ws, cleanup } = makeDirs();
+  try {
+    const first = runBootstrapIn(root, data, ws);
+    try {
+      assert.equal(first.status, 0, `first bootstrap failed:\n${first.stdout}\n${first.stderr}`);
+      const spawned = /spawned Node coordinator \(pid=(\d+)/.exec(first.stderr)![1];
+      const second = runBootstrapIn(root, data, ws);
+      try {
+        assert.equal(second.status, 0, `second bootstrap failed:\n${second.stdout}\n${second.stderr}`);
+        assert.match(second.stderr, new RegExp(`coordinator already running \\(pid=${spawned}\\)`));
+        assert.doesNotMatch(second.stderr, /spawned Node coordinator/);
+      } finally {
+        killSpawned(second.stderr ?? '');
+      }
+    } finally {
+      killSpawned(first.stderr ?? '');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test("STAGE 4: the coordinator leads a process group of its own, out of reach of the hook's", () => {
+  // Claude Code may kill the SessionStart hook's process group, for example
+  // when the hook times out. `nohup cmd &` left the coordinator in that group.
+  const root = makeStubRoot({ prebuiltDistJs: HEALTHY_PREBUILT_JS });
+  const { data, ws, cleanup } = makeDirs();
+  try {
+    const r = runBootstrapIn(root, data, ws);
+    try {
+      assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
+      const pid = /spawned Node coordinator \(pid=(\d+)/.exec(r.stderr)![1];
+      const pgid = spawnSync('ps', ['-o', 'pgid=', '-p', pid!], { encoding: 'utf8' }).stdout.trim();
+      assert.equal(pgid, pid);
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
     cleanup();
@@ -263,6 +640,7 @@ test('dev-checkout shape: a package WITH dist/ is mirrored (no build) and spawns
       );
       assert.doesNotMatch(r.stderr, /building src\//);
       assert.match(r.stderr, /spawned Node coordinator/);
+      assert.doesNotMatch(r.stderr, /has not started serving/);
       assert.equal(existsSync(join(ws, '.coherence', 'coordinator_backend')), false);
     } finally {
       killSpawned(r.stderr ?? '');
@@ -292,6 +670,214 @@ test("an operator's existing coordinator_backend file is never overwritten by th
   } finally {
     rmSync(root, { recursive: true, force: true });
     cleanup();
+  }
+});
+
+// --- .coherence check (#251) -------------------------------------------------
+
+/**
+ * A start the check refuses lstats and lists only, so it answers in well under
+ * a second; this only has to tell it from a start held on a FIFO.
+ */
+const AT_ONCE_MS = 5_000;
+
+/** A coordinator that never serves and goes away on its own: for starts that must never spawn one. */
+const SHORT_LIVED_JS = 'setTimeout(() => {}, 20_000);\n';
+
+/** What is at `path`, without following a link there. */
+function entryAt(path: string): string {
+  let info;
+  try {
+    info = lstatSync(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+    throw err;
+  }
+  if (info.isSymbolicLink()) return `link to ${readlinkSync(path)}`;
+  if (info.isFIFO()) return 'FIFO';
+  return `file ${JSON.stringify(readFileSync(path, 'utf8'))}`;
+}
+
+test('the bootstrap refuses a linked server.pid, coordinator_backend, state.db or .coherence before it reads, joins or writes anything', async () => {
+  // A repository can commit these links (cohexa-ai/agent-coherence#498).
+  // Before, the bootstrap joined the coordinator another workspace's pid file
+  // names, waited for good on a FIFO behind server.pid, and stamped the backend
+  // through a dangling link, creating the file it names.
+  const base = mkdtempSync(join(tmpdir(), 'provision-refused-'));
+  const theirs = join(base, 'other', '.coherence', 'server.pid');
+  mkdirSync(dirname(theirs), { recursive: true });
+  const fifo = join(base, 'pipe');
+  makeFifo(fifo);
+  const store = join(base, 'store');
+  writeFileSync(store, 'theirs');
+  // Only its own row releases the FIFO: a row that finished first must not let a held one go on.
+  const rows = [
+    { where: "server.pid linked to a serving coordinator's", entry: '.coherence/server.pid', target: theirs, pinned: true, fifos: [] },
+    { where: 'server.pid linked to a FIFO', entry: '.coherence/server.pid', target: fifo, pinned: true, fifos: [fifo] },
+    // Run as Claude Code runs it, in $PWD.
+    { where: 'a dangling coordinator_backend link', entry: '.coherence/coordinator_backend', target: join(base, 'gone'), pinned: false, fifos: [] },
+    // Its way out moves the store's -wal and -shm with it.
+    { where: 'a linked state.db', entry: '.coherence/state.db', target: store, pinned: true, fifos: [] },
+    // Its way out is a real directory, not a copy of a file.
+    { where: 'a dangling .coherence link', entry: '.coherence', target: join(base, 'gone-dir'), pinned: true, fifos: [] },
+  ].map((row) => {
+    const root = makeStubRoot({ prebuiltDistJs: SHORT_LIVED_JS });
+    const dirs = makeDirs();
+    const link = join(dirs.ws, row.entry);
+    mkdirSync(dirname(link), { recursive: true });
+    symlinkSync(row.target, link);
+    return { ...row, ...dirs, root, link };
+  });
+  // Another workspace's coordinator, serving.
+  const holder = await holdPidFileLock(theirs, { publish: 'PID\n4242\nbackend=node\n' });
+  try {
+    const before = rows.map((row) => entryAt(row.target));
+    const runs = rows.map(async (row) => {
+      const run = await runCommandBounded('bash', [join(row.root, 'bin', 'ensure-coordinator-node')], {
+        cwd: row.ws,
+        env: {
+          ...process.env,
+          AGENT_COHERENCE_WORKSPACE: row.pinned ? row.ws : undefined,
+          CLAUDE_PLUGIN_ROOT: row.root,
+          CLAUDE_PLUGIN_DATA: row.data,
+        } as NodeJS.ProcessEnv,
+        timeoutMs: AT_ONCE_MS,
+        fifos: row.fifos,
+      });
+      return [row.where, { ...run, link: entryAt(row.link), target: entryAt(row.target) }] as const;
+    });
+    const seen = Object.fromEntries(await Promise.all(runs));
+    assert.deepEqual(
+      seen,
+      Object.fromEntries(
+        rows.map((row, i) => [
+          row.where,
+          {
+            timedOut: false,
+            ...shimRefusal(row.entry, 'link'),
+            link: `link to ${row.target}`,
+            target: before[i],
+          },
+        ])
+      )
+    );
+  } finally {
+    await killAndWait(holder);
+    for (const row of rows) {
+      rmSync(row.root, { recursive: true, force: true });
+      row.cleanup();
+    }
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A coordinator that serves at once and goes away on its own. With `linkTarget`
+ * it first plants a link to it at coordinator_backend: after the start check,
+ * before the backend stamp.
+ */
+function servingCoordinatorJs(linkTarget?: string): string {
+  return (
+    'import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";\n' +
+    'const dir = (process.env.AGENT_COHERENCE_WORKSPACE ?? process.cwd()) + "/.coherence";\n' +
+    'mkdirSync(dir, { recursive: true });\n' +
+    (linkTarget === undefined
+      ? ''
+      : `symlinkSync(${JSON.stringify(linkTarget)}, dir + "/coordinator_backend");\n`) +
+    'writeFileSync(dir + "/server.pid", `${process.pid}\\n0\\nbackend=node\\n`);\n' +
+    'setTimeout(() => {}, 20_000);\n'
+  );
+}
+
+/**
+ * A bin directory whose `mkdir`, once it has made `ws`/.coherence, plants a
+ * link to `linkTarget` at coordinator_backend: between the stamp's own test
+ * and its write.
+ */
+function mkdirThatPlants(ws: string, linkTarget: string): string {
+  const bin = mkdtempSync(join(tmpdir(), 'provision-mkdir-'));
+  const coherenceDir = join(ws, '.coherence');
+  writeExecutable(
+    join(bin, 'mkdir'),
+    '#!/usr/bin/env bash\n' +
+      '/bin/mkdir "$@" || exit\n' +
+      'for last in "$@"; do :; done\n' +
+      `if [ "\${last:-}" = ${JSON.stringify(coherenceDir)} ]; then\n` +
+      `  ln -s ${JSON.stringify(linkTarget)} ${JSON.stringify(join(coherenceDir, 'coordinator_backend'))}\n` +
+      'fi\n'
+  );
+  return bin;
+}
+
+test('the first-provision stamp follows no link planted after the start check, and waits on no FIFO', async () => {
+  // The stamp runs once a coordinator serves, seconds after the start check.
+  // Before, a dangling link at coordinator_backend by then had "node" written
+  // through it, creating the file it names, and a link to a FIFO held the
+  // session start until something read the FIFO.
+  const base = mkdtempSync(join(tmpdir(), 'provision-stamp-'));
+  const fifo = join(base, 'pipe');
+  makeFifo(fifo);
+  const rows = [
+    { where: 'a dangling link the coordinator plants as it starts', target: join(base, 'gone-1'), by: 'coordinator', fifos: [] },
+    { where: "a dangling link planted between the stamp's test and its write", target: join(base, 'gone-2'), by: 'mkdir', fifos: [] },
+    { where: 'a link to a FIFO the coordinator plants as it starts', target: fifo, by: 'coordinator', fifos: [fifo] },
+  ].map((row) => {
+    const root = makeStubRoot({
+      prebuiltDistJs: servingCoordinatorJs(row.by === 'coordinator' ? row.target : undefined),
+    });
+    const dirs = makeDirs();
+    const bin = row.by === 'mkdir' ? mkdirThatPlants(dirs.ws, row.target) : undefined;
+    return { ...row, ...dirs, root, bin, link: join(dirs.ws, '.coherence', 'coordinator_backend') };
+  });
+  const runs: Array<{ stderr: string }> = [];
+  try {
+    const before = rows.map((row) => entryAt(row.target));
+    const outcomes = rows.map(async (row) => {
+      const run = await runCommandBounded('bash', [join(row.root, 'bin', 'ensure-coordinator-node')], {
+        cwd: row.ws,
+        env: {
+          ...process.env,
+          PATH: row.bin === undefined ? process.env.PATH : `${row.bin}:${process.env.PATH ?? ''}`,
+          AGENT_COHERENCE_WORKSPACE: row.ws,
+          CLAUDE_PLUGIN_ROOT: row.root,
+          CLAUDE_PLUGIN_DATA: row.data,
+        } as NodeJS.ProcessEnv,
+        // The whole provision runs first; this only has to tell a finished
+        // start from one held on the FIFO.
+        timeoutMs: 60_000,
+        fifos: row.fifos,
+      });
+      runs.push(run);
+      return [
+        row.where,
+        {
+          timedOut: run.timedOut,
+          status: run.status,
+          spawned: /spawned Node coordinator \(pid=/.test(run.stderr),
+          link: entryAt(row.link),
+          target: entryAt(row.target),
+        },
+      ] as const;
+    });
+    const seen = Object.fromEntries(await Promise.all(outcomes));
+    assert.deepEqual(
+      seen,
+      Object.fromEntries(
+        rows.map((row, i) => [
+          row.where,
+          { timedOut: false, status: 0, spawned: true, link: `link to ${row.target}`, target: before[i] },
+        ])
+      ),
+      runs.map((run) => run.stderr).join('\n')
+    );
+  } finally {
+    for (const run of runs) killSpawned(run.stderr);
+    for (const row of rows) {
+      if (row.bin !== undefined) rmSync(row.bin, { recursive: true, force: true });
+      rmSync(row.root, { recursive: true, force: true });
+      row.cleanup();
+    }
+    rmSync(base, { recursive: true, force: true });
   }
 });
 
@@ -396,7 +982,7 @@ test('SELF-HEAL: a NODE_MODULE_VERSION crash invalidates the stamp so the next s
   try {
     const r = runBootstrap(root, data, ws);
     assert.equal(r.status, 1, `expected loud failure:\n${r.stdout}\n${r.stderr}`);
-    assert.match(r.stderr, /exited immediately after spawn/);
+    assert.match(r.stderr, /exited before it started serving/);
     assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
     // The stamp vouched for a tree that cannot load. Dropping it is what
     // turns "dead until the user figures it out" into one bad session: the
@@ -556,8 +1142,7 @@ function stubNpmScript(npmOutput: string, exitCode = 1): string {
 
 function runBootstrapWithFailingNpm(root: string, data: string, ws: string, npmOutput: string) {
   const stubBin = mkdtempSync(join(tmpdir(), 'provision-npmstub-'));
-  writeFileSync(join(stubBin, 'npm'), stubNpmScript(npmOutput));
-  chmodSync(join(stubBin, 'npm'), 0o755);
+  writeExecutable(join(stubBin, 'npm'), stubNpmScript(npmOutput));
   try {
     return spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
       cwd: ws,
@@ -598,8 +1183,7 @@ test('a successful install is not reported as failed when the filter eats every 
     'npm http cache a@https://registry.npmjs.org/a 3ms (cache hit)',
     'npm http fetch GET 200 https://registry.npmjs.org/b 7ms',
   ].join('\n');
-  writeFileSync(join(stubBin, 'npm'), stubNpmScript(onlyFilteredLines, 0));
-  chmodSync(join(stubBin, 'npm'), 0o755);
+  writeExecutable(join(stubBin, 'npm'), stubNpmScript(onlyFilteredLines, 0));
   try {
     const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
       cwd: ws,
@@ -642,7 +1226,7 @@ test('registry chatter is filtered from the display but kept for classification'
     { length: 40 },
     (_, i) => `npm http cache pkg${i}@https://registry.npmjs.org/pkg${i} 3ms (cache hit)`
   ).join('\n');
-  writeFileSync(
+  writeExecutable(
     join(stubBin, 'npm'),
     stubNpmScript(
       `${chatter}\n` +
@@ -651,7 +1235,6 @@ test('registry chatter is filtered from the display but kept for classification'
         `npm error prebuild-install warn install No prebuilt binaries found (target=${process.versions.node} runtime=node arch=x64 libc= platform=linux)`
     )
   );
-  chmodSync(join(stubBin, 'npm'), 0o755);
   try {
     const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
       cwd: ws,
@@ -687,8 +1270,7 @@ test('npm-failure hint says so when it could not capture the output at all', () 
   const root = makeStubRoot({});
   const { data, ws, cleanup } = makeDirs();
   const stubBin = mkdtempSync(join(tmpdir(), 'provision-npmstub-'));
-  writeFileSync(join(stubBin, 'npm'), `#!/usr/bin/env bash\necho "npm error boom"\nexit 1\n`);
-  chmodSync(join(stubBin, 'npm'), 0o755);
+  writeExecutable(join(stubBin, 'npm'), `#!/usr/bin/env bash\necho "npm error boom"\nexit 1\n`);
   try {
     const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
       cwd: ws,
@@ -883,8 +1465,7 @@ test('STAGE 0: an unsupported Node major offers the Python backend only when the
     const root = makeStubRoot({});
     const { data, ws, cleanup } = makeDirs();
     const stubBin = mkdtempSync(join(tmpdir(), 'provision-nodestub-'));
-    writeFileSync(join(stubBin, 'node'), '#!/usr/bin/env bash\necho v23.11.0\n');
-    chmodSync(join(stubBin, 'node'), 0o755);
+    writeExecutable(join(stubBin, 'node'), '#!/usr/bin/env bash\necho v23.11.0\n');
     try {
       if (hadStore) {
         mkdirSync(join(ws, '.coherence'), { recursive: true });

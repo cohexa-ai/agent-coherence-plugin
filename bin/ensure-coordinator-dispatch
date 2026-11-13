@@ -50,7 +50,14 @@
 #
 # Workspace root mirrors the hook-client's resolution: git common-dir (linked
 # worktrees resolve to the parent repo) else toplevel. Not a git repo → no
-# workspace state to protect, so the runtime guard alone decides.
+# workspace state to protect, so the runtime guard alone decides. The Node
+# bootstrap is handed this root as its workspace, and outside a git repo it
+# does not run at all (see the node case at the end).
+#
+# Before any of that, and whatever selects the backend, the root's .coherence
+# is checked (coherence-dir-check below). A refused start runs neither
+# bootstrap: it prints SessionStart JSON saying it started no coordinator, and
+# exits 0.
 
 set -uo pipefail
 
@@ -67,17 +74,83 @@ node_abi_supported() {
   esac
 }
 
+# >>> coherence-dir-check: keep byte-identical in ensure-coordinator-dispatch
+# and ensure-coordinator-node (pinned by a test). cohexa-ai/agent-coherence#498.
+#
+# .coherence must be absent or a real directory (one mounted there counts),
+# and nothing directly inside it may be a symlink, a FIFO, a socket or a
+# device. A repository can commit any of them and no coordinator creates one;
+# a start would read and write through the link, or block on the FIFO. Checked
+# before this script reads or writes anything under .coherence, with [ -L ],
+# the type tests and globs only: it opens nothing there, so nothing it finds
+# can hold the session start. [ -L ] comes first because the other tests
+# follow a link, and a dangling one looks absent to them. A directory it
+# cannot list passes, and the coordinator decides, as before.
+#
+# Prints the refused path and returns 1 for a link, 2 for a non-directory and
+# 4 for a FIFO, socket or device; 0 when .coherence is absent or clean.
+coherence_dir_problem() {
+  local dir="$1" entry
+  if [ -L "$dir" ]; then printf '%s\n' "$dir"; return 1; fi
+  [ -e "$dir" ] || return 0
+  if [ ! -d "$dir" ]; then printf '%s\n' "$dir"; return 2; fi
+  { [ -r "$dir" ] && [ -x "$dir" ]; } || return 0
+  for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    if [ -L "$entry" ]; then printf '%s\n' "$entry"; return 1; fi
+  done
+  for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    if [ -p "$entry" ] || [ -S "$entry" ] || [ -b "$entry" ] || [ -c "$entry" ]; then printf '%s\n' "$entry"; return 4; fi
+  done
+  return 0
+}
+# Refuses the start when $1/.coherence breaks the rule: one line on stderr, and
+# one SessionStart JSON object on stdout, so the user (systemMessage) and the
+# model (additionalContext) both learn that this start started no coordinator.
+# The model is told only that: a coordinator already running for the workspace
+# still answers the hooks. The caller then exits 0, with nothing else on
+# stdout: Claude Code reads a hook's stdout as JSON only on exit 0, and shows a
+# failing hook's stderr to the user alone.
+refuse_coherence_dir() {   # 0 = refused (JSON printed), 1 = go on
+  local found status name why fix
+  found="$(coherence_dir_problem "$1/.coherence")"; status=$?
+  [ "$status" = 0 ] && return 1
+  # The name comes from the repository: keep JSON- and terminal-safe bytes only.
+  name="$(printf '%s' "${found#"$1/"}" | LC_ALL=C tr -c 'A-Za-z0-9._/-' '?')"
+  case "$status" in
+    # A linked .coherence names a directory, not a file; a copy of state.db
+    # alone loses the latest history its -wal and -shm hold.
+    1) why="$name is a symlink"
+       case "$name" in
+         .coherence) fix="Replace the link with a real directory and copy in the files you want to keep (move state.db together with its -wal and -shm), or mount a directory at .coherence, then start a new session." ;;
+         .coherence/state.db* | .coherence/workspace.db*) fix="Replace it with a copy of the file it names (move state.db together with its -wal and -shm), or mount a directory at .coherence, then start a new session." ;;
+         *) fix="Replace it with a copy of the file it names, or mount a directory at .coherence, then start a new session." ;;
+       esac ;;
+    2) why="$name is not a directory"; fix="Move it aside, then start a new session." ;;
+    *) why="$name is a FIFO, socket or device"; fix="Remove it, then start a new session." ;;
+  esac
+  echo "agent-coherence: not starting the coordinator: $why. $fix" >&2
+  printf '{"systemMessage":"agent-coherence started no coordinator for this session: %s. %s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"agent-coherence did not start a coordinator at this session start, because %s. Hooks may still answer from a coordinator already running for this workspace: treat any warning or deny they give as real, and do not assume edits are coordinated otherwise. Tell the user."}}\n' "$why" "$fix" "$why"
+  return 0
+}
+# <<< coherence-dir-check
+
 backend="${COHERENCE_COORDINATOR_BACKEND:-}"
+# Resolved whatever selects the backend, so the check below runs with an
+# explicit backend too: this is the .coherence the Python coordinator and the
+# hook client use, and the one this script reads next.
+root=""
+if command -v git >/dev/null 2>&1; then
+  common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  case "$common" in
+    /*) root="$(dirname "$common")" ;;
+    "") root="" ;;
+    *) root="$(git rev-parse --show-toplevel 2>/dev/null || true)" ;;
+  esac
+fi
+if [ -n "$root" ] && refuse_coherence_dir "$root"; then
+  exit 0
+fi
 if [ -z "$backend" ]; then
-  root=""
-  if command -v git >/dev/null 2>&1; then
-    common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-    case "$common" in
-      /*) root="$(dirname "$common")" ;;
-      "") root="" ;;
-      *) root="$(git rev-parse --show-toplevel 2>/dev/null || true)" ;;
-    esac
-  fi
   if [ -n "$root" ] && [ -f "$root/.coherence/coordinator_backend" ]; then
     backend="$(head -1 "$root/.coherence/coordinator_backend" | tr -d '[:space:]')"
   fi
@@ -106,6 +179,18 @@ fi
 
 case "$backend" in
   node)
+    # The Node bootstrap and its coordinator serve AGENT_COHERENCE_WORKSPACE,
+    # else the directory the session started in, while every hook and CLI
+    # uses the root resolved above (#254). Outside a repository those use
+    # none, so a coordinator started there would serve no one and never stop:
+    # none starts, as the Python bootstrap starts none there either.
+    if [ -z "${AGENT_COHERENCE_WORKSPACE:-}" ]; then
+      if [ -z "$root" ]; then
+        echo "agent-coherence: not in a git repository; no coordinator started (the hooks work only inside one)" >&2
+        exit 0
+      fi
+      export AGENT_COHERENCE_WORKSPACE="$root"
+    fi
     exec "$self_dir/ensure-coordinator-node"
     ;;
   *)

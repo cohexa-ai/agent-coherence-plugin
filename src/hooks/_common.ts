@@ -8,11 +8,13 @@
  * Error envelope: `{error: "<lowercase phrase>"}` per KTD-B.3 C1.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { ArtifactRegistry } from "../registry.js";
+import type { Artifact, ArtifactRegistry } from "../registry.js";
 import type { PolicyRef } from "../policy.js";
 import type { SessionRegistry } from "../sessions.js";
 import { isValidSubagentId } from "../agent_id.js";
+import { exceedsFoldLimit } from "../path_fold.js";
 import {
+  hasReclaimNotice,
   preemptionNoticeText,
   shortSessionId,
   PREEMPTION_NOTICE_OVERFLOW_LINE_TEMPLATE,
@@ -27,6 +29,7 @@ export interface HookDeps {
    */
   policy: PolicyRef;
   sessions: SessionRegistry;
+  canonicalRoot?: string;
 }
 
 export function writeJson(res: ServerResponse, status: number, body: unknown): void {
@@ -37,6 +40,49 @@ export function writeJson(res: ServerResponse, status: number, body: unknown): v
 
 export function writeError(res: ServerResponse, status: number, message: string): void {
   writeJson(res, status, { error: message });
+}
+
+/** Synthetic launch-gate sentinel hash — carries no content claim (Python `_F_SENTINEL_CONTENT_HASH`). */
+const F_SENTINEL_CONTENT_HASH = "f".repeat(64);
+/** Survivor #6 R2: self-commit → disk-flush lag window (Python `_SHARED_FOREIGN_DENY_LAG_WINDOW_SEC`). */
+const SHARED_FOREIGN_DENY_LAG_WINDOW_SEC = 5.0;
+
+/** Python `coordinator_holds_content_claim`: an empty or sentinel recorded hash claims no bytes. */
+export function holdsContentClaim(recordedHash: string): boolean {
+  return recordedHash !== "" && recordedHash !== F_SENTINEL_CONTENT_HASH;
+}
+
+/**
+ * Python `_is_recent_self_commit_lag`: the caller committed this artifact in
+ * the last few seconds, so bytes on disk that differ may still be its own
+ * write landing. P1: compare the raw writer identity against the caller's
+ * composite agentId — NOT the session id the writer's agent id was derived
+ * from. SB-25 made that (now removed, R7) reverse lookup return a subagent's
+ * bare attribution id, so a session-string comparison never matched a
+ * subagent's own commit and its immediate self-re-read was wrongly denied.
+ */
+export function isRecentSelfCommitLag(artifact: Artifact, agentId: string, now: number): boolean {
+  return artifact.last_writer_id === agentId && now - artifact.updated_at <= SHARED_FOREIGN_DENY_LAG_WINDOW_SEC;
+}
+
+/** Python `HANDLER_FAILURE_REASON_PREFIX`; library clients match it as a prefix. */
+const HANDLER_FAILURE_REASON_PREFIX = "internal: ";
+
+/** `internal: <Type>`, Python's `type(exc).__name__` after the prefix; the message never reaches a body. */
+export function internalFailureLabel(err: unknown): string {
+  const name = err instanceof Error ? err.constructor.name : "Unknown";
+  return `${HANDLER_FAILURE_REASON_PREFIX}${name}`;
+}
+
+/**
+ * Python `_answer_handler_error`: a hook route whose work raised answers HTTP
+ * 200 `{ok: false, reason: "internal: <Type>"}` (#214). Only the type reaches
+ * the body; the message goes to the coordinator's log.
+ */
+export function writeHandlerFailure(res: ServerResponse, err: unknown): void {
+  process.stderr.write(`agent-coherence: hook handler failed: ${String(err)}\n`);
+  if (res.headersSent) return;
+  writeJson(res, 200, { ok: false, reason: internalFailureLabel(err) });
 }
 
 /**
@@ -164,6 +210,15 @@ export function isValidPath(p: unknown): p is string {
   return typeof p === "string" && p.length > 0 && !p.startsWith("/") && !p.split("/").includes("..");
 }
 
+/**
+ * A request's path: `isValidPath`, and no longer than the 1024 code points
+ * the Python coordinator accepts. Such a name would never be folded, so a
+ * longer one is refused rather than given an identity of its own.
+ */
+export function isValidRequestPath(p: unknown): p is string {
+  return isValidPath(p) && !exceedsFoldLimit(p);
+}
+
 export function isValidContentHashOrAbsent(h: unknown): h is string | undefined | null {
   if (h === undefined || h === null) return true;
   return typeof h === "string" && CONTENT_HASH_RE.test(h);
@@ -226,8 +281,24 @@ export const ADMIT_NOTICE_VERBATIM_CAP = 3;
  *     "still surface on your next tracked-file operation" a true sentence
  *     rather than the false one a render-only cap would print.
  */
-export function drainNoticeText(deps: HookDeps, agentId: string): string | null {
-  const all = deps.registry.popPendingNoticesForAgent(agentId, ADMIT_NOTICE_VERBATIM_CAP);
+export function drainNoticeText(
+  deps: HookDeps,
+  agentId: string,
+  /**
+   * True for an opted-in pre-edit, which already holds its grant when it
+   * drains. If the pop finds the store busy, its BEGIN failed before any
+   * DELETE, so the notices are still queued: the admit goes out without them
+   * instead of a failure answer for a grant that landed.
+   */
+  admitOnBusy = false,
+): string | null {
+  let all: ReturnType<HookDeps["registry"]["popPendingNoticesForAgent"]>;
+  try {
+    all = deps.registry.popPendingNoticesForAgent(agentId, ADMIT_NOTICE_VERBATIM_CAP);
+  } catch (err) {
+    if (admitOnBusy && isSqliteBusy(err)) return null;
+    throw err;
+  }
   if (all.length === 0) return null;
   // Same slice, same order, as the DELETE consumed — the list is newest-first
   // and neither side re-sorts it.
@@ -241,16 +312,32 @@ export function drainNoticeText(deps: HookDeps, agentId: string): string | null 
     // survived a restart used to render "<unknown>".
     return {
       artifactPath: art?.name ?? "<unknown-artifact>",
+      preempterAgentId: n.preempterAgentId,
       preempterAgentShort: shortSessionId(n.preempterAgentId),
       preemptedAtUnixTs: n.preemptedAtUnixTs,
     };
   });
-  let text = preemptionNoticeText(rendered, all.length);
+  let text = preemptionNoticeText(rendered, all.length, hasReclaimNotice(all));
   const overflow = all.length - verbatim.length;
   if (overflow > 0) {
     text += "\n" + PREEMPTION_NOTICE_OVERFLOW_LINE_TEMPLATE.replace("{count}", String(overflow));
   }
   return text;
+}
+
+/**
+ * better-sqlite3's busy error, matched by its exact code, as
+ * `isUniqueViolation` in registry.ts matches its constraint code. The
+ * extended busy codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`) are
+ * deliberately not matched: only a held `BEGIN IMMEDIATE` has been observed
+ * here.
+ */
+function isSqliteBusy(err: unknown): boolean {
+  return typeof err === "object" && err !== null && "code" in err && err.code === "SQLITE_BUSY";
+}
+
+export function assertNever(x: never): never {
+  throw new Error(`unhandled outcome variant: ${JSON.stringify(x)}`);
 }
 
 /** One SHARED grant a Bash / Grep command earns on one tracked path. */

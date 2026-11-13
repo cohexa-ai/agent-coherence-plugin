@@ -25,10 +25,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runOnce, writeExecutable } from "./executable_fixture.js";
 
 // ES-module equivalent of __dirname (package.json has "type": "module")
 const __filename = fileURLToPath(import.meta.url);
@@ -44,16 +45,20 @@ const SHIMMED_COMMANDS = [
   "agent-coherence-migrate-deny",
 ];
 
+// Every test below times a shim, and a fresh checkout or worktree writes the
+// shims anew, so each runs once first (#219). With no binary on PATH and no
+// .venv under /tmp it reaches probe 3 and exits 127, touching nothing.
+for (const name of SHIMMED_COMMANDS) {
+  runOnce(join(BIN_DIR, name), { env: { PATH: "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp" }, cwd: "/tmp" });
+}
+
 /** Create a fake "real binary" that prints a sentinel + its argv to stdout. */
 function makeFakeBinary(dir: string, name: string, sentinel: string): string {
   mkdirSync(dir, { recursive: true });
-  const path = join(dir, name);
-  writeFileSync(
-    path,
+  return writeExecutable(
+    join(dir, name),
     `#!/usr/bin/env bash\necho "${sentinel}"\nfor arg in "$@"; do echo "ARG:$arg"; done\nexit 0\n`,
   );
-  chmodSync(path, 0o755);
-  return path;
 }
 
 /** Run a shim in a controlled env (custom PATH + CWD). */

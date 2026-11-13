@@ -9,7 +9,7 @@
  * pre-bash, pre-grep), and the payload rides a PreToolUse envelope, never
  * the SessionStart wrapper. It only ever ADDS context: a bare admit gets a
  * context-only envelope, an existing envelope keeps its own decision (see
- * `attachReground`).
+ * `attachPreToolUseContext`).
  *
  * R2 at-most-once: the claim happens ONLY here, after every deny decision.
  * Node's single-threaded event loop already makes the Map-delete pop atomic,
@@ -29,20 +29,20 @@ import { buildSessionStartContext } from "./session_start.js";
 /**
  * R8: does this admit response qualify to carry — and therefore consume —
  * the deferred re-grounding payload? The payload attaches ONLY to allow
- * envelopes. A response already carrying a `hookSpecificOutput` qualifies
- * iff its decision is "allow" — a strict-mode deny must stay byte-identical
+ * envelopes. A response already carrying a decision qualifies
+ * iff that decision is "allow" — a strict-mode deny must stay byte-identical
  * (KTD-P) and must NOT consume: the flag survives for the next qualifying
  * admit. An envelope-less response qualifies iff it is an admit body —
  * `{ok: true}` (pre-edit) or `{status: "fresh"}` (pre-read / pre-bash /
  * pre-grep). A service-refusal body (`{ok: false, ...}`) is neither a deny
- * envelope nor an admit: no attach, no consume.
+ * envelope nor an admit: no attach, no consume. A context-only envelope (the
+ * out-of-band notice, #205) decides nothing, so it qualifies exactly as the
+ * body under it would, as Python's `_reground_qualifies` does.
  */
 function regroundQualifies(result: Record<string, unknown>): boolean {
   const hso = result.hookSpecificOutput as PreToolUseEnvelope | undefined;
-  if (hso !== undefined) {
-    // `in` first: an envelope with no decision (a context-only advisory
-    // one) is not an allow, so it neither carries nor consumes a delivery.
-    return "permissionDecision" in hso && hso.permissionDecision === "allow";
+  if (hso !== undefined && "permissionDecision" in hso) {
+    return hso.permissionDecision === "allow";
   }
   return result.ok === true || result.status === "fresh";
 }
@@ -83,7 +83,8 @@ function claimRegroundContext(
 }
 
 /**
- * Merge the claimed re-grounding prose into a qualifying admit response.
+ * Merge advisory prose — the claimed re-grounding, or the out-of-band notice
+ * (#205, Python `_attach_pretooluse_context`) — into an admit response.
  * An existing envelope keeps its text and its decision and gets the block
  * appended AFTER it (notices and stale warnings render first — KTD6
  * ordering); a bare admit body gets a CONTEXT-ONLY PreToolUse envelope —
@@ -109,7 +110,7 @@ function claimRegroundContext(
  * shape. Wire-shape parity with Python `_attach_reground` is load-bearing
  * (protocol corpus): same key set, same insertion order.
  */
-function attachReground(result: Record<string, unknown>, text: string): Record<string, unknown> {
+export function attachPreToolUseContext(result: Record<string, unknown>, text: string): Record<string, unknown> {
   const hso = result.hookSpecificOutput as PreToolUseEnvelope | undefined;
   if (hso === undefined) {
     return {
@@ -141,7 +142,7 @@ export function deliverPendingReground(
   if (!regroundQualifies(admit)) return admit;
   const text = claimRegroundContext(deps, sessionId, body);
   if (text === null) return admit;
-  return attachReground(admit, text);
+  return attachPreToolUseContext(admit, text);
 }
 
 /**

@@ -372,7 +372,7 @@ test("session-start: pending preemption notice rendered READ-ONLY — appears in
 
 // ------------------------------------------------------------ subagents
 
-test("session-start: parent lines first, then subagent group under its prefix; released grant → touched line (KTD8)", async () => {
+test("session-start: parent lines first, then subagent group under its prefix; a released grant renders as a held SHARED grant", async () => {
   const { registry, sessions, post, cleanup } = await makeServer();
   try {
     const cid = registry.resolveOrRegisterArtifact("CLAUDE.md", HASH_1);
@@ -394,8 +394,8 @@ test("session-start: parent lines first, then subagent group under its prefix; r
       ].join("\n"),
     );
 
-    // Stop the subagent — its E grant releases (row goes INVALID); the row
-    // is still touched, rendered without a flag.
+    // Stop the subagent — its E grant releases to a read (row goes SHARED),
+    // so it renders as a held SHARED grant, byte-identical to Python.
     await post("/hooks/session-stop", { session_id: SID_A, agent_id: "worker-1" });
     const r2 = await post("/hooks/session-start", { session_id: SID_A });
     assert.equal(
@@ -404,7 +404,7 @@ test("session-start: parent lines first, then subagent group under its prefix; r
         SS_HEADER,
         "At compaction you held SHARED on CLAUDE.md (v1) — re-acquire before writing.",
         "Subagent worker-1:",
-        "plan.md is at v1.",
+        "At compaction you held SHARED on plan.md (v1) — re-acquire before writing.",
         SS_CLOSING,
       ].join("\n"),
     );
@@ -640,11 +640,11 @@ test("session-start: agent_id registers the subagent but the payload stays SESSI
 
 // ------------------------------------------------------- degraded build
 
-test("session-start: a failed build answers {} , leaves the flag unarmed, and breadcrumbs (KTD7)", async () => {
+test("session-start: a failed build answers the failure envelope, leaves the flag unarmed, and logs it (#214)", async () => {
   const tmp = mkdtempSync(join(tmpdir(), "session-start-degraded-"));
   const realRegistry = new ArtifactRegistry(join(tmp, ".coherence", "state.db"));
   // Only the builder's batched read explodes; every other registry call
-  // behaves, so the failure is the handler's guard and nothing else.
+  // behaves, so the failure is the build and nothing else.
   const exploding = new Proxy(realRegistry, {
     get(target, prop, receiver) {
       if (prop === "allStateMaps") {
@@ -688,13 +688,15 @@ test("session-start: a failed build answers {} , leaves the flag unarmed, and br
       },
       body: JSON.stringify({ session_id: SID_A }),
     });
+    // The Python coordinator's answer to a raised build (its session-start
+    // work has no try); {} remains its answer to a watchdog timeout only.
     assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), {});
+    assert.deepEqual(await res.json(), { ok: false, reason: "internal: Error" });
     // Never armed: nothing was built, so there is nothing to deliver later.
     assert.equal(sessions.consumeCompactPending(SID_A), false);
     const stderr = captured.join("");
-    assert.ok(stderr.includes("session-start build failed"));
-    // The degraded exit returns BEFORE the R8 breadcrumb — a build that
+    assert.ok(stderr.includes("allStateMaps exploded"));
+    // The failed build exits BEFORE the R8 breadcrumb — a build that
     // could not read the workspace must not claim what it holds.
     assert.ok(!stderr.includes("never-seen session"));
   } finally {

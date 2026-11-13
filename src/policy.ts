@@ -8,7 +8,9 @@
  *
  * Per KTD-L: DECISIONS.md is included in the default tracked set as of
  * v0.1.1 (operator-rulings append-only ledger pattern surfaced by
- * kcarriedo in anthropics/claude-code#59309).
+ * kcarriedo in anthropics/claude-code#59309). The Python coordinator's
+ * defaults do not include it, so it is a Node-only default; the README's
+ * Known limitations say so (#228).
  *
  * KTD-A.5 point 4: YAML file locking interop with the Python coordinator
  * requires fd-level POSIX flock(2), NOT proper-lockfile's sidecar-lock
@@ -16,16 +18,63 @@
  * happen via `/policy/track` + `/policy/untrack` endpoints landing in
  * Unit 3 / Unit 6); this module is read-only at the registry layer for now.
  *
- * Cross-language glob semantics: hand-rolled regex translation mirrors
- * Python's _glob_match exactly — `*` matches within a path segment,
- * `**` matches zero-or-more segments, `?` matches a single non-slash char.
- * fnmatch's fnmatchcase semantics; KTD-B.3 C5 prefix contract applies to
- * the parity scenarios that cover policy decisions.
+ * Glob semantics are the Python coordinator's two grammars. A pattern
+ * containing `**` (`globTokens`): `**` matches zero-or-more segments (a `/`
+ * after it is swallowed), `*` matches within a path segment, `?` matches a
+ * single non-slash char, and every other character, `[` included, is literal.
+ * A pattern without `**` is matched as `fnmatch.fnmatchcase` matches it
+ * (`fnmatchMatcher`, #209): `*` and `?` cross `/`, and `[...]` is a character
+ * class. KTD-B.3 C5 prefix contract applies to the parity scenarios that cover
+ * policy decisions.
+ *
+ * A strict path stays enforced for the coordinator's lifetime
+ * (Cohexa-ai/agent-coherence#261): strict wins over ignore (`isTracked`), a hot
+ * reload never drops a strict or user-added pattern while strict patterns are
+ * live (`reloaded`), and `/policy/untrack` refuses an entry that covers a strict
+ * path (`strictPatternsCovering`). The one way to stop enforcing a strict path
+ * is to restart the coordinator without its strict entry.
+ *
+ * On a disk that folds names (`caseless`, `nfd`), a file name matches a
+ * pattern when any of three readings does: the pattern as written against the
+ * name as requested, tidied; the pattern as written against the spelling the
+ * disk stores, when the coordinator has one; and the pattern folded
+ * (`foldGlobLiterals`: literal characters folded where they stand, each class
+ * made to accept the fold of every character it accepts) against the folded
+ * name. A disk that folds nothing uses the first reading alone, so folding
+ * only ever adds matches. A key, a name that is not a workspace file, is
+ * matched as requested only.
  */
 import { randomBytes } from "node:crypto";
-import { readFileSync, statSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
-import { join, dirname, basename } from "node:path";
+import { writeFileSync, renameSync, mkdirSync, rmSync, lstatSync, realpathSync, type Stats } from "node:fs";
+import { join, dirname, basename, isAbsolute, relative, sep } from "node:path";
 import { dump as yamlDump, load as yamlLoad, type YAMLException } from "js-yaml";
+import { NOT_REGULAR, readRegularFile } from "./disk_content.js";
+import {
+  exceedsFoldLimit,
+  foldOneCodePoint,
+  policyFold,
+  policyFoldText,
+  singleFoldPreimages,
+  tidyPath,
+  type FoldingProfile,
+  type FoldProfile,
+} from "./path_fold.js";
+
+export type NameKind = "file" | "key";
+
+/**
+ * What the coordinator knows about a name it asks the policy about: the fold
+ * profile of the workspace disk, whether the name is a file or a key, and, for
+ * a file, the spelling the disk stores it under (relative to the workspace
+ * root) when it has one.
+ */
+export interface PolicyMatchContext {
+  readonly profile: FoldProfile;
+  readonly kind: NameKind;
+  readonly diskSpelling?: string;
+}
+
+export const UNFOLDED_FILE: PolicyMatchContext = { profile: "none", kind: "file" };
 
 /** Mirror of Python coordinator_server.MAX_POLICY_PATHS_PER_REQUEST. */
 export const MAX_POLICY_PATHS_PER_REQUEST = 20;
@@ -59,6 +108,21 @@ export function validatePolicyPath(path: string): string | null {
   return null;
 }
 
+/** A track or untrack request's paths, split by `validatePolicyPath`, in request order. */
+export function partitionPolicyPaths(paths: ReadonlyArray<string>): {
+  valid: string[];
+  rejected: Array<{ path: string; reason: string }>;
+} {
+  const valid: string[] = [];
+  const rejected: Array<{ path: string; reason: string }> = [];
+  for (const path of paths) {
+    const reason = validatePolicyPath(path);
+    if (reason === null) valid.push(path);
+    else rejected.push({ path, reason });
+  }
+  return { valid, rejected };
+}
+
 /**
  * Default tracked patterns (Unit 2 commit 4 + KTD-L).
  *
@@ -87,7 +151,20 @@ export interface PolicySummary {
   default_pattern_count: number;
   user_added_pattern_count: number;
   ignored_pattern_count: number;
+  strict_mode_pattern_count: number;
   rejected_pattern_count: number;
+}
+
+/**
+ * The four pattern lists the operator view publishes, under the names the
+ * Python coordinator's operator view uses. A rejected pattern is in none of
+ * them; it shows only in `PolicySummary.rejected_pattern_count`.
+ */
+export interface PolicyPatternLists {
+  tracked_patterns: ReadonlyArray<string>;
+  user_added_patterns: ReadonlyArray<string>;
+  ignored_patterns: ReadonlyArray<string>;
+  strict_mode_patterns: ReadonlyArray<string>;
 }
 
 export interface RejectedPattern {
@@ -102,6 +179,15 @@ export class TrackedArtifactPolicy {
   readonly userAddedPatterns: ReadonlyArray<string>;
   readonly strictModePaths: ReadonlyArray<string>;
   readonly rejectedPatterns: ReadonlyArray<RejectedPattern>;
+  // What the strict-coverage check reads from the strict and tracked
+  // patterns as written, built once: an untrack request and the spawn
+  // diagnostic decide every entry against the same patterns. The folded
+  // patterns a folding disk adds are built on first use, per profile.
+  private readonly coverage: CoverageView;
+  private readonly foldedCoverage = new Map<FoldingProfile, CoverageView>();
+  // Patterns already logged as reaching their files through a link, shared
+  // with every policy reloaded from this one so each is logged once.
+  private readonly linkedPrefixesLogged: Set<string>;
 
   private constructor(args: {
     coordinatorRoot: string;
@@ -110,6 +196,7 @@ export class TrackedArtifactPolicy {
     userAddedPatterns: ReadonlyArray<string>;
     strictModePaths: ReadonlyArray<string>;
     rejectedPatterns: ReadonlyArray<RejectedPattern>;
+    linkedPrefixesLogged: Set<string>;
   }) {
     this.coordinatorRoot = args.coordinatorRoot;
     this.trackedPatterns = args.trackedPatterns;
@@ -117,14 +204,34 @@ export class TrackedArtifactPolicy {
     this.userAddedPatterns = args.userAddedPatterns;
     this.strictModePaths = args.strictModePaths;
     this.rejectedPatterns = args.rejectedPatterns;
+    this.linkedPrefixesLogged = args.linkedPrefixesLogged;
+    this.coverage = this.buildCoverage("none");
   }
 
   /**
    * Load policy: defaults + .coherence/tracked.yaml opt-in +
    * .coherence/ignored.yaml opt-out + .coherence/strict_mode.yaml
-   * strict opt-in (zero-Python Unit 6; mirrors Python policy.py).
+   * strict opt-in (zero-Python Unit 6; mirrors Python policy.py). Names, once
+   * at spawn, any ignored pattern that strict overrides (#261), and logs each
+   * pattern whose literal directories pass through a link.
    */
   static load(coordinatorRoot: string): TrackedArtifactPolicy {
+    const policy = TrackedArtifactPolicy.read(coordinatorRoot, new Set());
+    policy.logLinkedPrefixes();
+    const overridden = policy.ignoredPatternsOverriddenByStrict();
+    if (overridden.length > 0) {
+      process.stderr.write(
+        `agent-coherence: WARNING — ignored pattern(s) ${overridden.join(", ")} cover paths in ` +
+          `strict mode; strict wins, so those paths stay tracked and enforced. To stop enforcing ` +
+          `a strict path, remove its entry from .coherence/strict_mode.yaml and restart the ` +
+          `coordinator.\n`,
+      );
+    }
+    return policy;
+  }
+
+  /** Read the policy files, without `load`'s spawn-time diagnostic. */
+  private static read(coordinatorRoot: string, linkedPrefixesLogged: Set<string>): TrackedArtifactPolicy {
     const rejected: RejectedPattern[] = [];
     const added = loadYamlPatterns(join(coordinatorRoot, ".coherence", "tracked.yaml"), rejected);
     const ignored = loadYamlPatterns(join(coordinatorRoot, ".coherence", "ignored.yaml"), rejected);
@@ -136,38 +243,247 @@ export class TrackedArtifactPolicy {
       userAddedPatterns: added,
       strictModePaths: strict,
       rejectedPatterns: rejected,
+      linkedPrefixesLogged,
     });
   }
 
   /**
-   * v0.2 KTD-O (Node port): a path is in strict mode iff it is TRACKED and
-   * matches at least one strict_mode_paths glob. Intersection semantics —
-   * strict never applies to untracked paths. Empty strict_mode_paths
-   * short-circuits to false (v0.1.1 warn-only behavior preserved).
+   * Re-read the policy files for a hot reload (`/policy/track`,
+   * `/policy/untrack`) without narrowing strict enforcement (#261). Ignored
+   * patterns come from disk as they are; they cannot untrack a strict path
+   * anyway. While this policy has strict patterns, every strict and user-added
+   * pattern it carries is kept even if the file no longer lists it — strict
+   * mode needs both — so a hand-edited strict_mode.yaml or tracked.yaml
+   * followed by any track or untrack cannot end enforcement mid-run. Additions
+   * on disk still apply. Without strict patterns the files are read verbatim.
+   * A pattern that newly reaches its files through a link is logged.
    */
-  isStrictMode(parentRelativePath: string): boolean {
+  reloaded(): TrackedArtifactPolicy {
+    const next = this.mergedWith(TrackedArtifactPolicy.read(this.coordinatorRoot, this.linkedPrefixesLogged));
+    next.logLinkedPrefixes();
+    return next;
+  }
+
+  private mergedWith(fresh: TrackedArtifactPolicy): TrackedArtifactPolicy {
+    if (this.strictModePaths.length === 0) return fresh;
+    return new TrackedArtifactPolicy({
+      coordinatorRoot: fresh.coordinatorRoot,
+      trackedPatterns: fresh.trackedPatterns,
+      ignoredPatterns: fresh.ignoredPatterns,
+      userAddedPatterns: union(this.userAddedPatterns, fresh.userAddedPatterns),
+      strictModePaths: union(this.strictModePaths, fresh.strictModePaths),
+      rejectedPatterns: fresh.rejectedPatterns,
+      linkedPrefixesLogged: this.linkedPrefixesLogged,
+    });
+  }
+
+  private matchesTracked(name: NameReadings): boolean {
+    return readingsMatch(name, this.trackedPatterns) || readingsMatch(name, this.userAddedPatterns);
+  }
+
+  private matchesStrict(name: NameReadings): boolean {
+    return readingsMatch(name, this.strictModePaths);
+  }
+
+  /**
+   * The strict and tracked patterns the coverage search reads under
+   * `profile`: as written for `none`, folded (`foldGlobLiterals`) for a
+   * folding profile. Each glob reports the pattern as written.
+   */
+  private buildCoverage(profile: FoldProfile): CoverageView {
+    const globFor = (pattern: string): Glob =>
+      profile === "none"
+        ? globOf(pattern)
+        : globOf(foldPolicyPattern(pattern, profile), pattern, FOLDED_CLASS_MEMBER_LIMIT);
+    return {
+      // A literal strict path no tracked pattern reaches puts nothing in
+      // strict mode (an intersection), so no entry can cover it.
+      strict: this.strictModePaths
+        .filter((p) => !isLiteralGlob(p) || this.matchesTracked(literalReadings(p, profile)))
+        .map(globFor),
+      tracked: union(this.userAddedPatterns, this.trackedPatterns).map(globFor),
+    };
+  }
+
+  private foldedCoverageView(profile: FoldingProfile): CoverageView {
+    let view = this.foldedCoverage.get(profile);
+    if (view === undefined) {
+      view = this.buildCoverage(profile);
+      this.foldedCoverage.set(profile, view);
+    }
+    return view;
+  }
+
+  /**
+   * Log, once, each tracked or strict pattern whose literal segments pass
+   * through a link inside the workspace, a fully literal pattern's last one
+   * included: the hook client follows a link, so its Read, Edit and Write
+   * reach the coordinator under the target's path, which a pattern written
+   * against the link's path does not match. An ignored pattern that misses
+   * only leaves more coordinated, so ignored patterns are not checked.
+   */
+  private logLinkedPrefixes(): void {
+    const labelled: Array<[string, string]> = [
+      ...union(this.trackedPatterns, this.userAddedPatterns).map((p): [string, string] => ["tracked", p]),
+      ...this.strictModePaths.map((p): [string, string] => ["strict", p]),
+    ];
+    for (const [label, pattern] of labelled) {
+      if (this.linkedPrefixesLogged.has(pattern)) continue;
+      const link = firstLinkedSegment(this.coordinatorRoot, literalSegments(pattern));
+      if (link === undefined) continue;
+      this.linkedPrefixesLogged.add(pattern);
+      const subject = `${label} pattern ${JSON.stringify(pattern)}`;
+      const target = linkTargetOf(this.coordinatorRoot, link);
+      process.stderr.write(`${linkedPatternMessage(subject, link, target)}\n`);
+    }
+  }
+
+  /**
+   * v0.2 KTD-O (Node port): a path is in strict mode iff it is TRACKED (a
+   * default or user-added pattern) and matches at least one strict_mode_paths
+   * glob. Intersection semantics — strict never applies to a path no tracked
+   * pattern matches. An ignored pattern does not take a path out of strict
+   * mode (see `isTracked`). Empty strict_mode_paths short-circuits to false.
+   * Every pattern meets the name under each of its readings (`readingsOf`);
+   * without a context the name is a file on a disk that folds nothing.
+   */
+  isStrictMode(parentRelativePath: string, context: PolicyMatchContext = UNFOLDED_FILE): boolean {
     if (this.strictModePaths.length === 0) return false;
-    if (!this.isTracked(parentRelativePath)) return false;
-    const normalized = normalizeRelative(parentRelativePath);
-    if (normalized === null) return false;
-    return this.strictModePaths.some((p) => globMatch(normalized.replace(/\\/g, "/"), p));
+    const name = readingsOf(parentRelativePath, context);
+    if (name === null) return false;
+    return this.matchesTracked(name) && this.matchesStrict(name);
   }
 
   /**
    * Return true if the given parent-repo-relative path is coordinated.
    * Algorithm: path is tracked if it matches any default OR user-added
-   * pattern, AND does not match any ignored pattern. Ignore wins ties.
+   * pattern, AND does not match any ignored pattern — unless it also matches a
+   * strict pattern: strict wins over ignore (#261). An ignore pattern, however
+   * broad (`**`) and however it arrived (a leftover ignored.yaml at spawn or
+   * `/policy/untrack` at runtime), never drops a strict path onto the
+   * untracked fast path, where a read reports version 0 and a CAS commit is
+   * accepted at any expected version. For every path no strict pattern
+   * matches, ignore wins ties as before. Tracked, ignored and strict patterns
+   * all meet the name under the same readings, so a spelling that an ignored
+   * pattern reaches is still held by a strict pattern that reaches any other.
    */
-  isTracked(parentRelativePath: string): boolean {
-    const normalized = normalizeRelative(parentRelativePath);
-    if (normalized === null) return false;
+  isTracked(parentRelativePath: string, context: PolicyMatchContext = UNFOLDED_FILE): boolean {
+    const name = readingsOf(parentRelativePath, context);
+    if (name === null) return false;
+    if (!this.matchesTracked(name)) return false;
+    if (!readingsMatch(name, this.ignoredPatterns)) return true;
+    return this.matchesStrict(name);
+  }
 
-    const tracked =
-      matchesAny(normalized, this.trackedPatterns) ||
-      matchesAny(normalized, this.userAddedPatterns);
-    if (!tracked) return false;
-    if (matchesAny(normalized, this.ignoredPatterns)) return false;
-    return true;
+  /**
+   * The strict patterns under which `pattern` — a path or a glob, as
+   * `/policy/untrack` receives it — matches at least one path this policy
+   * puts in strict mode: some path matches `pattern`, a strict pattern and a
+   * tracked (default or user-added) pattern at once.
+   *
+   * Decided on the glob languages themselves, so an entry spelled differently
+   * from the strict pattern is still caught: `data/**` and `**` both cover a
+   * strict `data/*.json`. A literal strict path is decided exactly by matching
+   * it. A strict glob is decided by a product search (`globsIntersect`) on its
+   * own budget of `globIntersectBudgets.pattern` steps, drawn from one
+   * `globIntersectBudgets.call` for the entry. Running out errs toward
+   * "covers" (a refusal, never a silent untrack): a strict glob whose own
+   * budget runs out counts as covered, and once the entry's budget runs out so
+   * does every strict pattern not yet decided and not ruled out by literal
+   * prefixes and suffixes. Empty when no strict path is covered.
+   *
+   * On a folding `profile` the search runs as written first, then again with
+   * both sides folded (`foldGlobLiterals`) for each strict pattern not yet
+   * covered, under the same budgets.
+   */
+  strictPatternsCovering(pattern: string, profile: FoldProfile = "none"): string[] {
+    return this.strictPatternsCoveringEach([pattern], profile)[0]!;
+  }
+
+  /**
+   * `strictPatternsCovering` for each of `patterns`, in order: one
+   * `/policy/untrack` request, decided under one `globIntersectBudgets.request`
+   * so its cost is bounded however many entries it carries. Each entry still
+   * has its own `globIntersectBudgets.call`. Once the request's budget runs
+   * out, every later entry counts as covering each strict pattern its literal
+   * ends do not rule out, so a request of costly entries is refused rather
+   * than held past the client's timeout.
+   */
+  strictPatternsCoveringEach(patterns: ReadonlyArray<string>, profile: FoldProfile = "none"): string[][] {
+    const requestBudget = new SearchBudget(globIntersectBudgets.request);
+    return patterns.map((p) =>
+      this.strictPatternsCoveringWithin(p, new SearchBudget(globIntersectBudgets.call, requestBudget), profile),
+    );
+  }
+
+  /**
+   * Ignored patterns that cover a strict path, which strict therefore
+   * overrides (`isTracked`). Reported once at `load` (spawn), not on hot
+   * reloads. Every entry is decided under one `globIntersectBudgets.diagnostic`,
+   * so a large or pathological ignored.yaml cannot hold up the spawn, and an
+   * entry stops at the first strict pattern it covers. Once the budget runs
+   * out, the remaining entries a strict pattern might cover are reported,
+   * erring toward the warning.
+   */
+  ignoredPatternsOverriddenByStrict(): string[] {
+    if (this.coverage.strict.length === 0) return [];
+    const search = { tracked: this.coverage.tracked, budget: new SearchBudget(globIntersectBudgets.diagnostic) };
+    return this.ignoredPatterns.filter((p) => {
+      const entry = entryGlob(p);
+      return this.coverage.strict.some((strict) => this.entryCoversStrict(entry, strict, search));
+    });
+  }
+
+  private strictPatternsCoveringWithin(pattern: string, callBudget: SearchBudget, profile: FoldProfile): string[] {
+    if (this.strictModePaths.length === 0) return [];
+    const covered = this.coveredIn(this.coverage, entryGlob(pattern), callBudget);
+    if (profile === "none") return covered;
+    // A name still matches a pattern as written, so the search as written
+    // keeps every refusal it makes; the folded search only adds refusals.
+    const folded = this.foldedCoverageView(profile);
+    const undecided = { ...folded, strict: folded.strict.filter((s) => !covered.includes(s.source)) };
+    const reported = new Set([...covered, ...this.coveredIn(undecided, entryGlob(pattern, profile), callBudget)]);
+    return this.strictModePaths.filter((p) => reported.has(p));
+  }
+
+  private coveredIn(view: CoverageView, entry: Glob, budget: SearchBudget): string[] {
+    const search = { tracked: view.tracked, budget };
+    return view.strict.filter((strict) => this.entryCoversStrict(entry, strict, search)).map((s) => s.source);
+  }
+
+  /** Whether `entry` covers a path `strict` puts in strict mode; out of budget counts as covers. */
+  private entryCoversStrict(entry: Glob, strict: Glob, search: CoverageSearch): boolean {
+    // A path both match carries both literal prefixes and suffixes; if they
+    // do not nest, the strict pattern is exactly not covered, at no cost.
+    if (!affixesNest([entry.affixes, strict.affixes])) return false;
+    try {
+      // A literal strict path's language is the one path (tracked: the index
+      // keeps no other), so matching it decides it exactly.
+      return strict.isLiteral
+        ? matchesCharged(entry, strict.pattern, search.budget)
+        : this.strictGlobCovered(entry, strict, search);
+    } catch (err) {
+      if (err instanceof BudgetExhausted) return true;
+      throw err;
+    }
+  }
+
+  private strictGlobCovered(entry: Glob, strict: Glob, search: CoverageSearch): boolean {
+    // Only a tracked pattern whose literal ends nest with the entry's and the
+    // strict glob's can share a path with both; with none, the strict glob is
+    // exactly not covered, at no search cost.
+    const tracked = search.tracked.filter((t) =>
+      affixesNest([entry.affixes, strict.affixes, t.affixes]),
+    );
+    if (tracked.length === 0) return false;
+    // A budget per strict glob, so one costly pattern (or many cheap ones)
+    // never decides the others: a shared budget marks every pattern after the
+    // point it ran out as covering.
+    const budget = new SearchBudget(globIntersectBudgets.pattern, search.budget);
+    return (
+      globsIntersect([entry.tokens, strict.tokens], budget) &&
+      tracked.some((t) => globsIntersect([entry.tokens, strict.tokens, t.tokens], budget))
+    );
   }
 
   summary(): PolicySummary {
@@ -176,7 +492,23 @@ export class TrackedArtifactPolicy {
       default_pattern_count: this.trackedPatterns.length,
       user_added_pattern_count: this.userAddedPatterns.length,
       ignored_pattern_count: this.ignoredPatterns.length,
+      strict_mode_pattern_count: this.strictModePaths.length,
       rejected_pattern_count: this.rejectedPatterns.length,
+    };
+  }
+
+  /**
+   * The patterns this policy enforces, each as written: what a client checks
+   * its own globs against. Not part of `summary()`, whose counts every
+   * `/status` tier carries: a pattern list is the operator's directory
+   * layout, so only the operator view asks for these.
+   */
+  patternLists(): PolicyPatternLists {
+    return {
+      tracked_patterns: this.trackedPatterns,
+      user_added_patterns: this.userAddedPatterns,
+      ignored_patterns: this.ignoredPatterns,
+      strict_mode_patterns: this.strictModePaths,
     };
   }
 }
@@ -186,7 +518,7 @@ export class TrackedArtifactPolicy {
  * live-reloadable (plan Unit 1, "the load-bearing decision for G3").
  *
  * `createServer` captures its deps once by reference; Python re-assigns
- * `coordinator.policy = TrackedArtifactPolicy.load(root)` after every YAML
+ * `coordinator.policy = coordinator.policy.reloaded()` after every YAML
  * append. Node handlers must therefore read the policy THROUGH this ref
  * (never bind the inner TrackedArtifactPolicy), so a `reload()` after an
  * append is immediately visible to live handlers with no restart.
@@ -211,13 +543,13 @@ export class PolicyRef {
   }
 
   /** Convenience passthrough — the hot-path call every hook handler makes. */
-  isTracked(parentRelativePath: string): boolean {
-    return this.current.isTracked(parentRelativePath);
+  isTracked(parentRelativePath: string, context?: PolicyMatchContext): boolean {
+    return this.current.isTracked(parentRelativePath, context);
   }
 
   /** Strict-mode passthrough (Unit 6) — same read-through-the-ref discipline. */
-  isStrictMode(parentRelativePath: string): boolean {
-    return this.current.isStrictMode(parentRelativePath);
+  isStrictMode(parentRelativePath: string, context?: PolicyMatchContext): boolean {
+    return this.current.isStrictMode(parentRelativePath, context);
   }
 
   /** Convenience passthrough for the /status default tier. */
@@ -225,9 +557,23 @@ export class PolicyRef {
     return this.current.summary();
   }
 
-  /** Re-parse the YAML files and swap the snapshot (Python's `coordinator.policy = load(...)`). */
+  /**
+   * The current policy's pattern lists, for the operator view. Read through
+   * the ref on each request, never from the files: a reload keeps every strict
+   * and user-added pattern the running policy enforces, even one the files no
+   * longer list, and the view reports what is enforced.
+   */
+  patternLists(): PolicyPatternLists {
+    return this.current.patternLists();
+  }
+
+  /**
+   * Re-parse the YAML files and swap the snapshot (Python's
+   * `coordinator.policy = coordinator.policy.reloaded()`): a reload never
+   * narrows strict enforcement (`TrackedArtifactPolicy.reloaded`).
+   */
   reload(): void {
-    this.current = TrackedArtifactPolicy.load(this.current.coordinatorRoot);
+    this.current = this.current.reloaded();
   }
 }
 
@@ -246,13 +592,17 @@ export class PolicyRef {
  *   maps to 400. For the last two Python appends anyway, reporting success for
  *   an entry that never takes effect; for an unreadable file it also writes
  *   nothing but answers 500;
+ * - a symlink or anything else that is not a regular file counts as a file it
+ *   cannot read: it is never read through, renamed over or waited on (#248);
  * - byte cap → throws with Python's exact message
  *   (`policy YAML cap of 65536 bytes would be exceeded`) → route maps to 400.
  *
  * Locking note (deliberate divergence from Python's fcntl.flock): all Node
  * writes flow through the single coordinator process whose handlers are
- * synchronous on one event loop, and the pid-file mutex guarantees one
- * coordinator per workspace — so there is no concurrent writer to exclude.
+ * synchronous on one event loop, and the coordinator's lock on server.pid
+ * (coordinator_lock.ts, #217) keeps one coordinator per workspace — so there
+ * is no concurrent writer to exclude. A host that cannot take that lock logs
+ * so at start-up and has no such guarantee.
  * The write itself is tmp-file + atomic rename so a crash cannot leave a
  * torn YAML.
  */
@@ -262,33 +612,13 @@ export function appendPolicyYaml(
 ): { added: string[]; rejected: Array<{ path: string; reason: string }> } {
   mkdirSync(dirname(yamlPath), { recursive: true });
 
-  const candidate: string[] = [];
-  const rejected: Array<{ path: string; reason: string }> = [];
-  for (const p of newPaths) {
-    const reason = validatePolicyPath(p);
-    if (reason !== null) {
-      rejected.push({ path: p, reason });
-      continue;
-    }
-    candidate.push(p);
-  }
+  const { valid: candidate, rejected } = partitionPolicyPaths(newPaths);
   if (candidate.length === 0) {
     return { added: [], rejected };
   }
 
   const name = policyFileName(yamlPath);
-  let existing: string;
-  try {
-    existing = readFileSync(yamlPath, "utf8");
-  } catch (err) {
-    // Only a missing file is empty. Reading any other failure as empty would
-    // rename a file holding just the new entries over every pattern it had.
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT") {
-      throw new Error(`${name} could not be read (${code ?? String(err)}); nothing was written.`);
-    }
-    existing = "";
-  }
+  const existing = readExistingPolicy(yamlPath, name);
   // A file that loads as no entries still loads as none after an append, so
   // the new entry would never apply; refusing is the only true answer.
   const current = readPolicyEntries(existing);
@@ -340,6 +670,30 @@ export function appendPolicyYaml(
     rmSync(tmpPath, { force: true });
   }
   return { added: trulyNew, rejected };
+}
+
+/** The text an append to `yamlPath` starts from, or an error naming `name` that writes nothing. */
+function readExistingPolicy(yamlPath: string, name: string): string {
+  try {
+    return readRegularFile(yamlPath).toString("utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") {
+      throw new Error(
+        `${name} is a symlink; nothing was written. ` +
+          `Replace it with a copy of the file it names, or mount a directory at .coherence.`,
+      );
+    }
+    if (code === NOT_REGULAR) {
+      throw new Error(`${name} could not be read (not a regular file); nothing was written.`);
+    }
+    // Only a missing file is empty. Reading any other failure as empty would
+    // rename a file holding just the new entries over every pattern it had.
+    if (code !== "ENOENT") {
+      throw new Error(`${name} could not be read (${code ?? String(err)}); nothing was written.`);
+    }
+    return "";
+  }
 }
 
 const REWRITE_HINT =
@@ -443,14 +797,25 @@ function unloadableMessage(
 // ----------------------------------------------------------------------
 
 /**
- * Normalize a relative path: strip leading `./`. Returns null if the path
- * is absolute, contains `..` components, or is empty after stripping.
+ * Normalize a relative name for matching. A file is tidied first (`tidyPath`:
+ * repeated `/` and `.` segments dropped, as the kernel reads them), so
+ * `.//data/x.txt` meets the globs `data/x.txt` meets. A key keeps its exact
+ * name. Returns null if the name is absolute, contains `..` components, or is
+ * empty.
+ */
+export function normalizeRelative(p: string, kind: NameKind = "file"): string | null {
+  return stripLeadingDotSlash(kind === "file" ? tidyPath(p) : p);
+}
+
+/**
+ * Strip a leading `./`. Returns null if the path is absolute, contains `..`
+ * components, or is empty after stripping.
  *
  * Note: uses literal `./` prefix strip (NOT trim of `./`) so dotfiles like
  * `.env` and `.gitignore` are unchanged. Mirrors Python's removeprefix fix
  * documented at policy.py:136-140.
  */
-export function normalizeRelative(p: string): string | null {
+function stripLeadingDotSlash(p: string): string | null {
   if (p === "") return null;
   if (p.startsWith("/")) return null;
   const cleaned = p.startsWith("./") ? p.slice(2) : p;
@@ -460,100 +825,1117 @@ export function normalizeRelative(p: string): string | null {
   return cleaned;
 }
 
-function matchesAny(path: string, patterns: ReadonlyArray<string>): boolean {
+function matchesAny(path: string, patterns: ReadonlyArray<string>, patternOf = (p: string) => p): boolean {
   const posixPath = path.replace(/\\/g, "/");
   for (const pattern of patterns) {
-    if (globMatch(posixPath, pattern)) return true;
+    if (globMatch(posixPath, patternOf(pattern))) return true;
+  }
+  return false;
+}
+
+// ----------------------------------------------------------------------
+// The readings a name is matched under
+// ----------------------------------------------------------------------
+
+interface FoldedName {
+  readonly text: string;
+  readonly profile: FoldingProfile;
+}
+
+/** The readings of one name; a pattern any of them matches matches the name. */
+interface NameReadings {
+  /** As requested: tidied for a file, exact for a key. */
+  readonly requested: string;
+  /**
+   * A file as typed, before tidying, when that differs. A file also matches
+   * as typed, so a glob written with `//` or `/./` keeps matching a request
+   * typed the same way.
+   */
+  readonly asTyped?: string;
+  /** As the disk stores it, on a folding disk, when the coordinator has it. */
+  readonly onDisk: string | undefined;
+  /** Folded, on a folding disk, for the pattern folded the same way. */
+  readonly folded: FoldedName | undefined;
+}
+
+/** The readings of `name` under `context`, or null when it is not a relative name. */
+function readingsOf(name: string, context: PolicyMatchContext): NameReadings | null {
+  const requested = normalizeRelative(name, context.kind);
+  if (requested === null) return null;
+  const typed = context.kind === "file" ? stripLeadingDotSlash(name) : null;
+  const asTyped = typed !== null && typed !== requested ? { asTyped: typed } : {};
+  const profile = foldingProfileOf(requested, context);
+  if (profile === undefined) return { requested, ...asTyped, onDisk: undefined, folded: undefined };
+  return {
+    requested,
+    ...asTyped,
+    onDisk: context.diskSpelling,
+    folded: { text: policyFold(requested, profile), profile },
+  };
+}
+
+/**
+ * The profile a name's disk and folded readings apply under, or undefined
+ * when it is read as requested only: a key is an exact name, a disk that
+ * folds nothing keeps every spelling apart in policy as well, and a name over
+ * the fold limit is never folded (the coordinator refuses such a path, so
+ * only a Bash or Grep token gets here, matched as typed).
+ */
+function foldingProfileOf(name: string, context: PolicyMatchContext): FoldingProfile | undefined {
+  if (context.kind === "key" || context.profile === "none") return undefined;
+  return exceedsFoldLimit(name) ? undefined : context.profile;
+}
+
+/**
+ * A literal strict path's readings for the coverage search: as written, the
+ * way the search reads it, and folded where its characters stand.
+ */
+function literalReadings(path: string, profile: FoldProfile): NameReadings {
+  const folded = profile === "none" ? undefined : { text: policyFoldText(path, profile), profile };
+  return { requested: path, onDisk: undefined, folded };
+}
+
+function readingsMatch(name: NameReadings, patterns: ReadonlyArray<string>): boolean {
+  return (
+    matchesAny(name.requested, patterns) ||
+    (name.asTyped !== undefined && matchesAny(name.asTyped, patterns)) ||
+    (name.onDisk !== undefined && matchesAny(name.onDisk, patterns)) ||
+    (name.folded !== undefined && matchesAnyFolded(name.folded, patterns))
+  );
+}
+
+function matchesAnyFolded(name: FoldedName, patterns: ReadonlyArray<string>): boolean {
+  return matchesAny(name.text, patterns, (pattern) => foldPolicyPattern(pattern, name.profile));
+}
+
+// Untrack entries are folded uncached, so a client cannot grow this cache.
+const foldedPolicyPatterns: Record<FoldingProfile, Map<string, string>> = {
+  caseless: new Map(),
+  nfd: new Map(),
+};
+
+function foldPolicyPattern(pattern: string, profile: FoldingProfile): string {
+  const cache = foldedPolicyPatterns[profile];
+  let folded = cache.get(pattern);
+  if (folded === undefined) {
+    folded = foldGlobLiterals(pattern, profile);
+    cache.set(pattern, folded);
+  }
+  return folded;
+}
+
+/**
+ * `pattern` as the folded name meets it: each run of literal characters folded
+ * where it stands, `*` and `?` kept, and, in a pattern without `**`, each
+ * `[...]` class folded (`foldClass`); with `**`, `[` is a literal. No fold
+ * produces `* ? [ ] ! / -`, so the folded pattern parses into the same
+ * wildcards and classes, and the same matcher reads it. Exported so a check
+ * can compare it with the Python coordinator's `_fold_glob_literals`, which
+ * must write the same text.
+ */
+export function foldGlobLiterals(pattern: string, profile: FoldingProfile): string {
+  const chars = Array.from(pattern);
+  const closeAt = nextIndexOf(chars, "]");
+  const hasClasses = !pattern.includes("**");
+  let folded = "";
+  let literal = "";
+  let i = 0;
+  while (i < chars.length) {
+    const c = chars[i]!;
+    const close = hasClasses && c === "[" ? classClose(chars, closeAt, i + 1) : -1;
+    if (c !== "*" && c !== "?" && close < 0) {
+      literal += c;
+      i += 1;
+      continue;
+    }
+    const wildcard = close < 0 ? c : foldClass(chars.slice(i + 1, close), profile);
+    folded += policyFoldText(literal, profile) + wildcard;
+    literal = "";
+    i = close < 0 ? i + 1 : close + 1;
+  }
+  return folded + policyFoldText(literal, profile);
+}
+
+/**
+ * The class with body `body` as the folded name meets it: made to accept the
+ * fold of every character it accepts, since a folded name holds only folded
+ * characters, so a name one of whose spellings the class accepts as written
+ * is accepted folded, and every spelling gets the same answer. A positive
+ * class gains the fold of each member; a negated one keeps only the members
+ * no character outside it folds to, and with none left is `?`, which accepts
+ * any one character, `/` included, as a negated class does. A member whose
+ * fold is several characters adds nothing: a class, like `?`, meets one
+ * character. A class the fold leaves as it was is copied as written, and so,
+ * as a stated limit, is one too wide for the search to list (`readClass`) or
+ * one holding a reversed range, which fnmatch can read otherwise than its
+ * members say.
+ */
+function foldClass(body: ReadonlyArray<string>, profile: FoldingProfile): string {
+  const written = `[${body.join("")}]`;
+  const { negated, members, hasReversedRange } = readClass(body, CLASS_MEMBER_LIMIT);
+  if (members === undefined || hasReversedRange) return written;
+  const folded = negated ? stillRejected(members, profile) : withSingleFolds(members, profile);
+  // Folding only adds members to a positive class and only drops them from a
+  // negated one, so an unchanged size is an unchanged class.
+  if (folded.size === members.size) return written;
+  return folded.size === 0 ? "?" : classText(folded, negated);
+}
+
+function withSingleFolds(members: ReadonlySet<string>, profile: FoldingProfile): Set<string> {
+  const folded = new Set(members);
+  for (const member of members) {
+    const fold = foldOneCodePoint(member, profile);
+    if (fold !== undefined) folded.add(fold);
+  }
+  return folded;
+}
+
+/**
+ * The members a negated class still rejects folded: those no character outside
+ * it folds to, since a folded name holding one is then spelled only with
+ * characters the class rejects as written.
+ */
+function stillRejected(members: ReadonlySet<string>, profile: FoldingProfile): Set<string> {
+  const rejected = [...members].filter((member) =>
+    singleFoldPreimages(member, profile).every((source) => members.has(source)),
+  );
+  return new Set(rejected);
+}
+
+/**
+ * The class of exactly `members`, each listed once and by code point, so both
+ * coordinators write the same text: `]` first, where it is a member and not
+ * the close, and `-` last, where it makes no range. A `!` first would negate
+ * a positive class, so there it goes last before any `-`; a folded class
+ * always holds a fold, never `!`, so another member comes first.
+ */
+function classText(members: ReadonlySet<string>, negated: boolean): string {
+  const rest = [...members].filter((member) => member !== "]" && member !== "-").sort(byCodePoint);
+  const head = members.has("]") ? "]" : "";
+  if (!negated && head === "" && rest[0] === "!") rest.push(rest.shift()!);
+  return `[${negated ? "!" : ""}${head}${rest.join("")}${members.has("-") ? "-" : ""}]`;
+}
+
+function byCodePoint(left: string, right: string): number {
+  return left.codePointAt(0)! - right.codePointAt(0)!;
+}
+
+/**
+ * Whether `path` matches a policy pattern: one with `**` by its tokens (`**`
+ * zero-or-more path segments, `*` zero-or-more chars within a segment, `?`
+ * one non-slash char), one without as fnmatch matches it (`fnmatchMatcher`).
+ */
+// Per-process cache of compiled glob patterns. Hot path: every hook on
+// every tracked-artifact lookup compiles `**` once per session otherwise.
+// ce-review safe_auto fix: pure memoization, no semantic change.
+const compiledGlobs: Map<string, (path: string) => boolean> = new Map();
+
+export function globMatch(path: string, pattern: string): boolean {
+  let matcher = compiledGlobs.get(pattern);
+  if (matcher === undefined) {
+    matcher = compileGlob(pattern);
+    compiledGlobs.set(pattern, matcher);
+  }
+  return matcher(path);
+}
+
+/**
+ * Runs (`*` or `**`) a pattern may hold and still be matched by its regex. The
+ * regex backtracks into every run, so a failing match costs up to the path's
+ * length to the power of its runs: `"**".repeat(12) + "Z"` took 5.9 s on a
+ * 21-character path, and two runs (`**a**Z`) took about 2 s on a
+ * 50,000-character one, which a hook path may be. Every hook matches every
+ * pattern on the coordinator's one thread. A pattern over the limit is
+ * matched by `tokensMatch`, linear in the path; one run, anchored at both
+ * ends, is linear in the regex too.
+ */
+const REGEX_RUN_LIMIT = 1;
+
+function compileGlob(pattern: string): (path: string) => boolean {
+  if (!pattern.includes("**")) return fnmatchMatcher(pattern);
+  const tokens = globTokens(pattern);
+  if (tokens.filter(isRun).length > REGEX_RUN_LIMIT) {
+    return (path) => tokensMatch(tokens, path);
+  }
+  const regex = globRegex(tokens);
+  return (path) => regex.test(path);
+}
+
+/** The backtracking regex `tokens` spell (exported for the differential test). */
+export function globRegex(tokens: ReadonlyArray<Token>): RegExp {
+  return new RegExp("^" + tokens.map(tokenRegex).join("") + "$");
+}
+
+function tokenRegex(token: Token): string {
+  switch (token.kind) {
+    case "any_run":
+      return ".*";
+    case "seg_run":
+      return "[^/]*";
+    case "seg_one":
+      return "[^/]";
+    case "lit":
+      return token.ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    case "all_run":
+    case "any_one":
+    case "class":
+      // Only a pattern with `**` has a regex; `fnmatchMatcher` matches the rest.
+      throw new Error(`a ${token.kind} token has no regex`);
+  }
+}
+
+// ----------------------------------------------------------------------
+// Glob tokens and their automaton
+//
+// A pattern containing `**` is parsed once, into tokens: `**` is any run (a
+// following `/` swallowed), `*` a run without `/`, `?` one character but `/`,
+// and every other character a literal, `[` included. Its regex (`globRegex`),
+// the linear matcher and the strict-coverage search all read them. The regex
+// has no flags, so its `.` stops at a line terminator, its `$` matches only at
+// the end, and it reads UTF-16 code units, as the automaton does; a
+// differential test pins that the two agree.
+//
+// A pattern without `**` is matched as the Python coordinator matches it, by
+// fnmatch (`fnmatchMatcher`). The search reads it through the tokens Python's
+// search reads (`fnmatchSearchTokens`), approximations included, so both
+// coordinators refuse the same untrack entries.
+// ----------------------------------------------------------------------
+
+type Token =
+  | { readonly kind: "any_run" }
+  | { readonly kind: "seg_run" }
+  | { readonly kind: "seg_one" }
+  | { readonly kind: "lit"; readonly ch: string }
+  // Without `**`: `*` is a run of any characters and `?` any one character.
+  | { readonly kind: "all_run" }
+  | { readonly kind: "any_one" }
+  | { readonly kind: "class"; readonly negated: boolean; readonly members: ReadonlySet<string> };
+
+const ANY_RUN: Token = { kind: "any_run" };
+const SEG_RUN: Token = { kind: "seg_run" };
+const SEG_ONE: Token = { kind: "seg_one" };
+const ALL_RUN: Token = { kind: "all_run" };
+const ANY_ONE: Token = { kind: "any_one" };
+
+/** What a regex `.` without the `s` flag does not match. */
+const LINE_TERMINATORS: ReadonlySet<string> = new Set(["\n", "\r", "\u2028", "\u2029"]);
+
+/**
+ * Characters a class may enumerate before the search reads it as any one
+ * character: every member joins the search alphabet, which every explored
+ * state walks. The Python coordinator's `_CLASS_MEMBER_LIMIT`.
+ */
+const CLASS_MEMBER_LIMIT = 64;
+
+/**
+ * Characters a class of a folded pattern (`foldGlobLiterals`) may enumerate.
+ * The fold adds at most one member per member to a class of at most
+ * `CLASS_MEMBER_LIMIT`, so the search still reads a class the fold grew member
+ * by member, as it reads the class as written: read as any one character, it
+ * covered names no spelling of the class holds. The Python coordinator's
+ * `_FOLDED_CLASS_MEMBER_LIMIT`.
+ */
+const FOLDED_CLASS_MEMBER_LIMIT = 2 * CLASS_MEMBER_LIMIT;
+
+/** The tokens the overlap search reads; a pattern with `**` is also matched by them. */
+export function globTokens(pattern: string): Token[] {
+  return tokensWithin(pattern, CLASS_MEMBER_LIMIT);
+}
+
+/**
+ * `globTokens` with a class of up to `memberLimit` members listed. Not an
+ * optional parameter of `globTokens`, which callers pass to `map`: the index
+ * would become the limit.
+ */
+function tokensWithin(pattern: string, memberLimit: number): Token[] {
+  return pattern.includes("**") ? doubleStarTokens(pattern) : fnmatchSearchTokens(pattern, memberLimit);
+}
+
+function doubleStarTokens(pattern: string): Token[] {
+  const tokens: Token[] = [];
+  let i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i]!;
+    if (c === "*" && pattern[i + 1] === "*") {
+      tokens.push(ANY_RUN);
+      i += 2;
+      if (pattern[i] === "/") i += 1;
+    } else if (c === "*") {
+      tokens.push(SEG_RUN);
+      i += 1;
+    } else if (c === "?") {
+      tokens.push(SEG_ONE);
+      i += 1;
+    } else {
+      tokens.push({ kind: "lit", ch: c });
+      i += 1;
+    }
+  }
+  return tokens;
+}
+
+/**
+ * The search's tokens for a pattern without `**`, a port of the Python
+ * coordinator's `_glob_tokens`, read per code point: `*` any run, `?` any one
+ * character, `[...]` a class, an unterminated `[` a literal. Never used to
+ * match (`fnmatchMatcher` matches): as in Python, a class over `memberLimit`
+ * members reads as any one character, and a reversed range adds no members.
+ * fnmatch drops a reversed range with its two ends and, when a `!` follows
+ * them, reads the rest of the class as negated (a lone `!` as any one
+ * character), so for such a class the search accepts fewer characters than
+ * fnmatch and can miss a refusal, as the Python coordinator's search does.
+ */
+function fnmatchSearchTokens(pattern: string, memberLimit: number): Token[] {
+  const chars = Array.from(pattern);
+  const closeAt = nextIndexOf(chars, "]");
+  const tokens: Token[] = [];
+  let i = 0;
+  while (i < chars.length) {
+    const c = chars[i]!;
+    i += 1;
+    if (c === "*") {
+      tokens.push(ALL_RUN);
+    } else if (c === "?") {
+      tokens.push(ANY_ONE);
+    } else if (c === "[") {
+      const close = classClose(chars, closeAt, i);
+      if (close < 0) {
+        tokens.push({ kind: "lit", ch: "[" });
+        continue;
+      }
+      tokens.push(searchClass(chars.slice(i, close), memberLimit));
+      i = close + 1;
+    } else {
+      tokens.push({ kind: "lit", ch: c });
+    }
+  }
+  return tokens;
+}
+
+/**
+ * Where the class opened just before `start` closes, or -1 when it does not:
+ * fnmatch skips a leading `!`, then a leading `]`, before looking for `]`.
+ */
+function classClose(chars: ReadonlyArray<string>, closeAt: ReadonlyArray<number>, start: number): number {
+  let j = start;
+  if (chars[j] === "!") j += 1;
+  if (chars[j] === "]") j += 1;
+  return closeAt[j]!;
+}
+
+/**
+ * For each index (`chars.length` included), the index of the next `target` at
+ * or after it, or -1. Looking each one up keeps a pattern of many unterminated
+ * `[` linear, where scanning the rest of the pattern for each is quadratic.
+ */
+function nextIndexOf(chars: ReadonlyArray<string>, target: string): number[] {
+  const next = new Array<number>(chars.length + 1).fill(-1);
+  for (let k = chars.length - 1; k >= 0; k--) next[k] = chars[k] === target ? k : next[k + 1]!;
+  return next;
+}
+
+function searchClass(body: ReadonlyArray<string>, memberLimit: number): Token {
+  const { negated, members } = readClass(body, memberLimit);
+  // Any one character accepts more than the class does, never less, in either
+  // polarity (a negated class accepts `/` too): the search errs toward "covers".
+  return members === undefined ? ANY_ONE : { kind: "class", negated, members };
+}
+
+/** A class body as `readClass` reads it. */
+interface ClassReading {
+  readonly negated: boolean;
+  /** The characters it names, or undefined when that is more than the limit. */
+  readonly members: ReadonlySet<string> | undefined;
+  /**
+   * Whether it holds a range from a higher character to a lower one, which
+   * names none here. fnmatch drops such a range together with both its ends,
+   * so a `!` right after it can lead what is left and negate it: fnmatch reads
+   * `[z-a!X]` as `[^X]`, not as the members `!` and `X`.
+   */
+  readonly hasReversedRange: boolean;
+}
+
+/**
+ * A class body, as the Python coordinator's `_read_class` reads it: whether a
+ * leading `!` negates it, and the characters it names, up to `memberLimit`. A
+ * leading `]` is a member, `lo-hi` names every character from lo to hi, and a
+ * `-` that ends the body is a member. The search tokens and the class fold
+ * both read a class here, so they agree on it.
+ */
+function readClass(body: ReadonlyArray<string>, memberLimit: number): ClassReading {
+  const negated = body[0] === "!";
+  const chars = negated ? body.slice(1) : body;
+  const members = new Set<string>();
+  let hasReversedRange = false;
+  let k = 0;
+  while (k < chars.length) {
+    if (k + 2 < chars.length && chars[k + 1] === "-") {
+      const lo = chars[k]!.codePointAt(0)!;
+      const hi = chars[k + 2]!.codePointAt(0)!;
+      if (hi - lo >= memberLimit) return { negated, members: undefined, hasReversedRange };
+      hasReversedRange ||= hi < lo;
+      for (let cp = lo; cp <= hi; cp++) members.add(String.fromCodePoint(cp));
+      k += 3;
+    } else {
+      members.add(chars[k]!);
+      k += 1;
+    }
+    if (members.size > memberLimit) return { negated, members: undefined, hasReversedRange };
+  }
+  return { negated, members, hasReversedRange };
+}
+
+// ----------------------------------------------------------------------
+// fnmatch, for a pattern without `**`
+// ----------------------------------------------------------------------
+
+/** One character of a pattern without `**`, as `re` reads fnmatch's translation of it. */
+type FnmatchChar =
+  | { readonly kind: "lit"; readonly cp: number }
+  | { readonly kind: "any" }
+  | { readonly kind: "set"; readonly negated: boolean; readonly ranges: ReadonlyArray<readonly [number, number]> }
+  | { readonly kind: "never" };
+
+const FN_ANY: FnmatchChar = { kind: "any" };
+const FN_NEVER: FnmatchChar = { kind: "never" };
+const HYPHEN = 0x2d;
+
+/**
+ * Match a pattern without `**` exactly as the Python coordinator's
+ * `fnmatch.fnmatchcase` does, per code point (Python 3.11 to 3.14 agree). The
+ * pattern splits at `*` into fixed runs: the first must start the path, the
+ * last must end it, and each run between sits at its leftmost fit. fnmatch's
+ * regex matches the same paths (each run between stars is an atomic group);
+ * a JavaScript regex has no atomic groups, and backtracking took over a minute
+ * on `*a*a*a*a*a*a*b` against a 100-character path.
+ */
+function fnmatchMatcher(pattern: string): (path: string) => boolean {
+  const runs = fnmatchRuns(pattern);
+  // Literal ends rule most paths out before the path is read as code points.
+  const head = literalText(runs[0]!, false);
+  const tail = literalText(runs[runs.length - 1]!, true);
+  return (path) => path.startsWith(head) && path.endsWith(tail) && fixedRunsMatch(runs, codePointsOf(path));
+}
+
+/** The literal characters a run starts (or, `fromEnd`, ends) with. */
+function literalText(run: ReadonlyArray<FnmatchChar>, fromEnd: boolean): string {
+  const chars: string[] = [];
+  for (const c of fromEnd ? [...run].reverse() : run) {
+    if (c.kind !== "lit") break;
+    chars.push(String.fromCodePoint(c.cp));
+  }
+  return (fromEnd ? chars.reverse() : chars).join("");
+}
+
+// The last path read as code points: `matchesAny` tests one path against every
+// pattern in turn, so it is read once, not once per pattern.
+let lastPath = "";
+let lastCodePoints: number[] = [];
+
+function codePointsOf(path: string): number[] {
+  if (path !== lastPath) {
+    lastPath = path;
+    lastCodePoints = Array.from(path, (c) => c.codePointAt(0)!);
+  }
+  return lastCodePoints;
+}
+
+function fnmatchRuns(pattern: string): FnmatchChar[][] {
+  const chars = Array.from(pattern);
+  const closeAt = nextIndexOf(chars, "]");
+  const runs: FnmatchChar[][] = [[]];
+  let i = 0;
+  while (i < chars.length) {
+    const c = chars[i]!;
+    const run = runs[runs.length - 1]!;
+    i += 1;
+    if (c === "*") {
+      runs.push([]);
+    } else if (c === "?") {
+      run.push(FN_ANY);
+    } else if (c === "[" && classClose(chars, closeAt, i) >= 0) {
+      const close = classClose(chars, closeAt, i);
+      run.push(fnmatchSet(chars, i, close));
+      i = close + 1;
+    } else {
+      run.push({ kind: "lit", cp: c.codePointAt(0)! });
+    }
+  }
+  return runs;
+}
+
+/**
+ * The set `chars[start..end)`, a class body, reads as: a port of
+ * `fnmatch.translate`'s class handling, then of `re`'s reading of what it
+ * writes. `!` first negates, `]` first is a member, `a-z` is a code-point
+ * range, and a reversed range is dropped together with its two ends.
+ */
+function fnmatchSet(chars: ReadonlyArray<string>, start: number, end: number): FnmatchChar {
+  const body = chars.slice(start, end);
+  // The regex text fnmatch writes for the body, one character per entry.
+  let text = body.includes("-") ? rangedSetText(chars, start, end) : body.flatMap(escapeBackslash);
+  text = text.flatMap((c) => ("&~|".includes(c) ? ["\\", c] : [c]));
+  if (text.length === 0) return FN_NEVER;
+  if (text.length === 1 && text[0] === "!") return FN_ANY;
+  const negated = text[0] === "!";
+  if (negated) text = text.slice(1);
+  else if (text[0] === "^" || text[0] === "[") text = ["\\", ...text];
+  return { kind: "set", negated, ranges: mergeRanges(readSetBody(text)) };
+}
+
+/**
+ * `ranges` sorted and merged, so a membership test is a binary search: a
+ * class of thousands of members is tested at every position of every path a
+ * hook matches against it.
+ */
+function mergeRanges(ranges: ReadonlyArray<readonly [number, number]>): Array<readonly [number, number]> {
+  const merged: Array<[number, number]> = [];
+  for (const [lo, hi] of [...ranges].sort((a, b) => a[0] - b[0])) {
+    const last = merged[merged.length - 1];
+    if (last !== undefined && lo <= last[1] + 1) last[1] = Math.max(last[1], hi);
+    else merged.push([lo, hi]);
+  }
+  return merged;
+}
+
+function inRanges(ranges: ReadonlyArray<readonly [number, number]>, cp: number): boolean {
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const [first, last] = ranges[mid]!;
+    if (cp < first) hi = mid - 1;
+    else if (cp > last) lo = mid + 1;
+    else return true;
   }
   return false;
 }
 
 /**
- * Posix-style glob matcher. Supports `**` (zero-or-more path segments),
- * `*` (zero-or-more chars within a segment, no `/`), `?` (one non-slash char).
- * Mirrors Python's _glob_match for KTD-B parity.
+ * `fnmatch.translate` on a class body holding `-`: split it at the hyphens
+ * that make ranges, drop each reversed range by merging its neighbours, and
+ * escape every remaining `\` and `-`.
  */
-// Per-process cache of compiled glob patterns. Hot path: every hook on
-// every tracked-artifact lookup compiles `**` once per session otherwise.
-// ce-review safe_auto fix: pure memoization, no semantic change.
-const compiledGlobs: Map<string, RegExp> = new Map();
-
-export function globMatch(path: string, pattern: string): boolean {
-  let regex = compiledGlobs.get(pattern);
-  if (regex === undefined) {
-    regex = new RegExp("^" + patternToRegex(pattern) + "$");
-    compiledGlobs.set(pattern, regex);
+function rangedSetText(chars: ReadonlyArray<string>, start: number, end: number): string[] {
+  const chunks: string[][] = [];
+  let i = start;
+  let k = chars[start] === "!" ? start + 2 : start + 1;
+  for (;;) {
+    k = indexWithin(chars, "-", k, end);
+    if (k < 0) break;
+    chunks.push(chars.slice(i, k));
+    i = k + 1;
+    k += 3;
   }
-  return regex.test(path);
+  const tail = chars.slice(i, end);
+  if (tail.length > 0) chunks.push(tail);
+  else chunks[chunks.length - 1]!.push("-");
+  return withoutReversedRanges(chunks).flatMap((chunk, m) => [...(m > 0 ? ["-"] : []), ...chunk.flatMap(escapeSetChar)]);
 }
 
-function patternToRegex(pattern: string): string {
-  const out: string[] = [];
-  let i = 0;
-  while (i < pattern.length) {
-    const c = pattern[i];
-    if (c === "*") {
-      if (i + 1 < pattern.length && pattern[i + 1] === "*") {
-        out.push(".*");
-        i += 2;
-        if (i < pattern.length && pattern[i] === "/") {
-          i += 1;
-        }
-      } else {
-        out.push("[^/]*");
-        i += 1;
-      }
-    } else if (c === "?") {
-      out.push("[^/]");
-      i += 1;
+/**
+ * fnmatch's removal of reversed ranges, right to left: where a chunk's last
+ * character is above the next chunk's first, both go and the two chunks
+ * merge. The chunk being merged into is kept reversed, so each merge costs
+ * only the chunk it absorbs; copying the growing chunk on every merge took
+ * seconds on a 64 KiB class.
+ */
+function withoutReversedRanges(chunks: ReadonlyArray<ReadonlyArray<string>>): string[][] {
+  const done: string[][] = [];
+  let merging = [...chunks[chunks.length - 1]!].reverse();
+  for (let m = chunks.length - 1; m > 0; m--) {
+    const before = chunks[m - 1]!;
+    if (before[before.length - 1]!.codePointAt(0)! > merging[merging.length - 1]!.codePointAt(0)!) {
+      merging.pop();
+      for (let k = before.length - 2; k >= 0; k--) merging.push(before[k]!);
     } else {
-      // Escape regex metacharacters.
-      out.push(c!.replace(/[.+^${}()|[\]\\]/g, "\\$&"));
-      i += 1;
+      done.push(merging.reverse());
+      merging = [...before].reverse();
     }
   }
-  return out.join("");
+  done.push(merging.reverse());
+  return done.reverse();
+}
+
+function indexWithin(chars: ReadonlyArray<string>, target: string, from: number, to: number): number {
+  for (let k = from; k < to; k++) if (chars[k] === target) return k;
+  return -1;
+}
+
+function escapeBackslash(c: string): string[] {
+  return c === "\\" ? ["\\", c] : [c];
+}
+
+function escapeSetChar(c: string): string[] {
+  return c === "\\" || c === "-" ? ["\\", c] : [c];
+}
+
+/**
+ * The ranges `re` reads from a set body written by fnmatch, as if a `]`
+ * followed it: an escape is its one literal character, a `]` is a member only
+ * first, and a `-` between two characters makes a range.
+ */
+function readSetBody(text: ReadonlyArray<string>): Array<readonly [number, number]> {
+  const ranges: Array<readonly [number, number]> = [];
+  let p = 0;
+  const atom = (): number => {
+    const c = text[p++]!;
+    return (c === "\\" ? text[p++]! : c).codePointAt(0)!;
+  };
+  while (p < text.length && !(text[p] === "]" && ranges.length > 0)) {
+    const lo = atom();
+    if (text[p] !== "-") {
+      ranges.push([lo, lo]);
+      continue;
+    }
+    p += 1;
+    if (p >= text.length || text[p] === "]") {
+      ranges.push([lo, lo], [HYPHEN, HYPHEN]);
+      break;
+    }
+    ranges.push([lo, atom()]);
+  }
+  return ranges;
+}
+
+/** Whether `path` (code points) holds `runs` as `fnmatchMatcher` describes. */
+function fixedRunsMatch(runs: ReadonlyArray<ReadonlyArray<FnmatchChar>>, path: ReadonlyArray<number>): boolean {
+  const first = runs[0]!;
+  if (runs.length === 1) return path.length === first.length && runFits(first, path, 0);
+  const last = runs[runs.length - 1]!;
+  const lastStart = path.length - last.length;
+  if (lastStart < first.length || !runFits(first, path, 0) || !runFits(last, path, lastStart)) return false;
+  let at = first.length;
+  for (const run of runs.slice(1, -1)) {
+    let fit = at;
+    while (fit + run.length <= lastStart && !runFits(run, path, fit)) fit += 1;
+    if (fit + run.length > lastStart) return false;
+    at = fit + run.length;
+  }
+  return true;
+}
+
+function runFits(run: ReadonlyArray<FnmatchChar>, path: ReadonlyArray<number>, at: number): boolean {
+  return run.every((c, k) => fnmatchCharAccepts(c, path[at + k]!));
+}
+
+function fnmatchCharAccepts(c: FnmatchChar, cp: number): boolean {
+  switch (c.kind) {
+    case "lit":
+      return cp === c.cp;
+    case "any":
+      return true;
+    case "set":
+      return inRanges(c.ranges, cp) !== c.negated;
+    case "never":
+      return false;
+  }
+}
+
+// ----------------------------------------------------------------------
+// The token automaton
+// ----------------------------------------------------------------------
+
+function isRun(token: Token): boolean {
+  return token.kind === "any_run" || token.kind === "seg_run" || token.kind === "all_run";
+}
+
+/**
+ * Whether `token` consumes `ch`; `null` stands for every character no pattern
+ * names (not `/`, not a line terminator).
+ */
+function tokenAccepts(token: Token, ch: string | null): boolean {
+  switch (token.kind) {
+    case "any_run":
+      return ch === null || !LINE_TERMINATORS.has(ch);
+    case "seg_run":
+    case "seg_one":
+      return ch !== "/";
+    case "lit":
+      return ch === token.ch;
+    case "all_run":
+    case "any_one":
+      return true;
+    case "class":
+      return ch === null ? token.negated : token.members.has(ch) !== token.negated;
+  }
+}
+
+/**
+ * Append `state` and every state a run token can skip to from it, keeping
+ * `out` ascending and duplicate-free. States arrive in ascending order and a
+ * run only skips to the next state, so the closure of each is a contiguous
+ * run of states: one already reached adds nothing new.
+ *
+ * The work is proportional to the states produced, never to the pattern's
+ * length: the search charges each step at the states it carries, and a step
+ * that scanned every token let long patterns hold the coordinator's one
+ * thread for seconds within the same budget.
+ */
+function pushClosed(out: number[], state: number, tokens: ReadonlyArray<Token>): void {
+  if (out.length > 0 && state <= out[out.length - 1]!) return;
+  let i = state;
+  out.push(i);
+  while (i < tokens.length && isRun(tokens[i]!)) out.push(++i);
+}
+
+/** The automaton's start: state 0 and every state its leading runs skip to. */
+function startStates(tokens: ReadonlyArray<Token>): number[] {
+  const out: number[] = [];
+  pushClosed(out, 0, tokens);
+  return out;
+}
+
+/** The states after reading `ch` from the ascending `states`, ascending. */
+function advance(states: ReadonlyArray<number>, tokens: ReadonlyArray<Token>, ch: string | null): number[] {
+  const out: number[] = [];
+  for (const i of states) {
+    if (i >= tokens.length || !tokenAccepts(tokens[i]!, ch)) continue;
+    pushClosed(out, isRun(tokens[i]!) ? i : i + 1, tokens);
+  }
+  return out;
+}
+
+/**
+ * Whether `path` matches the tokens of a pattern with `**` exactly as their
+ * regex does, in time linear in the path: the automaton stepped one code unit
+ * at a time, never backtracking. Each step is charged to `budget`, when one
+ * is given, at the size of the state it leaves.
+ */
+export function tokensMatch(tokens: ReadonlyArray<Token>, path: string, budget?: SearchBudget): boolean {
+  let states = startStates(tokens);
+  for (let i = 0; i < path.length; i++) {
+    if (budget !== undefined) charge(budget, 1 + states.length);
+    states = advance(states, tokens, path[i]!);
+    if (states.length === 0) return false;
+  }
+  return states.includes(tokens.length);
+}
+
+// ----------------------------------------------------------------------
+// Bounded overlap search (strict coverage, #261)
+// ----------------------------------------------------------------------
+
+/**
+ * Search steps the strict-coverage decisions may take. A step is one
+ * automaton state carried across one character, so the cost is bounded
+ * whatever the patterns' alphabet. Mutable so tests can lower them.
+ *
+ * - `pattern`: one strict glob, before it counts as covered.
+ * - `call`: one untrack entry, across every strict pattern.
+ * - `request`: one `/policy/untrack` request, across its entries.
+ * - `diagnostic`: the spawn-time override warning, across every ignored entry.
+ *
+ * The values are the Python coordinator's (`policy.py`).
+ */
+export const globIntersectBudgets = {
+  pattern: 200_000,
+  call: 2_000_000,
+  request: 4_000_000,
+  diagnostic: 2_000_000,
+};
+
+/** A bounded glob search ran out of steps; every caller counts it as "covers". */
+export class BudgetExhausted extends Error {
+  constructor() {
+    super("glob search budget exhausted");
+  }
+}
+
+/** Search steps left, drawn from `parent` too when one is given. */
+export class SearchBudget {
+  remaining: number;
+  private readonly parent: SearchBudget | undefined;
+
+  constructor(steps: number, parent?: SearchBudget) {
+    this.remaining = steps;
+    this.parent = parent;
+  }
+
+  spend(steps: number): void {
+    this.remaining -= steps;
+    if (this.remaining < 0) throw new BudgetExhausted();
+    this.parent?.spend(steps);
+  }
+}
+
+let automatonSteps = 0;
+
+/** Steps every charged search and match has taken in this process (for tests). */
+export function automatonStepsTaken(): number {
+  return automatonSteps;
+}
+
+function charge(budget: SearchBudget, steps: number): void {
+  automatonSteps += steps;
+  budget.spend(steps);
+}
+
+/** A pattern with what the strict-coverage check reads from it. */
+interface Glob {
+  /** The text searched and matched: the pattern as written, or folded. */
+  readonly pattern: string;
+  /** The pattern as written, which the coverage check reports. */
+  readonly source: string;
+  readonly tokens: ReadonlyArray<Token>;
+  readonly affixes: readonly [string, string];
+  /**
+   * True when the pattern has no `*`, `?` or `[`, so it matches one path,
+   * itself: the Python coordinator's test, made on the text, so a pattern with
+   * an unterminated `[` is searched as a glob there and here.
+   */
+  readonly isLiteral: boolean;
+  /** `globMatch` for a pattern without `**`, compiled on first use, uncached beyond this glob. */
+  readonly fnmatches: (path: string) => boolean;
+}
+
+function globOf(pattern: string, source = pattern, memberLimit = CLASS_MEMBER_LIMIT): Glob {
+  const tokens = tokensWithin(pattern, memberLimit);
+  let matcher: ((path: string) => boolean) | undefined;
+  return {
+    pattern,
+    source,
+    tokens,
+    affixes: literalAffixes(tokens),
+    isLiteral: isLiteralGlob(pattern),
+    fnmatches: (path) => (matcher ??= fnmatchMatcher(pattern))(path),
+  };
+}
+
+function isLiteralGlob(pattern: string): boolean {
+  return !/[*?[]/.test(pattern);
+}
+
+interface CoverageView {
+  readonly strict: ReadonlyArray<Glob>;
+  readonly tracked: ReadonlyArray<Glob>;
+}
+
+interface CoverageSearch {
+  readonly tracked: ReadonlyArray<Glob>;
+  readonly budget: SearchBudget;
+}
+
+/**
+ * Whether `path` matches `entry`, charged to `budget` as the Python
+ * coordinator charges it: a pattern with `**` per automaton step, one without
+ * one step per character, since fnmatch is linear in the path.
+ */
+function matchesCharged(entry: Glob, path: string, budget: SearchBudget): boolean {
+  if (entry.pattern.includes("**")) return tokensMatch(entry.tokens, path, budget);
+  charge(budget, 1 + Array.from(path).length);
+  return entry.fnmatches(path);
+}
+
+/**
+ * An untrack entry as a glob. Paths are matched with a leading "./" stripped
+ * (`normalizeRelative`), so an entry spelled that way names the same paths.
+ * The entry is not tidied, so the search reads it as written. On a
+ * folding `profile` it is folded (`foldGlobLiterals`), as the strict and
+ * tracked patterns it is searched against are.
+ */
+function entryGlob(pattern: string, profile: FoldProfile = "none"): Glob {
+  const entry = stripLeadingDotSlash(pattern) ?? pattern;
+  return profile === "none"
+    ? globOf(entry)
+    : globOf(foldGlobLiterals(entry, profile), entry, FOLDED_CLASS_MEMBER_LIMIT);
+}
+
+// ----------------------------------------------------------------------
+// Patterns whose literal segments pass through a link
+// ----------------------------------------------------------------------
+
+/**
+ * The literal segments of `pattern` a link can sit on: its literal
+ * directories, and its last segment as well when the whole pattern is
+ * literal, since that segment then names one entry, which can be a link to a
+ * file.
+ */
+function literalSegments(pattern: string): string[] {
+  const segments = literalRun(globTokens(pattern)).split("/");
+  const named = isLiteralGlob(pattern) ? segments : segments.slice(0, -1);
+  return named.filter((segment) => segment !== "" && segment !== ".");
+}
+
+function firstLinkedSegment(root: string, segments: ReadonlyArray<string>): string | undefined {
+  for (let depth = 1; depth <= segments.length; depth++) {
+    const prefix = segments.slice(0, depth).join("/");
+    const stats = lstatIfReadable(join(root, prefix));
+    if (stats?.isSymbolicLink()) return prefix;
+    // Past a missing entry or a file, no link further down is on any path.
+    if (stats === undefined || !stats.isDirectory()) return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Resolvers in the order the hook client tries them: links followed with the
+ * typed case kept, then the disk's own spelling for a path the first leaves
+ * outside the root.
+ */
+const LINK_RESOLVERS: ReadonlyArray<(path: string) => string> = [
+  (path) => realpathSync(path),
+  (path) => realpathSync.native(path),
+];
+
+/**
+ * The workspace path the hook client sends for `link`: its target's path
+ * relative to the root, null when the target is outside the workspace (the
+ * client then sends nothing), or undefined when the link does not resolve.
+ */
+function linkTargetOf(root: string, link: string): string | null | undefined {
+  for (const realpath of LINK_RESOLVERS) {
+    let target: string;
+    try {
+      target = relative(realpath(root), realpath(join(root, link)));
+    } catch {
+      return undefined;
+    }
+    if (target !== ".." && !target.startsWith(`..${sep}`) && !isAbsolute(target)) return target;
+  }
+  return null;
+}
+
+/** The log line for a pattern (`subject`) that passes through `link`, by where its target lies. */
+function linkedPatternMessage(subject: string, link: string, target: string | null | undefined): string {
+  const head = `agent-coherence: ${subject} goes through the link ${JSON.stringify(link)}`;
+  if (target === null) {
+    return (
+      `${head}, whose target is outside the workspace. A Read, Edit or Write through it is not ` +
+      `coordinated at all: the hook client sends nothing for a path outside the workspace, so no ` +
+      `rewrite of this entry covers them.`
+    );
+  }
+  if (target === undefined) {
+    return (
+      `${head} inside the workspace, which does not resolve. The hook client sends nothing for a ` +
+      `Read, Edit or Write through it until its target exists, then follows it to the target's ` +
+      `path, which this entry does not match; name the target to cover them.`
+    );
+  }
+  return (
+    `${head} inside the workspace. The hook client follows the link, so a Read, Edit or Write ` +
+    `through it reaches the coordinator under the path of its target ${JSON.stringify(target)}, ` +
+    `which this entry does not match; name the target to cover them.`
+  );
+}
+
+/**
+ * `lstat` of `path`, or undefined when it cannot be read. The link check only
+ * informs, so a name the disk refuses (too long, under an unreadable
+ * directory, holding a NUL from a hand-edited policy file) must not stop the
+ * coordinator starting or a policy reloading.
+ */
+function lstatIfReadable(path: string): Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The literal characters `tokens` start with, kept in pattern order when read from the end. */
+function literalRun(tokens: Iterable<Token>, fromEnd = false): string {
+  let run = "";
+  for (const token of tokens) {
+    if (token.kind !== "lit") break;
+    run = fromEnd ? token.ch + run : run + token.ch;
+  }
+  return run;
+}
+
+/** The literal prefix and suffix every path matching `tokens` carries. */
+function literalAffixes(tokens: ReadonlyArray<Token>): readonly [string, string] {
+  return [literalRun(tokens), literalRun([...tokens].reverse(), true)];
+}
+
+/**
+ * False when no path can carry every literal prefix and suffix: the prefixes
+ * must each start the longest one, the suffixes each end theirs. Exact as a
+ * necessary condition, so it rules a search out, never in.
+ */
+function affixesNest(affixes: ReadonlyArray<readonly [string, string]>): boolean {
+  const longest = (i: 0 | 1) => affixes.reduce((a, b) => (b[i].length > a.length ? b[i] : a), "");
+  const prefix = longest(0);
+  const suffix = longest(1);
+  return affixes.every(([p, s]) => prefix.startsWith(p) && suffix.endsWith(s));
+}
+
+/**
+ * True when some non-empty path matches every pattern `tokenLists` spells
+ * (`globTokens`) under `globMatch`, up to the approximations of a class
+ * (`fnmatchSearchTokens`).
+ *
+ * A product of the patterns' automata searched over an alphabet of every
+ * character the patterns name, `/`, and one stand-in for every other
+ * character (exact: that stand-in is accepted wherever any unnamed character
+ * is). Each transition is charged to `budget` at the size of the state it
+ * leaves; running out throws `BudgetExhausted`, which every caller counts as
+ * "intersects".
+ */
+export function globsIntersect(tokenLists: ReadonlyArray<ReadonlyArray<Token>>, budget: SearchBudget): boolean {
+  // Most pairs an untrack check meets (`.log` against `.json`, `svc3/` against
+  // `svc7/`) fail on their literal ends: settled without a search.
+  if (!affixesNest(tokenLists.map(literalAffixes))) return false;
+  const alphabet = searchAlphabet(tokenLists);
+  const key =(state: ReadonlyArray<ReadonlyArray<number>>) => state.map((s) => s.join(",")).join("|");
+  const start = tokenLists.map(startStates);
+  const seen = new Set([key(start)]);
+  const frontier = [start];
+  while (frontier.length > 0) {
+    const state = frontier.pop()!;
+    const step = 1 + state.reduce((n, s) => n + s.length, 0);
+    for (const ch of alphabet) {
+      charge(budget, step);
+      const next = state.map((s, i) => advance(s, tokenLists[i]!, ch));
+      if (!next.every((s) => s.length > 0)) continue;
+      if (next.every((s, i) => s.includes(tokenLists[i]!.length))) return true;
+      const k = key(next);
+      if (!seen.has(k)) {
+        seen.add(k);
+        frontier.push(next);
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Every character the patterns name (a class names its members), `/`, and
+ * `null` for every other character. Sorted by code point, as the Python
+ * coordinator sorts it, so the bounded search explores in the same order on
+ * every run and on both coordinators, and the same entry is never refused on
+ * one and accepted on the other.
+ */
+function searchAlphabet(tokenLists: ReadonlyArray<ReadonlyArray<Token>>): Array<string | null> {
+  const named = new Set<string>(["/"]);
+  for (const tokens of tokenLists) {
+    for (const token of tokens) {
+      if (token.kind === "lit") named.add(token.ch);
+      else if (token.kind === "class") token.members.forEach((m) => named.add(m));
+    }
+  }
+  return [...[...named].sort((a, b) => a.codePointAt(0)! - b.codePointAt(0)!), null];
+}
+
+/** Order-preserving union: `first`, then what `second` adds. */
+function union(first: ReadonlyArray<string>, second: ReadonlyArray<string>): string[] {
+  return [...new Set([...first, ...second])];
 }
 
 /**
  * Read a YAML file containing a list of pattern strings. Apply path-traversal
  * guard. Returns surviving patterns; mutates rejected with (pattern, reason)
  * for each rejection.
- *
- * Missing file → []. Malformed YAML → [] + logged WARNING. Non-list top-level → [].
  */
 function loadYamlPatterns(yamlPath: string, rejected: RejectedPattern[]): string[] {
-  let stat;
-  try {
-    stat = statSync(yamlPath);
-  } catch {
-    return [];
-  }
-  if (!stat.isFile()) return [];
-
-  let raw: unknown;
-  try {
-    const text = readFileSync(yamlPath, "utf8");
-    raw = yamlLoad(text);
-  } catch (err) {
-    process.stderr.write(
-      `agent-coherence: WARNING — malformed YAML at ${yamlPath}; falling back to defaults: ${String(err)}\n`,
-    );
-    return [];
-  }
-
-  if (raw === null || raw === undefined) return [];
-  if (!Array.isArray(raw)) {
-    process.stderr.write(
-      `agent-coherence: WARNING — ${yamlPath} top-level must be a list of patterns; got ${typeof raw}. Ignoring.\n`,
-    );
-    return [];
-  }
-
   const surviving: string[] = [];
-  for (const item of raw) {
+  for (const item of loadYamlList(yamlPath, rejected)) {
     if (typeof item !== "string") {
-      rejected.push({ pattern: String(item), reason: `non-string pattern (${typeof item})` });
+      rejected.push({
+        pattern: describeNonString(item),
+        reason: `non-string pattern (${typeof item})`,
+      });
       continue;
     }
     const reason = validatePattern(item);
@@ -564,6 +1946,99 @@ function loadYamlPatterns(yamlPath: string, rejected: RejectedPattern[]): string
     surviving.push(item);
   }
   return surviving;
+}
+
+/**
+ * A non-string policy entry as rejected-pattern text, without calling the
+ * entry's own stringifier: String() on a committed `- {toString: 1}` throws,
+ * and on nested aliases it builds every expansion (CWE-776). Only the rejected
+ * count reaches /status, so the text need not match Python's str(item).
+ */
+function describeNonString(item: unknown): string {
+  const isPrimitive = item === null || (typeof item !== "object" && typeof item !== "function");
+  if (isPrimitive) return String(item);
+  return Array.isArray(item) ? "<list>" : `<${pythonTypeName(item)}>`;
+}
+
+/**
+ * The top-level list of a policy file, or [] when the file loads as no entries.
+ *
+ * Missing, empty or null file → []. An unreadable file, malformed YAML or a
+ * non-list top level → [] + logged WARNING + one rejected entry for the whole
+ * file, under the name and reason the Python coordinator records (#192): the
+ * warning reaches only the coordinator's log, and the rejected count on
+ * /status is what tells an emptied file apart from no user patterns. A
+ * symlink is rejected the same way and never read (#251). A FIFO or a device
+ * loads as [] without a word. A socket fails the open itself, so it is a file
+ * that could not be read, as on the Python coordinator.
+ */
+function loadYamlList(yamlPath: string, rejected: RejectedPattern[]): unknown[] {
+  const name = policyFileName(yamlPath);
+  let text: string;
+  try {
+    text = readRegularFile(yamlPath).toString("utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR" || code === "EISDIR" || code === NOT_REGULAR) return [];
+    if (code === "ELOOP") {
+      process.stderr.write(`agent-coherence: WARNING — ${yamlPath} is a symlink; it loads as no entries\n`);
+      rejected.push({ pattern: name, reason: "a symlink, so the file loads as no entries" });
+      return [];
+    }
+    process.stderr.write(
+      `agent-coherence: WARNING — could not read ${yamlPath}; it loads as no entries: ${String(err)}\n`,
+    );
+    rejected.push({ pattern: name, reason: "could not be read, so the file loads as no entries" });
+    return [];
+  }
+
+  let raw: unknown;
+  try {
+    raw = yamlLoad(text);
+  } catch (err) {
+    process.stderr.write(
+      `agent-coherence: WARNING — malformed YAML at ${yamlPath}; falling back to defaults: ${String(err)}\n`,
+    );
+    rejected.push({ pattern: name, reason: "not valid YAML, so the file loads as no entries" });
+    return [];
+  }
+
+  if (raw === null || raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    process.stderr.write(
+      `agent-coherence: WARNING — ${yamlPath} top-level must be a list of patterns; got ${typeof raw}. Ignoring.\n`,
+    );
+    rejected.push({
+      pattern: name,
+      reason: `top level is ${pythonTypeName(raw)}, not a list, so the file loads as no entries`,
+    });
+    return [];
+  }
+  return raw;
+}
+
+/**
+ * The name the Python coordinator's loader gives a top level that is not a
+ * list (`type(raw).__name__`). Only the rejected count reaches /status, so
+ * where js-yaml types a scalar differently from PyYAML (`4.0` and `1e3` load
+ * as integers here, and a timestamp at exactly midnight UTC reads as a date)
+ * the name is close rather than exact.
+ */
+function pythonTypeName(value: unknown): string {
+  if (typeof value === "string") return "str";
+  if (typeof value === "boolean") return "bool";
+  if (typeof value === "number") return Number.isInteger(value) ? "int" : "float";
+  if (value instanceof Date) {
+    const midnight =
+      value.getUTCHours() === 0 &&
+      value.getUTCMinutes() === 0 &&
+      value.getUTCSeconds() === 0 &&
+      value.getUTCMilliseconds() === 0;
+    return midnight ? "date" : "datetime";
+  }
+  if (ArrayBuffer.isView(value)) return "bytes";
+  if (typeof value === "object") return "dict";
+  return typeof value;
 }
 
 /** Path-traversal guard. Returns null if pattern is acceptable, else a short reason. */

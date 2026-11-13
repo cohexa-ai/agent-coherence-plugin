@@ -18,7 +18,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
-  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -29,6 +28,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { writeExecutable } from './executable_fixture.js';
 import { load as loadYaml } from 'js-yaml';
 
 // __dirname at runtime is dist/test/; plugin root is two levels up.
@@ -89,8 +89,7 @@ function writeFakeGh(dir: string, lock: LockBehavior): string {
     'esac',
   ].join('\n');
   const ghPath = join(binDir, 'gh');
-  writeFileSync(ghPath, `${script}\n`);
-  chmodSync(ghPath, 0o755);
+  writeExecutable(ghPath, `${script}\n`);
   return binDir;
 }
 

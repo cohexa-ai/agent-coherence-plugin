@@ -27,6 +27,7 @@ import {
   SkipHook,
 } from "../hook_client.js";
 import { readPortFromPidFile } from "../hook_client_transport.js";
+import { writeStandInPidFile } from "./coordinator_stand_in.js";
 
 const SID = "44444444-4444-4444-8444-444444444444";
 const HOOK_CLIENT_JS = join(dirname(fileURLToPath(import.meta.url)), "..", "hook_client.js");
@@ -412,7 +413,7 @@ test("session-start fail-open: closed port / empty stdin / malformed JSON → '{
       });
     });
     mkdirSync(join(root, ".coherence"), { recursive: true });
-    writeFileSync(join(root, ".coherence", "server.pid"), `${process.pid}\n${closedPort}\n`);
+    writeStandInPidFile(join(root, ".coherence", "server.pid"), `${process.pid}\n${closedPort}\n`);
     writeFileSync(join(root, ".coherence", "hook.secret"), `${"x".repeat(32)}\n`);
 
     const down = runClient(
@@ -452,10 +453,65 @@ test("hooks.json: exactly two SessionStart entries — bootstrap shim first, hoo
   assert.equal(entries.length, 2);
   // Bootstrap shim stays first (it never reads stdin, so the pair is
   // parallel-safe); the compact re-grounding client is second.
-  assert.ok(entries[0]!.hooks[0]!.command.endsWith("/bin/ensure-coordinator-dispatch"));
+  assert.ok(entries[0]!.hooks[0]!.command.endsWith('/bin/ensure-coordinator-dispatch"'));
   const second = entries[1]!;
   assert.equal(second.matcher, undefined);
   assert.equal(second.hooks.length, 1);
   assert.equal(second.hooks[0]!.type, "command");
   assert.ok(second.hooks[0]!.command.endsWith('hook-client" session-start'));
+});
+
+test("hooks.json: every ${CLAUDE_PLUGIN_ROOT} path is double-quoted, so an install path with a space stays one word", () => {
+  const hooksJsonPath = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "hooks",
+    "hooks.json",
+  );
+  const parsed = JSON.parse(readFileSync(hooksJsonPath, "utf8")) as {
+    hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+  };
+  // Hook commands run through a shell. An unquoted placeholder splits at a
+  // space in the install path, the command is not found, and the clients'
+  // fail-open floor then leaves the plugin silently doing nothing.
+  const placeholder = "${CLAUDE_PLUGIN_ROOT}";
+  const commands = Object.entries(parsed.hooks).flatMap(([event, entries]) =>
+    entries.flatMap((entry) => entry.hooks.map((hook) => ({ event, command: hook.command }))),
+  );
+  const withPlaceholder = commands.filter(({ command }) => command.includes(placeholder));
+  assert.ok(withPlaceholder.length > 0, "no hooks.json command uses the placeholder; this check would pass vacuously");
+  const unquoted = withPlaceholder
+    .filter(({ command }) => command.split(placeholder).slice(0, -1).some((before) => !before.endsWith('"')))
+    .map(({ event, command }) => `${event}: ${command}`);
+  assert.deepEqual(unquoted, []);
+});
+
+test("hooks.json: holds only keys Claude Code's loader accepts, so it prints no unknown-keys notice", () => {
+  const hooksJsonPath = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "hooks",
+    "hooks.json",
+  );
+  const parsed = JSON.parse(readFileSync(hooksJsonPath, "utf8")) as {
+    hooks: Record<string, Array<Record<string, unknown>>>;
+  };
+  // The sets Claude Code 2.1.319 checks. It names any other key at the top
+  // level or in a matcher group in a notice at every session start (#259);
+  // it does not check the hook objects inside a group.
+  const topLevel = new Set(["$schema", "description", "hooks", "modules", "surface"]);
+  const matcherGroup = new Set(["matcher", "hooks"]);
+  const unknown = [
+    ...Object.keys(parsed).filter((key) => !topLevel.has(key)),
+    ...Object.entries(parsed.hooks).flatMap(([event, groups]) =>
+      groups.flatMap((group, index) =>
+        Object.keys(group)
+          .filter((key) => !matcherGroup.has(key))
+          .map((key) => `${key} in hooks.${event}[${index}]`),
+      ),
+    ),
+  ];
+  assert.deepEqual(unknown, []);
 });

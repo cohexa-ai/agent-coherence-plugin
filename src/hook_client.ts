@@ -45,7 +45,8 @@
  * says `backend=node`, so the client does not claim and the request is exactly
  * what it was before.
  */
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { isValidSubagentId } from "./agent_id.js";
 import {
@@ -114,12 +115,63 @@ function requireFilePath(cc: CcPayload): string {
   return fp;
 }
 
-/** Absolute CC path → workspace-relative; outside the root → SkipHook (mirrors Python). */
-export function toWorkspaceRelative(filePath: string, root: string): string {
-  const rel = relative(root, resolve(filePath));
-  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-    throw new SkipHook(`path outside workspace root: ${filePath}`);
+type Resolver = (path: string) => string;
+
+/**
+ * The JS resolver follows links and keeps the case every other name was
+ * typed in, as the Python client's `Path.resolve()` does (macOS's `/var`
+ * still becomes `/private/var`: it is a link). A Bash token is keyed as
+ * typed, so a Read of README.MD must be sent as typed too, or a coordinator
+ * that folds nothing keeps the two tools' records of one file apart.
+ */
+const followLinks: Resolver = (path) => realpathSync(path);
+
+/**
+ * The native resolver also returns the disk's case, the one way a tool path
+ * spelled with a differently cased root (REPO for Repo) can meet the root.
+ */
+const diskSpelling: Resolver = (path) => realpathSync.native(path);
+
+/**
+ * An absolute path with its links followed by `realpath`. A resolver throws
+ * on a missing leaf, so a file a tool is about to create resolves its deepest
+ * existing ancestor and keeps the rest as typed.
+ */
+function resolveLinks(absolutePath: string, realpath: Resolver): string {
+  try {
+    return realpath(absolutePath);
+  } catch {
+    // Missing, or a link the resolver cannot follow: told apart below.
   }
+  // The entry exists yet does not resolve: a dangling or looping link. Keying
+  // the link's own path would give its file a second identity once the
+  // target exists, so the hook skips instead.
+  if (lstatSync(absolutePath, { throwIfNoEntry: false }) !== undefined) {
+    throw new SkipHook(`link does not resolve: ${absolutePath}`);
+  }
+  return join(resolveLinks(dirname(absolutePath), realpath), basename(absolutePath));
+}
+
+/** `absolutePath` relative to `root`, both resolved by `realpath`; null when outside the root. */
+function relativeInside(root: string, absolutePath: string, realpath: Resolver): string | null {
+  const rel = relative(realpath(root), resolveLinks(absolutePath, realpath));
+  const outside = rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+  return outside ? null : rel;
+}
+
+/**
+ * Absolute CC path to workspace-relative, links followed and typed case
+ * kept; the disk's spelling is tried only for a path that otherwise lies
+ * outside the root. Still outside: SkipHook (mirrors Python).
+ */
+export function toWorkspaceRelative(filePath: string, root: string): string {
+  // Claude Code folds '..' by text before it opens an absolute path, so fold it
+  // before following links: on disk, link/.. is the parent of the link's target.
+  const absolutePath = resolve(filePath);
+  const rel =
+    relativeInside(root, absolutePath, followLinks) ??
+    relativeInside(root, absolutePath, diskSpelling);
+  if (rel === null) throw new SkipHook(`path outside workspace root: ${filePath}`);
   return rel;
 }
 
@@ -142,6 +194,8 @@ export function buildPreRead(cc: CcPayload, root: string): Record<string, unknow
   // KTD-O: PreToolUse:Read fires BEFORE the read, so tool_response carries no
   // hash — compute it from disk (raw bytes) so the strict gate's hash_differs
   // branch is reachable. Unreadable → omit (falls back to INVALID-only).
+  // Folded by text as for the key: read unfolded, the disk steps link/.. to
+  // the target's parent and hashes a file the tool does not open.
   const contentHash = hashFile(resolve(filePath));
   if (contentHash !== null) body.content_hash = contentHash;
   return withAgentId(cc, body);
@@ -166,6 +220,7 @@ export function buildPostEdit(cc: CcPayload, root: string): Record<string, unkno
   let contentHash =
     typeof toolResponse.content_hash === "string" ? toolResponse.content_hash : null;
   if (success && contentHash === null) {
+    // Folded by text as for the key, so the hash is of the file the tool wrote.
     contentHash = hashFile(resolve(filePath));
   }
   const body: Record<string, unknown> = { session_id: sessionId, path: rel, success };
@@ -182,6 +237,13 @@ export function buildSessionStop(cc: CcPayload): Record<string, unknown> {
  * verb. The subagent identity is MANDATORY here — a SubagentStop payload
  * without an agent id must NOT fall back to the parent identity (that would
  * release the parent's live grants); absence skips (fail-open `{}`).
+ *
+ * A missed SubagentStop: the Python coordinator's heartbeat/idle sweep
+ * reclaims the grant. The Node coordinator has no sweep, so the subagent's
+ * grant stays held until a session-stop or a failed post-edit for that
+ * identity releases it, an ordinary pre-edit displaces it, or an opted-in
+ * pre-edit (`if_unheld: true`) 1800 s or more after its grant reclaims it. A
+ * parent's Stop does not release it.
  */
 export function buildSubagentStop(cc: CcPayload): Record<string, unknown> {
   const sessionId = requireSessionId(cc);
@@ -206,12 +268,24 @@ export function buildSubagentStop(cc: CcPayload): Record<string, unknown> {
  * absent source is not a compaction — SkipHook rides the fail-open ladder
  * to `{}` with NO network call. SessionStart stdin carries no agent_id;
  * withAgentId stays additive-only, so nothing is fabricated.
+ *
+ * hooks.json runs this in parallel with the bootstrap shim, which never reads
+ * stdin, so the pair is safe. A coordinator cold or crashed at compact time
+ * fails this open (`{}`) and that compaction's re-grounding is lost: the
+ * documented SB-10 loss mode.
  */
 export function buildSessionStart(cc: CcPayload): Record<string, unknown> {
   if (cc.source !== "compact") throw new SkipHook('source is not "compact"');
   return withAgentId(cc, { session_id: requireSessionId(cc) });
 }
 
+/**
+ * KTD-N H4: hooks.json matches Bash and Grep as well as Read because a model
+ * whose Read was warned or denied routes around it with `bash cat plan.md` or a
+ * grep over the directory. pre-bash forwards the command, from which the
+ * coordinator extracts tracked paths; pre-grep forwards the search root, under
+ * which it enumerates the tracked artifacts.
+ */
 export function buildPreBash(cc: CcPayload): Record<string, unknown> {
   const sessionId = requireSessionId(cc);
   const command = toolInput(cc).command;

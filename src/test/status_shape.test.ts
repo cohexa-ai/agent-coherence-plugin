@@ -16,8 +16,8 @@
  *
  * R6 narrowed one of those fields rather than moving it: `agent_name` renders
  * `claude-session-<session id>`, so both runtimes stopped publishing it below
- * the operator tier. Python moved the name to `?detail=full`; Node serves no
- * operator tier (detail=full is 501), so on its one tier the value is always
+ * the operator tier. Python moved the name to `?detail=full`; Node's operator
+ * view adds only the policy's pattern lists, so on every Node tier the value is
  * null. The FIELD is still part of the pinned shape — it is typed
  * `string | null` on both sides and Python emits null on this same path.
  */
@@ -155,8 +155,8 @@ test("AC-03: sessions entries carry the agent_name field + states map (Python pa
   // R6: `agent_name` renders `claude-session-<session id>` verbatim, so a
   // session row published the raw session id beside that session's
   // per-artifact state. Python moved the name behind the operator
-  // (?detail=full) tier; Node serves no operator tier at all (detail=full is
-  // 501), so on the one tier it does serve the name is null. The FIELD stays —
+  // (?detail=full) tier; Node's operator view adds only the policy's pattern
+  // lists, so on every tier Node serves the name is null. The FIELD stays —
   // it is parity-pinned and typed `string | null`, and null is the same shape
   // Python emits on this path.
   //
