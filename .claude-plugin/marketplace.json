@@ -2,7 +2,7 @@
   "name": "agent-coherence",
   "owner": {
     "name": "Vlad Parakhin",
-    "email": "vlad@agent-coherence.dev",
+    "email": "vlad@cohexa.ai",
     "url": "https://agent-coherence.dev/plugin/"
   },
   "description": "Self-hosted marketplace for the agent-coherence Claude Code plugin. Coherence for the prose subset of project rules that can't be expressed as policy.",
@@ -14,7 +14,7 @@
       "version": "0.7.0",
       "author": {
         "name": "Vlad Parakhin",
-        "email": "vlad@agent-coherence.dev",
+        "email": "vlad@cohexa.ai",
         "url": "https://agent-coherence.dev/plugin/"
       },
       "homepage": "https://github.com/Cohexa-ai/agent-coherence-plugin",
