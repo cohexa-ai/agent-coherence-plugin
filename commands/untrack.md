@@ -22,10 +22,11 @@ finish checking is refused the same way, naming strict patterns it may not
 cover. Before suggesting the strict-mode step for a long or `*`-heavy entry,
 retry such entries in smaller requests and give each a more literal path (for
 example `src/...` rather than `**/...`).
-Do not edit those files, stop the coordinator, or delete
-`.coherence/server.pid` yourself unless the user asks you to. The bundled
-Node coordinator refuses this way, and so does a Python coordinator from an
-`agent-coherence` release after 0.14.1.
+Do not edit those files or stop the coordinator yourself unless the user
+asks you to, and never delete `.coherence/server.pid`: the lock that keeps a
+workspace to one coordinator is on it. The bundled Node coordinator refuses
+this way, and so does a Python coordinator from `agent-coherence` 0.15.0 or
+later.
 
 If no paths were given, ask the user which workspace-relative path(s) they
 want to untrack. Don't invoke the CLI without arguments: the bundled Node CLI exits 1 with no output, and the Python console script exits 2 with a usage error.
