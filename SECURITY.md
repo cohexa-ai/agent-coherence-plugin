@@ -161,7 +161,7 @@ The coordinator learns the disk's fold once per start (`src/fs_profile.ts`):
 
 A planted entry under the probe prefix, a `.coherence` on another device than
 the workspace, or a probe step that fails at worst makes the start
-cannot-tell: the coordinator then folds nothing, as before this change, and
+cannot-tell: the coordinator then folds nothing, as plugin 0.6.0 did, and
 logs why.
 
 Not covered:
@@ -230,7 +230,7 @@ The coordinator's state directory is `<repo>/.coherence/`. Contents:
 |---|---|---|---|
 | `state.db` | SQLite-WAL artifact state | default user umask | Per-artifact MESI state, version numbers, `content_hash` (SHA-256, hex). **Never** raw file content. |
 | `hook.secret` | Bearer token for HTTP auth | `0600` | 64 hex chars (32 random bytes) |
-| `server.pid` | Coordinator process discovery | default | Port + PID of the lazy-spawned coordinator |
+| `server.pid` | Coordinator process discovery | default | PID and port of the running coordinator, which holds a lock on the file. A stopping coordinator removes the port line |
 | `tracked.yaml` | User-committed opt-in patterns | default | Glob patterns: path globs with `**`, Python `fnmatch` without (see the README) |
 | `ignored.yaml` | User-committed opt-out patterns | default | Glob patterns, as `tracked.yaml` |
 
