@@ -138,12 +138,17 @@ export const TERMINAL_DENIAL_CLASSES: ReadonlySet<string> = new Set([
  * it as-is instead of mapping it back to the session id it was derived from.
  * Byte-stability is a property of the same inputs producing the same bytes,
  * which a one-time reword landed on both sides does not disturb.
+ *
+ * #514 reworded everything after the first sentence, again on both backends:
+ * the session's next Read of the recorded bytes is admitted, so the text says
+ * so, and no longer says that a retry gets the same denial. It also holds
+ * after a Bash or Grep deny, whose re-grant admits the next Read.
  */
 export const STRICT_MODE_DENY_REASON_TEMPLATE =
   "Stale read denied: {path} was updated by agent {last_writer_short} " +
-  "at {last_writer_ts_iso}. Re-read {path} via the Read tool before " +
-  "proceeding. This denial is structural (v0.2 strict mode); retrying " +
-  "the same operation will produce the same denial.";
+  "at {last_writer_ts_iso}. Read {path} again with the Read tool: the " +
+  "next Read returns the current version, and edits of {path} are denied " +
+  "until you have read it.";
 
 /**
  * The deny text for the arm where nothing was written (R8) — BYTE-IDENTICAL
@@ -159,13 +164,13 @@ export const STRICT_MODE_DENY_REASON_TEMPLATE =
  * tick of its own (`last_writer_at_unix_ts` is the last real commit, which is
  * not what happened here), and the version is the honest thing to report.
  * That makes this arm byte-stable for the same reason the other one is.
+ * After the first sentence it says what the commit text says (#514).
  */
 export const GRANT_CHANGE_DENY_REASON_TEMPLATE =
   "Stale read denied: your grant on {path} was revoked and no new version " +
-  "was committed \u2014 {path} is still at v{current_version}. Re-read " +
-  "{path} via the Read tool before proceeding. This denial is structural " +
-  "(v0.2 strict mode); retrying the same operation will produce the same " +
-  "denial.";
+  "was committed \u2014 {path} is still at v{current_version}. Read {path} " +
+  "again with the Read tool: the next Read returns the current version, " +
+  "and edits of {path} are denied until you have read it.";
 
 /**
  * BYTE-IDENTICAL to Python `OUT_OF_BAND_DENY_REASON_TEMPLATE` (#205): a
@@ -182,6 +187,34 @@ export const OUT_OF_BAND_DENY_REASON_TEMPLATE =
   "outside the coordinator; the read stays denied until the change is " +
   "committed through the coordinator. This denial is structural (v0.2 " +
   "strict mode); retrying the same operation will produce the same denial.";
+
+/**
+ * BYTE-IDENTICAL to the Python coordinator's text for this case (#514): a reader
+ * whose copy is stale, or who never read the file, hashed bytes that are not
+ * the recorded version, or sent no hash because the file is gone, and no
+ * other session holds an uncommitted write. A Read cannot clear it, so it
+ * names what does, and it does not claim a version the reader last read.
+ */
+export const STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE =
+  "Stale read denied: {path} on disk does not match v{current_version}, " +
+  "the last version committed through the coordinator, and no session " +
+  "committed the change, so it was made outside the coordinator. Do not " +
+  "restore or overwrite {path}: the change may be your user's work. Tell " +
+  "your user that {path} changed outside the coordinator; the read stays " +
+  "denied until the change is committed through the coordinator. This " +
+  "denial is structural (v0.2 strict mode); retrying the same operation " +
+  "will produce the same denial.";
+
+/**
+ * BYTE-IDENTICAL to the Python coordinator's text for this case (#514): the same
+ * reader as above while another session holds an uncommitted write of the
+ * file, whose commit is what clears the deny.
+ */
+export const WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE =
+  "Stale read denied: another agent is writing {path} and has not " +
+  "committed it yet, so {path} on disk does not match v{current_version}, " +
+  "the last version committed through the coordinator. Wait for that " +
+  "write to be committed, then Read {path} again with the Read tool.";
 
 /**
  * BYTE-IDENTICAL to Python `OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE` (#205): the
@@ -356,6 +389,31 @@ export function emitStrictDeny(args: {
     hookEventName: "PreToolUse",
     permissionDecision: "deny",
     permissionDecisionReason: reason,
+  };
+}
+
+/**
+ * The strict deny of a stale or never-read Read whose bytes are not the
+ * recorded version, or that carries no hash (#514). A Read would be refused
+ * too, so the text never promises one: it names the uncommitted write when
+ * another session holds one, else the change made outside the coordinator.
+ * Same envelope as `emitStrictDeny`; `source` is kept for call-site parity.
+ */
+export function emitUnrecordedBytesDeny(args: {
+  source: string;
+  summary: StaleSummary;
+  writeInFlight: boolean;
+}): HookSpecificOutput {
+  const template = args.writeInFlight
+    ? WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE
+    : STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE;
+  return {
+    hookEventName: "PreToolUse",
+    permissionDecision: "deny",
+    permissionDecisionReason: fmt(template, {
+      path: args.summary.path,
+      current_version: String(args.summary.current_version),
+    }),
   };
 }
 

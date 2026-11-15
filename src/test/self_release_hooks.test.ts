@@ -374,7 +374,7 @@ for (const [name, release] of [
   });
 }
 
-test("in strict mode, an edit of a copy a peer made stale is denied and the session stays stale", async () => {
+test("in strict mode, an edit of a copy a peer made stale is denied and the session stays stale until it reads again", async () => {
   const s = await makeServer();
   try {
     const edit = await editAfterPeerCommit(s, STRICT);
@@ -387,8 +387,10 @@ test("in strict mode, an edit of a copy a peer made stale is denied and the sess
       released_artifacts: [],
     });
     assert.equal(stateOf(s, STRICT, sessionToAgentId(SID_A)), MESIState.INVALID);
+    // The edit's deny was the session's one stale deny (#514), so its Read of
+    // the committed bytes is admitted at the current version.
     const read = await s.post("/hooks/pre-read", { session_id: SID_A, path: STRICT, content_hash: HASH_2 });
-    assert.ok(denyReason(read).startsWith(UPDATED_BY_PEER));
+    assert.deepEqual(read, { status: "fresh", version: 2 });
   } finally {
     await s.cleanup();
   }
