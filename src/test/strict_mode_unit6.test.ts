@@ -347,10 +347,15 @@ test("out-of-band templates: placeholder sets and bytes are locked to Python's (
 });
 
 test("KTD-U: emitAllow refuses to convert a terminal denial class", () => {
-  assert.throws(
-    () => emitAllow({ source: "test", denialClass: "permissions_deny_strict_mode" }),
-    /KTD-U security invariant/,
-  );
+  // The two held-file classes are listed by their wire values, so renaming
+  // one fails here as surely as dropping it from the terminal set.
+  for (const denialClass of [
+    "permissions_deny_strict_mode",
+    "permissions_deny_held_path",
+    "permissions_deny_admission_unavailable",
+  ]) {
+    assert.throws(() => emitAllow({ source: "test", denialClass }), /KTD-U security invariant/, denialClass);
+  }
   // Non-terminal allow works and omits additionalContext when absent.
   const quiet = emitAllow({ source: "test" });
   assert.deepEqual(quiet, { hookEventName: "PreToolUse", permissionDecision: "allow" });

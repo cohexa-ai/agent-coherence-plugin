@@ -118,11 +118,29 @@ export function emitPreToolUseContext(args: {
 // ----------------------------------------------------------------------
 
 /**
+ * An opted-in edit refused because another agent holds the path, under the
+ * holder text and the parent text alike (`emitHeldPathDeny`,
+ * `emitHeldByParentDeny`). The same value as Python's `HELD_PATH_DENIAL_CLASS`.
+ */
+export const HELD_PATH_DENIAL_CLASS = "permissions_deny_held_path";
+
+/**
+ * An opted-in edit refused because the coordinator could not confirm that no
+ * other agent holds the path (`emitAdmissionUnavailableDeny`). Terminal:
+ * admitting an edit nobody checked would let it displace the very holder the
+ * opt-in was sent to protect. The same value as Python's
+ * `ADMISSION_UNAVAILABLE_DENIAL_CLASS`.
+ */
+export const ADMISSION_UNAVAILABLE_DENIAL_CLASS = "permissions_deny_admission_unavailable";
+
+/**
  * KTD-U security invariant: denial classes that must NEVER be converted to
  * `permissionDecision: "allow"`. `emitAllow` throws on membership.
  */
 export const TERMINAL_DENIAL_CLASSES: ReadonlySet<string> = new Set([
   "permissions_deny_strict_mode",
+  HELD_PATH_DENIAL_CLASS,
+  ADMISSION_UNAVAILABLE_DENIAL_CLASS,
 ]);
 
 /**
@@ -415,6 +433,102 @@ export function emitUnrecordedBytesDeny(args: {
       current_version: String(args.summary.current_version),
     }),
   };
+}
+
+// ----------------------------------------------------------------------
+// Held-path denies: the hook client's answers to a strict edit it opted in
+// to acquire-or-fail. BYTE-IDENTICAL to Python's templates of the same names.
+// ----------------------------------------------------------------------
+//
+// Static like the strict templates, for the same measured reason, and pinned
+// by the library's fixtures, copied into src/test/fixtures/hook_on_held/, so
+// both clients render them byte for byte, which is why they are ASCII only.
+// Each reads as a sentence behind Claude Code's "PreToolUse:Edit hook error: "
+// prefix. None names a setting, file, command or shell route: a refusal that
+// hands the model its way around is a self-bypass the retry loop would take.
+// None says retrying gives the same denial, because a held file does come free.
+
+/**
+ * Another agent holds the path. `holder` is the holder's short agent id,
+ * never a session id. The text names both ways the file comes free and gives
+ * a window rather than a moment, and never a "turn", which one session cannot
+ * see in another. The window's end is the one both coordinators keep
+ * (Cohexa-ai/agent-coherence#628): the Python coordinator's sweep frees a
+ * grant its holder has held for 30 minutes by default, or sooner once the
+ * holder has been quiet for 10 minutes; the Node coordinator runs no timer, and gives an
+ * opted-in edit a grant its holder has held for 30 minutes, so the refused
+ * session's next edit after that gets the file. The 10 minutes are left out
+ * because the Node coordinator does not keep them. The last sentence is there
+ * because a hold this session took through another client is a different
+ * agent to the coordinator, so a session can be refused by its own hold.
+ */
+export const HELD_PATH_DENY_REASON_TEMPLATE =
+  "Edit denied: {path} is held by agent {holder}. It comes free when that " +
+  "agent lets go of it, or at the latest once that agent has held it for 30 " +
+  "minutes. Do not retry now: do other work that does not need {path}, or " +
+  "stop and tell your user. If you hold {path} yourself through another " +
+  "tool, such as an MCP server, release it there first.";
+
+/**
+ * A subagent refused by its own parent's hold. The parent is waiting on the
+ * subagent, so it does not let go of the path while the subagent runs and
+ * waiting would never end; the subagent hands the change back instead. It
+ * shares `HELD_PATH_DENIAL_CLASS` with the holder text.
+ */
+export const HELD_BY_PARENT_DENY_REASON_TEMPLATE =
+  "Edit denied: {path} is held by the session that started you. Do not wait " +
+  "for it: finish without this change and report the change you wanted to " +
+  "make back to that session.";
+
+/**
+ * Every other answer to an opted-in edit, and no answer at all: one text that
+ * stays true whatever the cause -- a timeout, a coordinator that went away, an
+ * answer in a shape the client does not know, or a request that could not be
+ * sent as it was. It never claims the edit left nothing behind, because a
+ * timed-out request was measured landing late on both coordinators. A strict
+ * edit refused because the coordinator cannot be reached should reuse this
+ * text and its class, so one state has one deny.
+ */
+export const ADMISSION_UNAVAILABLE_DENY_REASON_TEMPLATE =
+  "Edit denied: the coordinator could not confirm that no other agent holds " +
+  "{path}. Try the edit once more; if it is denied again, stop and tell " +
+  "your user.";
+
+/** The strict deny's envelope: the decision and its reason, nothing beside them. */
+function preToolUseDeny(reason: string): HookSpecificOutput {
+  return {
+    hookEventName: "PreToolUse",
+    permissionDecision: "deny",
+    permissionDecisionReason: reason,
+  };
+}
+
+/**
+ * The deny for an edit of `path` refused because another agent holds it,
+ * naming `holderAgentId` (the refusal's 32-hex holder) by its short form.
+ * Class `HELD_PATH_DENIAL_CLASS`; Python's `emit_held_path_deny`.
+ */
+export function emitHeldPathDeny(args: { path: string; holderAgentId: string }): HookSpecificOutput {
+  return preToolUseDeny(
+    fmt(HELD_PATH_DENY_REASON_TEMPLATE, { path: args.path, holder: shortSessionId(args.holderAgentId) }),
+  );
+}
+
+/**
+ * The deny for a subagent's edit of `path` refused by its own parent's hold.
+ * Class `HELD_PATH_DENIAL_CLASS`; Python's `emit_held_by_parent_deny`.
+ */
+export function emitHeldByParentDeny(path: string): HookSpecificOutput {
+  return preToolUseDeny(fmt(HELD_BY_PARENT_DENY_REASON_TEMPLATE, { path }));
+}
+
+/**
+ * The deny for an opted-in edit of `path` whose answer was not an admit, a
+ * deny to relay or a holder refusal. Class `ADMISSION_UNAVAILABLE_DENIAL_CLASS`;
+ * Python's `emit_admission_unavailable_deny`.
+ */
+export function emitAdmissionUnavailableDeny(path: string): HookSpecificOutput {
+  return preToolUseDeny(fmt(ADMISSION_UNAVAILABLE_DENY_REASON_TEMPLATE, { path }));
 }
 
 export interface StaleResponse {
