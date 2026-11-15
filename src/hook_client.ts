@@ -9,7 +9,11 @@
  * THE INVARIANT CONTRACT (parity with the Python client): **exit code is
  * ALWAYS 0**, and on ANY failure — TTY stdin, empty/malformed stdin, no git
  * root, coordinator down, HTTP error, builder bug — print `{}` so Claude
- * Code never sees the hook block a tool call.
+ * Code never sees the hook block a tool call. One exception, opt-in: with
+ * `.coherence/hook_on_held` holding `refuse`, a pre-edit of a strict file
+ * asks the coordinator for the file only if no other agent holds it, and once
+ * a coordinator port is known any failure there prints a deny instead of `{}`
+ * (see heldStrictAnswer).
  *
  * Subcommands + payload translators are verbatim ports of
  * `ccs/cli/coherence_hook_client.py`:
@@ -57,12 +61,30 @@ import {
 } from "./caller_principal.js";
 import {
   type CoordinatorEndpoint,
+  CoordinatorPortUnknown,
   CoordinatorUnavailable,
   findCoordinatorRoot,
+  HOOK_REQUEST_TIMEOUT_MS,
   hashFile,
   requestJsonStatus,
   resolveEndpoint,
 } from "./hook_client_transport.js";
+import {
+  NO_REFUSAL_MESSAGE,
+  type OptedInRequest,
+  SETTING_ON,
+  SETTING_UNKNOWN,
+  STATUS_ROUTE,
+  UNKNOWN_SETTING_MESSAGE,
+  advertisesRefusal,
+  answerFor,
+  malformedSubagentId,
+  readSetting,
+  strictForCoordinator,
+  strictProfiles,
+  unavailableDeny,
+} from "./hook_on_held.js";
+import type { FoldProfile } from "./path_fold.js";
 
 /** Internal signal: nothing meaningful to do — emit `{}` (mirrors Python _SkipHook). */
 export class SkipHook extends Error {}
@@ -157,6 +179,21 @@ function relativeInside(root: string, absolutePath: string, realpath: Resolver):
   const rel = relative(realpath(root), resolveLinks(absolutePath, realpath));
   const outside = rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
   return outside ? null : rel;
+}
+
+/**
+ * `rel` under `root` as the disk spells it, relative to the disk's spelling of
+ * `root`: the spelling a coordinator on a folding disk also matches policy
+ * against. Undefined when the disk cannot give one (a link that does not
+ * resolve, a directory that cannot be read), which leaves the policy's other
+ * readings, as on the coordinator and in the Python client.
+ */
+export function diskSpellingOf(root: string, rel: string): string | undefined {
+  try {
+    return relative(resolveLinks(root, diskSpelling), resolveLinks(join(root, rel), diskSpelling));
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -346,11 +383,9 @@ function report(message: string): void {
 }
 
 /**
- * POST the hook's payload presenting the session's caller principal, and
- * recover a principal refusal: re-claim with the stored mint nonce (see
- * recoverFromPrincipalRefusal) and retry ONCE — safe because a refused request
- * changed nothing. Resolves to the body of a 2xx answer, else null; any other
- * non-2xx degrades to `{}` exactly as before. Rejects on a transport failure.
+ * POST the hook's payload presenting the session's caller principal: the body
+ * of a 2xx answer, else null, so any other non-2xx degrades to `{}` exactly as
+ * before. Rejects on a transport failure.
  */
 async function postPresentingPrincipal(
   endpoint: CoordinatorEndpoint,
@@ -358,6 +393,24 @@ async function postPresentingPrincipal(
   route: string,
   payload: Record<string, unknown>,
 ): Promise<Record<string, unknown> | null> {
+  const answer = await postPresentingPrincipalAnswer({ endpoint, root }, route, payload);
+  return isSuccess(answer.status) ? answer.body : null;
+}
+
+/**
+ * POST the hook's payload presenting the session's caller principal, and
+ * recover a principal refusal: re-claim with the stored mint nonce (see
+ * recoverFromPrincipalRefusal) and retry ONCE — safe because a refused request
+ * changed nothing. Resolves to the last answer's status beside its body (null
+ * when the body is not a JSON object), so a caller can tell a refusal by
+ * status from a success it cannot read. Rejects on a transport failure.
+ */
+export async function postPresentingPrincipalAnswer(
+  target: { endpoint: CoordinatorEndpoint; root: string },
+  route: string,
+  payload: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> | null }> {
+  const { endpoint, root } = target;
   const sessionId = String(payload.session_id);
   const post = (principal: string | null) =>
     requestJsonStatus(endpoint, "POST", route, payload, principalHeaders(principal));
@@ -378,7 +431,121 @@ async function postPresentingPrincipal(
       }
     }
   }
-  return answer.status >= 200 && answer.status < 300 ? answer.body : null;
+  return answer;
+}
+
+// ----------------------------------------------------------------------
+// The refusal of held strict files (pre-edit, setting on)
+// ----------------------------------------------------------------------
+
+/**
+ * The pre-edit payload as built: the session and the workspace-relative path,
+ * and any subagent id. The same shape the refusal classifies once it is sent.
+ */
+type PreEditPayload = OptedInRequest;
+
+/** A pre-edit the refusal applies to: its payload, and the fold profiles under which its path is strict. */
+interface HeldCandidate {
+  payload: PreEditPayload;
+  profiles: ReadonlySet<FoldProfile>;
+}
+
+const isSuccess = (status: number): boolean => status >= 200 && status < 300;
+
+/**
+ * With the held-file refusal on, what a pre-edit of a strict path prints: the
+ * coordinator's admit or deny, or one of the held-file denies. Null takes
+ * today's path unchanged: the setting is off, the path is strict under no
+ * profile, no coordinator port is known, or the coordinator does not refuse
+ * held files or does not fold the path onto a strict entry. `deadlineMs`
+ * bounds everything from the capability read to the answer; the hook's own
+ * request limit unless given.
+ */
+export async function heldStrictAnswer(
+  cc: CcPayload,
+  root: string,
+  deadlineMs: number = HOOK_REQUEST_TIMEOUT_MS,
+): Promise<unknown> {
+  const candidate = await heldStrictCandidate(cc, root);
+  if (candidate === null) return null;
+  try {
+    return await askCoordinator(cc, root, { candidate, deadlineMs });
+  } catch {
+    // A coordinator is known and the path is strict: admitting on a failure
+    // would let this edit take a file another agent may hold. This takes every
+    // transport, status and principal failure alike, and anything else.
+    return unavailableDeny(candidate.payload.path);
+  }
+}
+
+/**
+ * The pre-edit's payload and the fold profiles under which its path is
+ * strict, when the setting is on and some profile makes it strict. The policy
+ * module is imported here, so no other hook pays for loading it.
+ */
+async function heldStrictCandidate(cc: CcPayload, root: string): Promise<HeldCandidate | null> {
+  try {
+    if (!holdRefusalOn(root)) return null;
+    const payload = buildPreEdit(cc, root) as PreEditPayload;
+    const { TrackedArtifactPolicy } = await import("./policy.js");
+    const policy = TrackedArtifactPolicy.readQuietly(root);
+    const profiles = strictProfiles(policy, payload.path, (rel) => diskSpellingOf(root, rel));
+    return profiles.size > 0 ? { payload, profiles } : null;
+  } catch {
+    // Nothing has been asked yet, so today's path decides, as it would with
+    // the setting off.
+    return null;
+  }
+}
+
+/** Whether the refusal is on. An unknown value is off, and says so on stderr. */
+function holdRefusalOn(root: string): boolean {
+  const setting = readSetting(join(root, ".coherence"));
+  if (setting === SETTING_UNKNOWN) report(UNKNOWN_SETTING_MESSAGE);
+  return setting === SETTING_ON;
+}
+
+/**
+ * Read the capability, then send the opted-in pre-edit. Rejects on any failure
+ * to reach or read the coordinator, except that no known port takes today's
+ * path (null).
+ */
+async function askCoordinator(
+  cc: CcPayload,
+  root: string,
+  ask: { candidate: HeldCandidate; deadlineMs: number },
+): Promise<unknown> {
+  const { payload, profiles } = ask.candidate;
+  const resolved = knownEndpoint(root);
+  if (resolved === null) return null;
+  // One deadline from the capability read to the answer, the claim and any
+  // re-claim included: a coordinator that stalls, or sends a byte now and
+  // then, holds a strict edit no longer than one request limit in all.
+  const endpoint = { ...resolved, deadlineAt: Date.now() + ask.deadlineMs };
+  const status = await requestJsonStatus(endpoint, "GET", STATUS_ROUTE);
+  if (!isSuccess(status.status) || status.body === null) return unavailableDeny(payload.path);
+  if (!advertisesRefusal(status.body)) {
+    report(NO_REFUSAL_MESSAGE);
+    return null;
+  }
+  if (!strictForCoordinator(status.body, profiles)) return null;
+  if (malformedSubagentId(cc)) return unavailableDeny(payload.path);
+  const request: OptedInRequest = { ...payload, if_unheld: true };
+  const route = ENDPOINT_BY_SUBCOMMAND["pre-edit"];
+  const answer = await postPresentingPrincipalAnswer({ endpoint, root }, route, request);
+  if (!isSuccess(answer.status) || answer.body === null) return unavailableDeny(payload.path);
+  return answerFor(answer.body, request);
+}
+
+/** The endpoint of the workspace's coordinator; null when no coordinator port is known. */
+function knownEndpoint(root: string): CoordinatorEndpoint | null {
+  try {
+    return resolveEndpoint(root);
+  } catch (err) {
+    // No coordinator is known, so none can hold the file.
+    if (err instanceof CoordinatorPortUnknown) return null;
+    throw err;
+  }
 }
 
 async function readStdin(): Promise<string> {
@@ -433,6 +600,16 @@ export async function runMain(argv: string[]): Promise<number> {
     }
     const rootResolved = resolve(root);
 
+    if (sub === "pre-edit") {
+      const held = await heldStrictAnswer(cc, rootResolved);
+      if (held !== null) {
+        process.stdout.write(JSON.stringify(held) + "\n");
+        return 0;
+      }
+    }
+
+    // Today's path, on an endpoint resolved afresh: one the refusal resolved
+    // carries its deadline, which today's requests must not inherit.
     let endpoint;
     try {
       endpoint = resolveEndpoint(rootResolved);

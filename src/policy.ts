@@ -43,6 +43,10 @@
  * name. A disk that folds nothing uses the first reading alone, so folding
  * only ever adds matches. A key, a name that is not a workspace file, is
  * matched as requested only.
+ *
+ * A file name under the reserved `subject:` prefix, in any of those readings,
+ * matches no pattern at all: it is untracked and never strict. Keys are
+ * matched as before.
  */
 import { randomBytes } from "node:crypto";
 import { writeFileSync, renameSync, mkdirSync, rmSync, lstatSync, realpathSync, type Stats } from "node:fs";
@@ -75,6 +79,18 @@ export interface PolicyMatchContext {
 }
 
 export const UNFOLDED_FILE: PolicyMatchContext = { profile: "none", kind: "file" };
+
+/**
+ * The prefix reserved for subjects. This coordinator does not support
+ * subjects, so it must never coordinate a file under the prefix as an
+ * ordinary file: a subject client would read that answer as its own.
+ */
+const SUBJECT_NAME_PREFIX = "subject:";
+
+/** True when any of the given forms of one name starts with the reserved subject prefix. */
+export function isUnderSubjectPrefix(forms: ReadonlyArray<string | undefined>): boolean {
+  return forms.some((form) => form !== undefined && form.startsWith(SUBJECT_NAME_PREFIX));
+}
 
 /** Mirror of Python coordinator_server.MAX_POLICY_PATHS_PER_REQUEST. */
 export const MAX_POLICY_PATHS_PER_REQUEST = 20;
@@ -230,12 +246,28 @@ export class TrackedArtifactPolicy {
     return policy;
   }
 
+  /**
+   * The policy `load` reads, writing nothing to stderr. A hook client prints
+   * only its answer, so a warning about a policy file would reach the user's
+   * stderr on every hook; the coordinator reports these diagnostics when it
+   * loads the same files. Python's `TrackedArtifactPolicy.read_quietly`.
+   */
+  static readQuietly(coordinatorRoot: string): TrackedArtifactPolicy {
+    return TrackedArtifactPolicy.read(coordinatorRoot, new Set(), dropWarning);
+  }
+
   /** Read the policy files, without `load`'s spawn-time diagnostic. */
-  private static read(coordinatorRoot: string, linkedPrefixesLogged: Set<string>): TrackedArtifactPolicy {
+  private static read(
+    coordinatorRoot: string,
+    linkedPrefixesLogged: Set<string>,
+    warn: WarningSink = warnOnStderr,
+  ): TrackedArtifactPolicy {
     const rejected: RejectedPattern[] = [];
-    const added = loadYamlPatterns(join(coordinatorRoot, ".coherence", "tracked.yaml"), rejected);
-    const ignored = loadYamlPatterns(join(coordinatorRoot, ".coherence", "ignored.yaml"), rejected);
-    const strict = loadYamlPatterns(join(coordinatorRoot, ".coherence", "strict_mode.yaml"), rejected);
+    const policyFile = (name: string) =>
+      loadYamlPatterns(join(coordinatorRoot, ".coherence", name), rejected, warn);
+    const added = policyFile("tracked.yaml");
+    const ignored = policyFile("ignored.yaml");
+    const strict = policyFile("strict_mode.yaml");
     return new TrackedArtifactPolicy({
       coordinatorRoot,
       trackedPatterns: DEFAULT_TRACKED_PATTERNS,
@@ -858,20 +890,23 @@ interface NameReadings {
   readonly folded: FoldedName | undefined;
 }
 
-/** The readings of `name` under `context`, or null when it is not a relative name. */
+/**
+ * The readings of `name` under `context`, or null when it is not a relative
+ * name or is a file under the reserved subject prefix as typed, tidied or
+ * folded: every spelling that reaches such a file's row, so none of them is
+ * tracked or strict. A key under the prefix is read as any key, because a
+ * tracked pattern may cover it on purpose.
+ */
 function readingsOf(name: string, context: PolicyMatchContext): NameReadings | null {
   const requested = normalizeRelative(name, context.kind);
   if (requested === null) return null;
+  const profile = foldingProfileOf(requested, context);
+  const folded = profile === undefined ? undefined : { text: policyFold(requested, profile), profile };
+  if (context.kind === "file" && isUnderSubjectPrefix([name, requested, folded?.text])) return null;
   const typed = context.kind === "file" ? stripLeadingDotSlash(name) : null;
   const asTyped = typed !== null && typed !== requested ? { asTyped: typed } : {};
-  const profile = foldingProfileOf(requested, context);
-  if (profile === undefined) return { requested, ...asTyped, onDisk: undefined, folded: undefined };
-  return {
-    requested,
-    ...asTyped,
-    onDisk: context.diskSpelling,
-    folded: { text: policyFold(requested, profile), profile },
-  };
+  if (folded === undefined) return { requested, ...asTyped, onDisk: undefined, folded: undefined };
+  return { requested, ...asTyped, onDisk: context.diskSpelling, folded };
 }
 
 /**
@@ -1926,11 +1961,15 @@ function union(first: ReadonlyArray<string>, second: ReadonlyArray<string>): str
 /**
  * Read a YAML file containing a list of pattern strings. Apply path-traversal
  * guard. Returns surviving patterns; mutates rejected with (pattern, reason)
- * for each rejection.
+ * for each rejection; each WARNING line goes to `warn`.
  */
-function loadYamlPatterns(yamlPath: string, rejected: RejectedPattern[]): string[] {
+function loadYamlPatterns(
+  yamlPath: string,
+  rejected: RejectedPattern[],
+  warn: WarningSink,
+): string[] {
   const surviving: string[] = [];
-  for (const item of loadYamlList(yamlPath, rejected)) {
+  for (const item of loadYamlList(yamlPath, rejected, warn)) {
     if (typeof item !== "string") {
       rejected.push({
         pattern: describeNonString(item),
@@ -1960,19 +1999,28 @@ function describeNonString(item: unknown): string {
   return Array.isArray(item) ? "<list>" : `<${pythonTypeName(item)}>`;
 }
 
+/** Where a policy read's WARNING lines go: stderr, except on a quiet read. */
+type WarningSink = (line: string) => void;
+
+const warnOnStderr: WarningSink = (line) => {
+  process.stderr.write(line);
+};
+
+const dropWarning: WarningSink = () => undefined;
+
 /**
  * The top-level list of a policy file, or [] when the file loads as no entries.
  *
  * Missing, empty or null file → []. An unreadable file, malformed YAML or a
- * non-list top level → [] + logged WARNING + one rejected entry for the whole
- * file, under the name and reason the Python coordinator records (#192): the
+ * non-list top level → [] + a WARNING line to `warn` + one rejected entry for
+ * the whole file, under the name and reason the Python coordinator records (#192): the
  * warning reaches only the coordinator's log, and the rejected count on
  * /status is what tells an emptied file apart from no user patterns. A
  * symlink is rejected the same way and never read (#251). A FIFO or a device
  * loads as [] without a word. A socket fails the open itself, so it is a file
  * that could not be read, as on the Python coordinator.
  */
-function loadYamlList(yamlPath: string, rejected: RejectedPattern[]): unknown[] {
+function loadYamlList(yamlPath: string, rejected: RejectedPattern[], warn: WarningSink): unknown[] {
   const name = policyFileName(yamlPath);
   let text: string;
   try {
@@ -1981,11 +2029,11 @@ function loadYamlList(yamlPath: string, rejected: RejectedPattern[]): unknown[] 
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR" || code === "EISDIR" || code === NOT_REGULAR) return [];
     if (code === "ELOOP") {
-      process.stderr.write(`agent-coherence: WARNING — ${yamlPath} is a symlink; it loads as no entries\n`);
+      warn(`agent-coherence: WARNING — ${yamlPath} is a symlink; it loads as no entries\n`);
       rejected.push({ pattern: name, reason: "a symlink, so the file loads as no entries" });
       return [];
     }
-    process.stderr.write(
+    warn(
       `agent-coherence: WARNING — could not read ${yamlPath}; it loads as no entries: ${String(err)}\n`,
     );
     rejected.push({ pattern: name, reason: "could not be read, so the file loads as no entries" });
@@ -1996,7 +2044,7 @@ function loadYamlList(yamlPath: string, rejected: RejectedPattern[]): unknown[] 
   try {
     raw = yamlLoad(text);
   } catch (err) {
-    process.stderr.write(
+    warn(
       `agent-coherence: WARNING — malformed YAML at ${yamlPath}; falling back to defaults: ${String(err)}\n`,
     );
     rejected.push({ pattern: name, reason: "not valid YAML, so the file loads as no entries" });
@@ -2005,7 +2053,7 @@ function loadYamlList(yamlPath: string, rejected: RejectedPattern[]): unknown[] 
 
   if (raw === null || raw === undefined) return [];
   if (!Array.isArray(raw)) {
-    process.stderr.write(
+    warn(
       `agent-coherence: WARNING — ${yamlPath} top-level must be a list of patterns; got ${typeof raw}. Ignoring.\n`,
     );
     rejected.push({

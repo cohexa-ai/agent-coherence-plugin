@@ -25,7 +25,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { request } from "node:http";
+import { type ClientRequest, request } from "node:http";
 import { linkRefusalMessage } from "./coherence_dir.js";
 import {
   type CoordinatorPin,
@@ -44,6 +44,15 @@ export class CoordinatorUnavailable extends Error {}
  */
 export class CoordinatorDeparted extends CoordinatorUnavailable {}
 
+/**
+ * No coordinator port is known for the workspace: server.pid is absent, or it
+ * reads with no port line, as in a workspace where no coordinator was started.
+ * A pid file that cannot be read, or that names a coordinator that has exited,
+ * still raises the parent class, so a caller can tell "no coordinator" from
+ * "a coordinator that cannot answer" while every existing catch takes both.
+ */
+export class CoordinatorPortUnknown extends CoordinatorUnavailable {}
+
 /** Per-git-call wall-clock bound (mirrors the Python resolver's timeout=5.0). */
 const GIT_TIMEOUT_MS = 5000;
 
@@ -55,6 +64,14 @@ export interface CoordinatorEndpoint {
    * for an endpoint built by hand, which no pid file describes.
    */
   pin?: CoordinatorPin;
+  /**
+   * When, in epoch milliseconds, every request on this endpoint must be over:
+   * one started after it is refused before anything is checked or sent, and
+   * one still running then is destroyed. The socket's idle limit cannot bound
+   * a request like this, because a peer that sends a byte now and then keeps
+   * resetting it. None: a request is bounded by its idle limit only.
+   */
+  deadlineAt?: number;
 }
 
 /** Parent repo root from any path inside it (mirrors Python resolver.find_coordinator_root). */
@@ -147,9 +164,11 @@ function runningCoordinatorLines(coherenceDir: string): { lines: PidFileLines; p
     throw new CoordinatorUnavailable(`${pidFile} is not a regular file; restart the coordinator`);
   }
   const lines = read.status === "read" ? read.lines : null;
-  if (lines === null || lines.port === null) {
-    throw new CoordinatorUnavailable(`no coordinator running for this workspace (no port in ${pidFile})`);
-  }
+  const noPort = `no coordinator running for this workspace (no port in ${pidFile})`;
+  // A file that cannot be read may still name a coordinator that runs, so only
+  // one that is absent, or read with no port, says that none does.
+  if (read.status === "absent" || lines?.port === null) throw new CoordinatorPortUnknown(noPort);
+  if (lines === null || lines.port === null) throw new CoordinatorUnavailable(noPort);
   const evidence = exitEvidence(pidFile, lines);
   if (evidence !== null) {
     throw new CoordinatorUnavailable(
@@ -191,6 +210,8 @@ export const HOOK_REQUEST_TIMEOUT_MS = 5000;
  */
 export const CLI_REQUEST_TIMEOUT_MS = 6000;
 
+const DEADLINE_PASSED = "request deadline passed";
+
 /**
  * Authenticated JSON request. Resolves to the parsed body on 2xx, null on a
  * non-2xx response (the Python HTTPError→None degrade), and rejects on a
@@ -215,7 +236,10 @@ export async function requestJson(
  * bounds how long the socket may sit idle; the hooks' limit unless given.
  * Rejects with CoordinatorDeparted, no socket opened, once the coordinator a
  * pinned endpoint was resolved from may no longer be the one on its port: a
- * process that took the port never receives the bearer.
+ * process that took the port never receives the bearer. An endpoint's
+ * `deadlineAt` bounds the request by the wall clock as well: once it has
+ * passed the request is refused before that check and before any socket, and
+ * a request still running when it passes is destroyed and rejected.
  */
 export function requestJsonStatus(
   endpoint: CoordinatorEndpoint,
@@ -226,6 +250,10 @@ export function requestJsonStatus(
   timeoutMs: number = HOOK_REQUEST_TIMEOUT_MS,
 ): Promise<{ status: number; body: Record<string, unknown> | null }> {
   return new Promise((resolvePromise, rejectPromise) => {
+    if (endpoint.deadlineAt !== undefined && endpoint.deadlineAt <= Date.now()) {
+      rejectPromise(new Error(`${DEADLINE_PASSED}; nothing was sent`));
+      return;
+    }
     const departure = endpoint.pin === undefined ? null : pinDeparture(endpoint.pin);
     if (departure !== null) {
       rejectPromise(new CoordinatorDeparted(`${departure}; nothing was sent`));
@@ -273,9 +301,26 @@ export function requestJsonStatus(
     );
     req.on("timeout", () => req.destroy(new Error("request timeout")));
     req.on("error", (err) => rejectPromise(err));
+    if (endpoint.deadlineAt !== undefined) destroyAtDeadline(req, endpoint.deadlineAt, rejectPromise);
     if (payload !== null) req.write(payload);
     req.end();
   });
+}
+
+/**
+ * Destroy `req` at `deadlineAt`, whatever its peer is sending by then. The
+ * timer goes once the request closes, so a request answered in time leaves
+ * nothing behind to hold the process up.
+ */
+function destroyAtDeadline(req: ClientRequest, deadlineAt: number, reject: (err: Error) => void): void {
+  const timer = setTimeout(() => {
+    const passed = new Error(DEADLINE_PASSED);
+    // Rejected before the destroy: on a response already under way the destroy
+    // also raises the cut-off error, which must not stand in for this one.
+    reject(passed);
+    req.destroy(passed);
+  }, Math.max(0, deadlineAt - Date.now()));
+  req.once("close", () => clearTimeout(timer));
 }
 
 /**

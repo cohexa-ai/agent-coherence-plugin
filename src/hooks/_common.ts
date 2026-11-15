@@ -224,6 +224,23 @@ export function hasSubagentIdField(body: Record<string, unknown>): boolean {
  */
 export const MALFORMED_SUBAGENT_ERROR = "agent_id must be 1-64 chars of [A-Za-z0-9_-]";
 
+const SUBJECT_UNSUPPORTED_REASON = "subject_unsupported";
+// Ends with its reason, as the Python coordinator's typed refusals do, so the
+// text alone tells the refusal apart.
+const SUBJECT_UNSUPPORTED_ERROR =
+  "subject: names are reserved for subjects, which this coordinator does not support " +
+  `(${SUBJECT_UNSUPPORTED_REASON})`;
+
+/**
+ * HTTP 400 `{error, reason: "subject_unsupported"}`, an edit route's answer to
+ * a name it refuses as a subject (`isSubjectRequest`). A refusal rather than
+ * the untracked admit, which a subject client would read as acquired or
+ * committed. `reason` is the typed key a client classifies it by.
+ */
+export function writeSubjectUnsupported(res: ServerResponse): void {
+  writeJson(res, 400, { error: SUBJECT_UNSUPPORTED_ERROR, reason: SUBJECT_UNSUPPORTED_REASON });
+}
+
 export function isValidSessionId(s: unknown): s is string {
   return typeof s === "string" && SESSION_ID_RE.test(s);
 }

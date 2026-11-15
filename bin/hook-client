@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
-# agent-coherence plugin: universal hook-client dispatch shim (zero-Python Unit 5).
+# agent-coherence plugin: the hook-client dispatch shim every hook runs.
 #
 # Hooks route through this ONE shim so the client selection is a single seam:
-#   1. Node hook-client (dist/hook_client.js) — preferred. Uses ONLY node:
-#      builtins (no node_modules), so it runs with no npm install and no
-#      Python. Probed in the package's own dist/ (dev checkout) THEN the
-#      PLUGIN_DATA copy that ensure-coordinator-node provisions at
-#      SessionStart — a marketplace install is a git clone and dist/ is
-#      gitignored, so there the DATA copy is the only Node client that
-#      exists. Backend-agnostic: it POSTs to whichever coordinator holds
+#   1. Node hook-client (dist/hook_client.js) — preferred. It needs no Python,
+#      but it does load packages from the node_modules beside its dist/: uuid
+#      on every hook, and js-yaml, through the policy module, for a pre-edit
+#      when .coherence/hook_on_held turns the held-file refusal on. Without
+#      js-yaml that refusal is silently off. Probed in the package's own
+#      dist/ (dev checkout) THEN the PLUGIN_DATA copy that
+#      ensure-coordinator-node provisions, with its node_modules, at a
+#      Node-backend SessionStart — a marketplace install is a git clone and
+#      dist/ is gitignored, so there the DATA copy is the only Node client
+#      that exists. Backend-agnostic: it POSTs to whichever coordinator holds
 #      .coherence/server.pid.
 #   2. Python agent-coherence-hook-client — fallback for environments with
-#      no `node` on PATH (a Python-backend user who never needed Node).
-#   3. Emit `{}` — the hook contract's fail-open floor: Claude Code must
-#      never see a hook block a tool call (exit 0, parseable stdout).
+#      no `node` on PATH (a Python-backend user who never needed Node), or no
+#      built Node client.
+#   3. Emit `{}` when neither client can run: the hook then admits the tool
+#      call (exit 0, parseable stdout).
+#
+# Either client exits 0 and fails open, printing `{}` when the coordinator
+# cannot answer, with one opt-in exception: with .coherence/hook_on_held
+# holding `refuse`, a pre-edit of a strict file is denied when a coordinator
+# is known but cannot confirm that no other agent holds the file. With no
+# coordinator running, that edit is admitted as before.
 #
 # stdin (the CC hook JSON payload) passes through exec to the real client.
 
@@ -34,6 +44,6 @@ if command -v agent-coherence-hook-client >/dev/null 2>&1; then
   exec agent-coherence-hook-client "$@"
 fi
 
-# Fail-open floor: no client available — degrade silently.
+# Neither client can run: print `{}`, which admits the tool call.
 echo "{}"
 exit 0

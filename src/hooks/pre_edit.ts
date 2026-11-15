@@ -18,6 +18,8 @@
  *   An opted-in request whose `agent_id` is present but malformed answers
  *   HTTP 400 `{error}` in the Python coordinator's wording for that fault; an
  *   ordinary one reads it as the parent.
+ * - A name refused as a subject (`isSubjectRequest`): HTTP 400 `{error,
+ *   reason: "subject_unsupported"}`, after the 400s above.
  *
  * Note on collision detection ordering: the Python handler peeks `exclusiveHolder`
  * BEFORE calling `write()` (which would invalidate the holder). We mirror this:
@@ -54,11 +56,13 @@ import {
   type HookDeps,
   writeError,
   writeJson,
+  writeSubjectUnsupported,
 } from "./_common.js";
 import { attachPreToolUseContext, deliverPendingReground, writeFastAdmit } from "./reground.js";
 import {
   findRequested,
   isStrictRequest,
+  isSubjectRequest,
   isTrackedRequest,
   readRequestName,
   resolveRequested,
@@ -142,6 +146,12 @@ export async function handlePreEdit(
   const fields = body as Record<string, unknown>;
   if (optedIn && readSubagentId(fields) === null && hasSubagentIdField(fields)) {
     writeError(res, 400, MALFORMED_SUBAGENT_ERROR);
+    return;
+  }
+
+  // Before the untracked exit, whose admit a subject client would read as acquired.
+  if (isSubjectRequest(deps, name)) {
+    writeSubjectUnsupported(res);
     return;
   }
 

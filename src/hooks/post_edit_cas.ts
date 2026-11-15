@@ -5,6 +5,8 @@
  * Node port of Python `_handle_post_edit_cas` (coordinator_server.py:1920).
  * Wire bodies are byte-parity with Python (STABLE, per its docstring):
  *  - 400 `{error: …}` with Python's exact validation strings
+ *  - a name refused as a subject (`isSubjectRequest`), after those: 400
+ *    `{error, reason: "subject_unsupported"}`, a Node-only answer
  *  - untracked → `{ok: true}`; unknown-at-commit → `{ok:true, note:"untracked-at-commit"}`
  *  - WIN → `{ok: true, version: N+1}`
  *  - conflict → `{ok: false, reason, current_version}` (reason matched EXACTLY
@@ -29,8 +31,9 @@ import {
   isValidContentHashRequired,
   nowTick as nowTickFn,
   readSubagentId,
+  writeSubjectUnsupported,
 } from "./_common.js";
-import { findRequested, isTrackedRequest, readRequestName } from "./door.js";
+import { findRequested, isSubjectRequest, isTrackedRequest, readRequestName } from "./door.js";
 
 interface PostEditCasBody {
   session_id?: unknown;
@@ -65,6 +68,12 @@ export async function handlePostEditCas(
     expectedVersion < 0
   ) {
     writeError(res, 400, "expected_version must be a non-negative integer");
+    return;
+  }
+
+  // Before the untracked exit, which accepts a commit at any expected version.
+  if (isSubjectRequest(deps, name)) {
+    writeSubjectUnsupported(res);
     return;
   }
 

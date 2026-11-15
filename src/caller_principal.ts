@@ -293,7 +293,12 @@ export function storeCallerPrincipal(root: string, key: string, principal: strin
   }
 }
 
-/** One `POST /principal/claim`. Transport failures come back as `unconfirmed`. */
+/**
+ * One `POST /principal/claim`. Transport failures come back as `unconfirmed`,
+ * the endpoint's deadline running out among them: the claim is sent on the
+ * endpoint it is given, so it is bounded by the same deadline as the request
+ * it is for.
+ */
 export async function claimCallerPrincipal(
   endpoint: CoordinatorEndpoint,
   sessionId: string,
