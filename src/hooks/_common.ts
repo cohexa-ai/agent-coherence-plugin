@@ -65,6 +65,20 @@ export function isRecentSelfCommitLag(artifact: Artifact, agentId: string, now: 
   return artifact.last_writer_id === agentId && now - artifact.updated_at <= SHARED_FOREIGN_DENY_LAG_WINDOW_SEC;
 }
 
+/**
+ * Python `_a_write_is_in_flight`: another session holds an uncommitted write
+ * claim whose bytes may still be landing, so a differing disk proves nothing.
+ * Node records no heartbeats, so only Python's no-heartbeat arm applies: any
+ * peer in EXCLUSIVE counts as in flight. Python skips the check only when
+ * that peer's heartbeat is within 5 s, so the two differ only for a peer
+ * that has held EXCLUSIVE silently for longer, and the check never denies.
+ * A peer on another row of the file's fold bucket counts: its bytes land in
+ * the same file.
+ */
+export function aWriteIsInFlight(deps: HookDeps, artifactId: string, agentId: string): boolean {
+  return deps.registry.hasExclusivePeer(artifactId, agentId);
+}
+
 /** Python `HANDLER_FAILURE_REASON_PREFIX`; library clients match it as a prefix. */
 const HANDLER_FAILURE_REASON_PREFIX = "internal: ";
 
@@ -201,6 +215,14 @@ export function hasSubagentIdField(body: Record<string, unknown>): boolean {
   // has_subagent_id_field.
   return raw !== undefined && raw !== null && raw !== "";
 }
+
+/**
+ * The 400 `error` for a present subagent id that fails the grammar, on a
+ * request that refuses one rather than reading it as the parent. Python
+ * `_MALFORMED_SUBAGENT_ERROR`, word for word, so a client sees one phrase for
+ * one fault on either backend.
+ */
+export const MALFORMED_SUBAGENT_ERROR = "agent_id must be 1-64 chars of [A-Za-z0-9_-]";
 
 export function isValidSessionId(s: unknown): s is string {
   return typeof s === "string" && SESSION_ID_RE.test(s);
@@ -367,6 +389,11 @@ export interface Regrant {
  * Grep passes none: its path set is every tracked file under its root, not
  * what it showed, so crediting a held file would advance a baseline the
  * session was just told to re-read.
+ *
+ * Each path granted or credited here also drops the session's stale-deny
+ * record for it: the row is valid again, so the record would otherwise
+ * outlive the staleness it was armed for and admit, with no deny, the first
+ * Read after the next commit -- and an Edit sent with that Read.
  */
 export function applyRegrants(
   deps: HookDeps,
@@ -376,8 +403,12 @@ export function applyRegrants(
 ): void {
   for (const { artifactId, trigger } of regrants) {
     deps.registry.grantShared(artifactId, agentId, opts.nowTick, trigger, opts.commandRuns);
+    deps.sessions.dropStaleDeny(agentId, artifactId);
   }
   if (opts.commandRuns) {
-    for (const artifactId of opts.held) deps.registry.recordObservation(artifactId, agentId);
+    for (const artifactId of opts.held) {
+      deps.registry.recordObservation(artifactId, agentId);
+      deps.sessions.dropStaleDeny(agentId, artifactId);
+    }
   }
 }

@@ -7,7 +7,9 @@
  *    zero-fraction case) and the <unknown> sentinel (never [:8]-sliced).
  * 2. The pre-read 2×2 gate truth table — (None, matches) must NOT deny.
  * 3. KTD-U terminal denial — emitAllow throws on the strict class.
- * 4. KTD-T stickiness — a denied pre-read re-denies (no SHARED re-grant).
+ * 4. KTD-T stickiness — a denied pre-read of bytes that are not the recorded
+ *    ones re-denies (no SHARED re-grant). The Read of the recorded bytes
+ *    after a deny is admitted: see stale_read_recovery.test.ts (#514).
  * 5. Empty strict_mode.yaml → warn-only (v0.1.1 default preserved).
  */
 import { test } from "node:test";
@@ -26,10 +28,14 @@ import { MESIState } from "../states.js";
 import {
   emitAllow,
   emitStrictDeny,
+  emitUnrecordedBytesDeny,
+  GRANT_CHANGE_DENY_REASON_TEMPLATE,
   OUT_OF_BAND_CHANGE_NOTICE_TEMPLATE,
   OUT_OF_BAND_DENY_REASON_TEMPLATE,
   pythonIsoUtc,
+  STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE,
   STRICT_MODE_DENY_REASON_TEMPLATE,
+  WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE,
   type StaleSummary,
   staleReadWarning,
   editCollisionWarning,
@@ -83,9 +89,9 @@ test("emitStrictDeny: byte-identical reason (real writer, fractional ts) + no ad
     permissionDecision: "deny",
     permissionDecisionReason:
       "Stale read denied: docs/plan.md was updated by agent 55555555 " +
-      "at 2025-05-24T12:00:00.123456+00:00. Re-read docs/plan.md via the Read tool before " +
-      "proceeding. This denial is structural (v0.2 strict mode); retrying " +
-      "the same operation will produce the same denial.",
+      "at 2025-05-24T12:00:00.123456+00:00. Read docs/plan.md again with the Read tool: " +
+      "the next Read returns the current version, and edits of docs/plan.md are " +
+      "denied until you have read it.",
   });
   assert.equal("additionalContext" in out, false);
 });
@@ -101,15 +107,14 @@ test("emitStrictDeny: the path is inserted verbatim — no $-pattern or placehol
   // byte-for-byte against Python's `emit_strict_deny` for every path here.
   const writeReason = (p: string): string =>
     `Stale read denied: ${p} was updated by agent 01234567 ` +
-    `at 2026-09-21T14:13:20.500000+00:00. Re-read ${p} via the Read tool before ` +
-    "proceeding. This denial is structural (v0.2 strict mode); retrying " +
-    "the same operation will produce the same denial.";
+    `at 2026-09-21T14:13:20.500000+00:00. Read ${p} again with the Read tool: ` +
+    `the next Read returns the current version, and edits of ${p} are denied ` +
+    "until you have read it.";
   const grantReason = (p: string): string =>
     `Stale read denied: your grant on ${p} was revoked and no new version ` +
-    `was committed — ${p} is still at v3. Re-read ` +
-    `${p} via the Read tool before proceeding. This denial is structural ` +
-    "(v0.2 strict mode); retrying the same operation will produce the same " +
-    "denial.";
+    `was committed — ${p} is still at v3. Read ${p} again with the Read ` +
+    `tool: the next Read returns the current version, and edits of ${p} are ` +
+    "denied until you have read it.";
   // `prior` picks the template via summaryReportsAWrite: null (never observed)
   // renders the write text; 3 (equal to current_version) the grant-change text.
   const render = (path: string, prior: number | null): string | undefined =>
@@ -256,9 +261,80 @@ test("shortSessionId is the single shortener: sentinel whole, real id to 8", () 
   assert.equal(shortSessionId("no-open-bracket>"), "no-open-");
 });
 
-test("template placeholder set is locked (KTD-P)", () => {
-  const placeholders = [...STRICT_MODE_DENY_REASON_TEMPLATE.matchAll(/\{(\w+)\}/g)].map((m) => m[1]);
-  assert.deepEqual(placeholders, ["path", "last_writer_short", "last_writer_ts_iso", "path"]);
+test("template placeholder sets are locked (KTD-P)", () => {
+  const placeholders = (template: string) => [...template.matchAll(/\{(\w+)\}/g)].map((m) => m[1]);
+  assert.deepEqual(placeholders(STRICT_MODE_DENY_REASON_TEMPLATE), [
+    "path",
+    "last_writer_short",
+    "last_writer_ts_iso",
+    "path",
+    "path",
+  ]);
+  assert.deepEqual(placeholders(GRANT_CHANGE_DENY_REASON_TEMPLATE), [
+    "path",
+    "path",
+    "current_version",
+    "path",
+    "path",
+  ]);
+  assert.deepEqual(placeholders(STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE), [
+    "path",
+    "current_version",
+    "path",
+    "path",
+  ]);
+  assert.deepEqual(placeholders(WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE), [
+    "path",
+    "path",
+    "current_version",
+    "path",
+  ]);
+});
+
+test("the stale-copy texts promise the Read; the texts a Read cannot clear keep the same-denial sentence (#514)", () => {
+  const sameDenial = "retrying the same operation will produce the same denial";
+  const nextRead = "the next Read returns the current version";
+  for (const template of [STRICT_MODE_DENY_REASON_TEMPLATE, GRANT_CHANGE_DENY_REASON_TEMPLATE]) {
+    assert.equal(template.includes(sameDenial), false, template);
+    assert.equal(template.includes(nextRead), true, template);
+  }
+  for (const template of [OUT_OF_BAND_DENY_REASON_TEMPLATE, STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE]) {
+    assert.equal(template.includes(sameDenial), true, template);
+    assert.equal(template.includes(nextRead), false, template);
+  }
+  // A write in flight is cleared by its commit, and the text says to wait for it.
+  assert.equal(WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE.includes(sameDenial), false);
+  assert.equal(WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE.includes(nextRead), false);
+  // Neither variant for bytes that are not the recorded ones claims a version the reader last read.
+  for (const template of [STALE_OUT_OF_BAND_DENY_REASON_TEMPLATE, WRITE_IN_FLIGHT_DENY_REASON_TEMPLATE]) {
+    assert.equal(template.includes("the version you last read"), false, template);
+    assert.equal(template.includes("updated by agent"), false, template);
+  }
+});
+
+test("emitUnrecordedBytesDeny: the out-of-band and write-in-flight variants, byte for byte (#514)", () => {
+  const summary: StaleSummary = { ...grantChangeSummary(), current_version: 2, hash_differs: true };
+  const reason = (writeInFlight: boolean) =>
+    emitUnrecordedBytesDeny({ source: "pre_read_strict_deny", summary, writeInFlight }).permissionDecisionReason;
+  assert.equal(
+    reason(false),
+    "Stale read denied: docs/plan.md on disk does not match v2, the last version committed through " +
+      "the coordinator, and no session committed the change, so it was made outside the coordinator. " +
+      "Do not restore or overwrite docs/plan.md: the change may be your user's work. Tell your user " +
+      "that docs/plan.md changed outside the coordinator; the read stays denied until the change is " +
+      "committed through the coordinator. This denial is structural (v0.2 strict mode); retrying the " +
+      "same operation will produce the same denial.",
+  );
+  assert.equal(
+    reason(true),
+    "Stale read denied: another agent is writing docs/plan.md and has not committed it yet, so " +
+      "docs/plan.md on disk does not match v2, the last version committed through the coordinator. " +
+      "Wait for that write to be committed, then Read docs/plan.md again with the Read tool.",
+  );
+  assert.equal(
+    "additionalContext" in emitUnrecordedBytesDeny({ source: "t", summary, writeInFlight: false }),
+    false,
+  );
 });
 
 test("out-of-band templates: placeholder sets and bytes are locked to Python's (#205)", () => {
@@ -368,17 +444,17 @@ test("pre-read strict gate truth table: INVALID→deny; (None,differs)→deny; (
     const invalidDeny = await post("/hooks/pre-read", {
       session_id: SID_A,
       path: "CLAUDE.md",
-      content_hash: HASH_1,
+      content_hash: HASH_2,
     });
     assert.equal(decision(invalidDeny), "deny");
     assert.equal(invalidDeny.status, "stale");
 
-    // KTD-T sticky: the deny did NOT re-grant SHARED — an identical retry re-denies
-    // with byte-identical reason text.
+    // KTD-T sticky: the deny did NOT re-grant SHARED — a retry of bytes that
+    // are not the recorded ones re-denies with byte-identical reason text.
     const retry = await post("/hooks/pre-read", {
       session_id: SID_A,
       path: "CLAUDE.md",
-      content_hash: HASH_1,
+      content_hash: HASH_2,
     });
     assert.equal(decision(retry), "deny");
     assert.equal(
@@ -663,10 +739,10 @@ test("emitStrictDeny: a grant handover reports no write and names the unchanged 
     permissionDecision: "deny",
     permissionDecisionReason:
       "Stale read denied: your grant on docs/plan.md was revoked and no new " +
-      "version was committed — docs/plan.md is still at v1. Re-read " +
-      "docs/plan.md via the Read tool before proceeding. This denial is " +
-      "structural (v0.2 strict mode); retrying the same operation will " +
-      "produce the same denial.",
+      "version was committed — docs/plan.md is still at v1. Read " +
+      "docs/plan.md again with the Read tool: the next Read returns the " +
+      "current version, and edits of docs/plan.md are denied until you " +
+      "have read it.",
   });
   assert.equal(out.permissionDecisionReason!.includes("was updated by"), false);
 });
@@ -691,9 +767,9 @@ test("emitStrictDeny: a real commit still names the writing agent and its tick",
   assert.equal(
     out.permissionDecisionReason,
     "Stale read denied: docs/plan.md was updated by agent d7f57e87 at " +
-      "2025-05-24T12:00:00+00:00. Re-read docs/plan.md via the Read tool " +
-      "before proceeding. This denial is structural (v0.2 strict mode); " +
-      "retrying the same operation will produce the same denial.",
+      "2025-05-24T12:00:00+00:00. Read docs/plan.md again with the Read " +
+      "tool: the next Read returns the current version, and edits of " +
+      "docs/plan.md are denied until you have read it.",
   );
 });
 
@@ -799,7 +875,9 @@ test("denied pre-bash then a grant handover: the deny still reports the write A 
     await post("/hooks/pre-bash", { session_id: SID_A, command: `cat ${STRICT_PATH}` });
     handOverWithoutCommit(registry, ids);
 
-    const r = await post("/hooks/pre-read", { session_id: SID_A, path: STRICT_PATH });
+    // The recorded bytes, as the hook client hashes them: a Read with no hash
+    // means the file is gone, which has a deny text of its own (#514).
+    const r = await post("/hooks/pre-read", { session_id: SID_A, path: STRICT_PATH, content_hash: HASH_2 });
     assert.equal(decision(r), "deny");
     const reason = (r.hookSpecificOutput as Record<string, string>).permissionDecisionReason;
     assert.match(reason, /plan\.md was updated by agent /);
@@ -1000,7 +1078,9 @@ test("a bash retry then a grant handover reports no write", async () => {
     await post("/hooks/pre-bash", { session_id: SID_A, command: `cat ${STRICT_PATH}` });
     handOverWithoutCommit(registry, ids);
 
-    const r = await post("/hooks/pre-read", { session_id: SID_A, path: STRICT_PATH });
+    // The recorded bytes, as the hook client hashes them: a Read with no hash
+    // means the file is gone, which has a deny text of its own (#514).
+    const r = await post("/hooks/pre-read", { session_id: SID_A, path: STRICT_PATH, content_hash: HASH_2 });
     assert.equal(decision(r), "deny");
     const reason = (r.hookSpecificOutput as Record<string, string>).permissionDecisionReason;
     assert.doesNotMatch(reason, /was updated by/);
@@ -1055,7 +1135,9 @@ test("a Grep after a denied bash does not count as reading the file", async () =
     assert.equal(registry.lastObservedVersionFor(ids.id, ids.agentA), 1);
 
     handOverWithoutCommit(registry, ids);
-    const r = await post("/hooks/pre-read", { session_id: SID_A, path: STRICT_PATH });
+    // The recorded bytes, as the hook client hashes them: a Read with no hash
+    // means the file is gone, which has a deny text of its own (#514).
+    const r = await post("/hooks/pre-read", { session_id: SID_A, path: STRICT_PATH, content_hash: HASH_2 });
     assert.equal(decision(r), "deny");
     const reason = (r.hookSpecificOutput as Record<string, string>).permissionDecisionReason;
     assert.match(reason, /plan\.md was updated by agent /);

@@ -15,6 +15,9 @@
  *   "other_holder", holder_agent_id}` while another agent holds the path for
  *   writing, in that key order; otherwise an admit that never carries a
  *   collision warning. Any other `if_unheld` value is an ordinary request.
+ *   An opted-in request whose `agent_id` is present but malformed answers
+ *   HTTP 400 `{error}` in the Python coordinator's wording for that fault; an
+ *   ordinary one reads it as the parent.
  *
  * Note on collision detection ordering: the Python handler peeks `exclusiveHolder`
  * BEFORE calling `write()` (which would invalidate the holder). We mirror this:
@@ -39,10 +42,13 @@ import {
 } from "../hook_payloads.js";
 import {
   assertNever,
+  aWriteIsInFlight,
   drainNoticeText,
+  hasSubagentIdField,
   holdsContentClaim,
   isRecentSelfCommitLag,
   isValidSessionId,
+  MALFORMED_SUBAGENT_ERROR,
   readJsonBody,
   readSubagentId,
   type HookDeps,
@@ -59,20 +65,6 @@ import {
 } from "./door.js";
 
 export type PreEditDeps = HookDeps;
-
-/**
- * Python `_a_write_is_in_flight`: another session holds an uncommitted write
- * claim whose bytes may still be landing, so a differing disk proves nothing.
- * Node records no heartbeats, so only Python's no-heartbeat arm applies: any
- * peer in EXCLUSIVE counts as in flight. Python skips the check only when
- * that peer's heartbeat is within 5 s, so the two differ only for a peer
- * that has held EXCLUSIVE silently for longer, and the check never denies.
- * A peer on another row of the file's fold bucket counts: its bytes land in
- * the same file.
- */
-function aWriteIsInFlight(deps: PreEditDeps, artifactId: string, agentId: string): boolean {
-  return deps.registry.hasExclusivePeer(artifactId, agentId);
-}
 
 /**
  * Python `_recorded_content_missing_from_disk` (#205): the recorded version
@@ -142,6 +134,17 @@ export async function handlePreEdit(
   const path: string = name.requested;
   const optedIn = body.if_unheld === true;
 
+  // An opted-in caller asks whether ITS OWN identity may take the file. Read
+  // as the parent, a malformed subagent id would answer for the wrong agent:
+  // a subagent whose parent holds the path would be admitted as the parent's
+  // repeat. Refused before the untracked exit, so the answer does not depend
+  // on the policy. An ordinary request still reads it as the parent.
+  const fields = body as Record<string, unknown>;
+  if (optedIn && readSubagentId(fields) === null && hasSubagentIdField(fields)) {
+    writeError(res, 400, MALFORMED_SUBAGENT_ERROR);
+    return;
+  }
+
   // SB-10 U8 (KTD6): the allow-attach seam — runs after every deny
   // decision; strict-deny and refusal bodies pass through untouched.
   const withReground = (result: object): Record<string, unknown> =>
@@ -200,6 +203,9 @@ export async function handlePreEdit(
         warning_generated_at_unix_ts: nowUnix(),
         hash_differs: false, // pre-edit doesn't carry content_hash
       };
+      // This deny counts as the session's one stale deny for the file, so its
+      // next Read of the recorded bytes is admitted (#514).
+      deps.sessions.armStaleDeny(agentId, artifactId);
       writeJson(res, 200, {
         ok: false,
         hookSpecificOutput: emitStrictDeny({ source: "pre_edit_strict_deny", summary }),
@@ -239,6 +245,8 @@ export async function handlePreEdit(
     });
     return;
   }
+  // The session now holds the file, so a later staleness starts from a deny.
+  deps.sessions.dropStaleDeny(agentId, artifactId);
 
   // #205: only an admitted editor is told, and the check never denies.
   const outOfBandVersion = peerWriteInFlight
