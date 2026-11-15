@@ -1,5 +1,5 @@
 /**
- * Unit 3 — Node hook-client: payload-builder parity, fail-open contract,
+ * Unit 3 — Node hook-client: payload-builder parity, fail-open contract (held-file refusal off),
  * and a live end-to-end run against a real coordinator (subprocess, the
  * bin_shims.test.ts style).
  */
@@ -162,7 +162,10 @@ function runClient(args: string[], stdin: string, cwd: string): { stdout: string
   return { stdout: r.stdout, status: r.status };
 }
 
-test("fail-open: coordinator down / bad stdin / unknown sub → '{}' + exit 0, always", () => {
+// The held-file refusal does not apply here: no .coherence/hook_on_held, and no
+// strict entry. With it on, a strict pre-edit against a coordinator that is
+// known but cannot answer is denied instead (hook_client_admission.test.ts).
+test("fail-open with the held-file refusal off and no strict file: coordinator down / bad stdin / unknown sub → '{}' + exit 0", () => {
   const { root, cleanup } = makeWorkspace();
   try {
     // A git repo with NO coordinator running.

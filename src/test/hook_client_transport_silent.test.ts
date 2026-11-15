@@ -12,7 +12,8 @@
  * is a live peer that does not answer, not a half-open routed link, a dropped
  * packet or a partition. The peer is a stub, not a coordinator of either kind.
  * This pins the transport, not what a hook does next: a hook still admits on
- * every one of these rejections.
+ * every one of these rejections, except a pre-edit of a strict file with the
+ * held-file refusal on, which denies.
  *
  * Two quieter cases sit beside them. A workspace with no coordinator port, no
  * server.pid or one with no port line, is refused with its own type, so a
