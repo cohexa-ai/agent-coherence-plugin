@@ -6,7 +6,15 @@ Alpha — APIs and the `hooks.json` wire shape may change before `v1.0`.
 
 The canonical release-notes surface is [GitHub Releases](https://github.com/Cohexa-ai/agent-coherence-plugin/releases); this file mirrors that history in a structured format for operators who prefer a single browsable timeline.
 
-## [Unreleased]
+## [0.7.1] — 2026-11-15
+
+**On the built-in Node coordinator, a strict-mode session whose copy of a file went stale can read the file again after one deny and keep working, the stale-copy deny texts now say so, and an opted-in pre-edit with a malformed subagent id is refused with `HTTP 400`.**
+
+**Upgrade note:**
+
+- **Restart the Node coordinator.** A Node coordinator that an earlier plugin started keeps serving its workspace after the update, with the old behavior, until it stops. From the workspace root, check that `ps -p "$(head -n 1 .coherence/server.pid)" -o command=` names `dist/coordinator.js`, run `kill "$(head -n 1 .coherence/server.pid)"`, then start a new session.
+- **Python-backend workspaces.** The recovery and the new deny texts come from `agent-coherence` releases after 0.16.0, which make the same change in the Python coordinator; 0.16.0 and earlier keep denying every Read. Upgrade the library with the plugin.
+- **Deny texts.** A script or prompt that matches the strict-mode deny texts byte for byte must accept the new wording (see **Changed**).
 
 ### Fixed
 
@@ -21,6 +29,8 @@ The canonical release-notes surface is [GitHub Releases](https://github.com/Cohe
 - **On the built-in Node coordinator, the strict-mode deny texts for a stale copy now say that reading the file again returns the current version ([Cohexa-ai/agent-coherence#514](https://github.com/Cohexa-ai/agent-coherence/issues/514)).** The text for a peer's commit and the text for a revoked grant keep their first sentence, and the rest now reads `Read <path> again with the Read tool: the next Read returns the current version, and edits of <path> are denied until you have read it.`, where it told the agent to re-read the file and said that retrying the same operation would produce the same denial. Pre-read, pre-edit, pre-bash and pre-grep send these two texts. A stale Read whose bytes are not the recorded version, or that carries no hash, and a Read by a session that never read the file whose bytes differ from the record, now get one of two texts that never promise a Read: `Stale read denied: <path> on disk does not match v<n>, the last version committed through the coordinator, and no session committed the change, so it was made outside the coordinator. ...`, which keeps the same-denial sentence, or, while another session holds an uncommitted write of the file, `Stale read denied: another agent is writing <path> and has not committed it yet, so <path> on disk does not match v<n>, the last version committed through the coordinator. Wait for that write to be committed, then Read <path> again with the Read tool.` A session that never read the file got the commit text before, which named the last committer, or `agent <unknown>` when nobody had committed, as the writer of bytes no session committed. The out-of-band text for a reader that still holds the file is unchanged. Each text is the same bytes for a given file and event, and the Python coordinator sends the same bytes in `agent-coherence` releases after 0.16.0.
 
 - **On the built-in Node coordinator, a pre-edit that opts in to acquire-or-fail with a malformed subagent id is now refused with `HTTP 400` ([Cohexa-ai/agent-coherence#519](https://github.com/Cohexa-ai/agent-coherence/issues/519)).** A pre-edit that sends `"if_unheld": true` asks whether the caller's own agent identity may take the file. When its `agent_id` was present but not 1 to 64 characters of `[A-Za-z0-9_-]`, such as `"bad id!"`, a 65-character string, a number or a list, the Node coordinator read it as the parent session and answered for the parent, so a subagent whose parent held the file was admitted as the parent's own repeat. Now such a request answers `HTTP 400` with `{"error": "agent_id must be 1-64 chars of [A-Za-z0-9_-]"}`, the wording the Python coordinator uses for the same fault, and changes nothing. The check runs before the tracked-path check, so an untracked path answers the same. An empty or `null` `agent_id` still means no subagent id, a well-formed one, including a `CoherentVolume`'s 32-hex attempt id, is unchanged, and a pre-edit that does not opt in still reads a malformed id as the parent. The plugin's own hooks do not send `if_unheld`.
+
+- **The plugin and marketplace manifests name a contact email, and the plugin ships a listing icon, `.claude-plugin/icon.png` ([#276](https://github.com/Cohexa-ai/agent-coherence-plugin/pull/276)).** `claude plugin validate` warned that no icon was present. Nothing changes at run time.
 
 ## [0.7.0] — 2026-11-13
 
