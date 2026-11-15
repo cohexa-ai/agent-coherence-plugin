@@ -394,7 +394,7 @@ async function postPresentingPrincipal(
   payload: Record<string, unknown>,
 ): Promise<Record<string, unknown> | null> {
   const answer = await postPresentingPrincipalAnswer({ endpoint, root }, route, payload);
-  return answer.status >= 200 && answer.status < 300 ? answer.body : null;
+  return isSuccess(answer.status) ? answer.body : null;
 }
 
 /**
@@ -438,11 +438,11 @@ export async function postPresentingPrincipalAnswer(
 // The refusal of held strict files (pre-edit, setting on)
 // ----------------------------------------------------------------------
 
-/** The pre-edit payload as built: the session and the workspace-relative path, and any subagent id. */
-type PreEditPayload = Readonly<Record<string, unknown>> & {
-  readonly session_id: string;
-  readonly path: string;
-};
+/**
+ * The pre-edit payload as built: the session and the workspace-relative path,
+ * and any subagent id. The same shape the refusal classifies once it is sent.
+ */
+type PreEditPayload = OptedInRequest;
 
 /** A pre-edit the refusal applies to: its payload, and the fold profiles under which its path is strict. */
 interface HeldCandidate {
