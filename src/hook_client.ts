@@ -160,6 +160,21 @@ function relativeInside(root: string, absolutePath: string, realpath: Resolver):
 }
 
 /**
+ * `rel` under `root` as the disk spells it, relative to the disk's spelling of
+ * `root`: the spelling a coordinator on a folding disk also matches policy
+ * against. Undefined when the disk cannot give one (a link that does not
+ * resolve, a directory that cannot be read), which leaves the policy's other
+ * readings, as on the coordinator and in the Python client.
+ */
+export function diskSpellingOf(root: string, rel: string): string | undefined {
+  try {
+    return relative(resolveLinks(root, diskSpelling), resolveLinks(join(root, rel), diskSpelling));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Absolute CC path to workspace-relative, links followed and typed case
  * kept; the disk's spelling is tried only for a path that otherwise lies
  * outside the root. Still outside: SkipHook (mirrors Python).
