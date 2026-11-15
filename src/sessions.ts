@@ -191,9 +191,10 @@ export class SessionRegistry {
   }
 
   /**
-   * Drop the record once the identity's Read or Edit of the file is admitted,
-   * so a record a shell read left behind cannot skip the deny of a later
-   * staleness event.
+   * Drop the record once the identity's row on the file is valid again: an
+   * admitted hook Read of the file, an admitted Edit, or a Bash or Grep
+   * command that re-grants or credits it (`applyRegrants`). A record left
+   * behind would skip the deny of a later staleness event.
    */
   dropStaleDeny(agentId: string, artifactId: string): void {
     this.staleDenied.delete(staleDenyKey(agentId, artifactId));

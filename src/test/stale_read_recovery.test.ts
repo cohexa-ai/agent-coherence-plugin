@@ -127,6 +127,7 @@ function sessionOf(post: Post, who: { sid: string; agentId?: string; path?: stri
     edit: () => post("/hooks/pre-edit", { ...base, path }),
     commit: (hash: string) => post("/hooks/post-edit", { ...base, path, success: true, content_hash: hash }),
     cat: () => post("/hooks/pre-bash", { ...base, command: `cat ${path}` }),
+    grep: () => post("/hooks/pre-grep", { ...base, search_root: "" }),
     stop: () => post("/hooks/session-stop", base),
   };
 }
@@ -285,6 +286,26 @@ test("an identity whose rows were forgotten uses up its recovery on its next adm
   });
 });
 
+test("an Edit admitted to an identity whose rows were forgotten uses up its recovery, so the next staleness is denied again", async () => {
+  await withCoordinator([PLAN], async ({ registry, post }) => {
+    const a = sessionOf(post, { sid: SID_A });
+    const sub = sessionOf(post, { sid: SID_B, agentId: SUBAGENT });
+    assertReadAdmitted(await sub.read(H1), 1, "subagent's first read");
+    await peerCommits(a, H2);
+    assertDenied(await sub.read(H2), "subagent's first stale read", lastCommitDeny(registry, AGENT_A));
+    assert.deepEqual(await post("/hooks/session-stop", { session_id: SID_B, agent_id: SUBAGENT, ended: true }), {
+      ok: true,
+      released_artifacts: [],
+    });
+    // With no row, the subagent edits as a first-time editor: no deny.
+    assertEditAdmitted(await sub.edit(), "subagent's edit with no row");
+    assert.deepEqual(await sub.commit(H3), { ok: true });
+    const c = sessionOf(post, { sid: SID_C });
+    await peerCommits(c, H4);
+    assertDenied(await sub.read(H4), "first read after C's commit", lastCommitDeny(registry, sessionToAgentId(SID_C)));
+  });
+});
+
 test("a shell read recovers the row; the next Read uses up the recovery, so the next staleness is denied again", async () => {
   await withCoordinator([PLAN], async ({ registry, post }) => {
     const { a, b } = await staleB(post);
@@ -298,7 +319,7 @@ test("a shell read recovers the row; the next Read uses up the recovery, so the 
   });
 });
 
-test("an admitted Edit uses up the recovery, so the next staleness is denied again", async () => {
+test("a shell read, its retry and an admitted Edit leave no recovery, so the next staleness is denied again", async () => {
   await withCoordinator([PLAN], async ({ registry, post }) => {
     const { b } = await staleB(post);
     assertDenied(await b.read(H2), "first stale read", lastCommitDeny(registry, AGENT_A));
@@ -309,6 +330,54 @@ test("an admitted Edit uses up the recovery, so the next staleness is denied aga
     // B's edit took A's grant, so a third session makes the next commit.
     await peerCommits(sessionOf(post, { sid: SID_C }), H3);
     assertDenied(await b.read(H3), "first read after the next commit", lastCommitDeny(registry, sessionToAgentId(SID_C)));
+  });
+});
+
+for (const [tool, shellRead] of [
+  ["shell read", (s: Session) => s.cat()],
+  ["Grep", (s: Session) => s.grep()],
+] as const) {
+  test(`a ${tool} retried after its deny uses up the recovery, so the next staleness is denied again`, async () => {
+    await withCoordinator([PLAN], async ({ registry, post }) => {
+      const { a, b } = await staleB(post);
+      assertDenied(await b.read(H2), "first stale read", lastCommitDeny(registry, AGENT_A));
+      assertDenied(await shellRead(b), `the ${tool} is denied and re-grants the row`);
+      assert.equal((await shellRead(b)).status, "fresh", `the retried ${tool} runs`);
+      await peerCommits(a, H3);
+      const committed = lastCommitDeny(registry, AGENT_A);
+      // A Read and an Edit sent in one message: the Edit was written from v2.
+      assertDenied(await b.read(H3), "first read after the next commit", committed);
+      assertEditDenied(await b.edit(), "edit sent with that read", committed);
+      assertReadAdmitted(await b.read(H3), 3, "read after that deny");
+    });
+  });
+}
+
+test("a shell read of a held row uses up the recovery an Edit deny armed, so the next staleness is denied again", async () => {
+  await withCoordinator([PLAN], async ({ registry, post }) => {
+    const { a, b } = await staleB(post);
+    const committed = lastCommitDeny(registry, AGENT_A);
+    assertDenied(await b.cat(), "the shell read is denied and re-grants the row", committed);
+    // The re-granted row certifies no read of v2, so the Edit is denied and arms the recovery.
+    assertEditDenied(await b.edit(), "edit before the shell read ran", committed);
+    assert.equal((await b.cat()).status, "fresh", "the retried shell read records v2");
+    await peerCommits(a, H3);
+    assertDenied(await b.read(H3), "first read after the next commit", lastCommitDeny(registry, AGENT_A));
+    assertReadAdmitted(await b.read(H3), 3, "read after that deny");
+  });
+});
+
+test("a Read of a held row uses up the recovery an Edit deny armed, so the next staleness is denied again", async () => {
+  await withCoordinator([PLAN], async ({ registry, post }) => {
+    const { a, b } = await staleB(post);
+    const committed = lastCommitDeny(registry, AGENT_A);
+    assertDenied(await b.cat(), "the shell read is denied and re-grants the row", committed);
+    // The re-granted row certifies no read of v2, so the Edit is denied and arms the recovery.
+    assertEditDenied(await b.edit(), "edit before any read of v2", committed);
+    assertReadAdmitted(await b.read(H2), 2, "read on the re-granted row");
+    await peerCommits(a, H3);
+    assertDenied(await b.read(H3), "first read after the next commit", lastCommitDeny(registry, AGENT_A));
+    assertReadAdmitted(await b.read(H3), 3, "read after that deny");
   });
 });
 
@@ -330,6 +399,20 @@ test("a holder takes the file and stops without committing: B's Read is denied o
     const a = sessionOf(post, { sid: SID_A });
     const b = sessionOf(post, { sid: SID_B });
     assertReadAdmitted(await b.read(H1), 1, "B's first read");
+    assertEditAdmitted(await a.edit(), "A takes the file");
+    await a.stop();
+    assertDenied(await b.read(H1), "B's first read after the handover", grantChangeDeny(PLAN, 1));
+    assertReadAdmitted(await b.read(H1), 1, "B's next read");
+  });
+});
+
+test("a record that claims no bytes: B's Read after the deny is admitted whatever bytes it read", async () => {
+  await withCoordinator([PLAN], async ({ registry, post }) => {
+    const a = sessionOf(post, { sid: SID_A });
+    const b = sessionOf(post, { sid: SID_B });
+    // A shell read is the file's first observation, and it hashes nothing, so v1 claims no bytes.
+    assert.equal((await b.cat()).status, "fresh", "B's first shell read");
+    assert.equal(registry.getArtifactByName(PLAN)!.content_hash, "", "v1 claims no bytes");
     assertEditAdmitted(await a.edit(), "A takes the file");
     await a.stop();
     assertDenied(await b.read(H1), "B's first read after the handover", grantChangeDeny(PLAN, 1));

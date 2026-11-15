@@ -154,6 +154,8 @@ export async function handlePreRead(
   const sessionId: string = body.session_id;
   const path: string = name.requested;
   const contentHash: string | null = (body.content_hash as string | null | undefined) ?? null;
+  // Decided once: whether this pre-read may arm, use up or be admitted by a stale-deny record.
+  const hookRead = isHookRead(body as Record<string, unknown>);
 
   // SB-10 U8 (KTD6): the allow-attach seam — runs after every deny
   // decision; a non-qualifying result (strict deny) passes through as the
@@ -251,9 +253,10 @@ export async function handlePreRead(
     // denied Bash / Grep command re-armed certifies no read, so this one is
     // the read to record (mirrors Python pre-read's fresh arm).
     if (agentState === MESIState.SHARED) deps.registry.recordObservation(artifactId, agentId);
-    // A record a shell read's re-grant left armed is used up here, so it
-    // cannot skip the deny of a later staleness event.
-    if (isHookRead(body as Record<string, unknown>)) deps.sessions.dropStaleDeny(agentId, artifactId);
+    // A record can be armed while this row is valid: an Edit denied on a
+    // SHARED row that certifies no read of this version arms one. It is used
+    // up here, so it cannot skip the deny of a later staleness event.
+    if (hookRead) deps.sessions.dropStaleDeny(agentId, artifactId);
     // Python's order: drained notices ride an allow envelope, the out-of-band
     // notice is appended to it (or becomes a context-only one), then any
     // pending re-grounding.
@@ -330,7 +333,6 @@ export async function handlePreRead(
   // refused while the bytes still differ, so it never gets the stale-copy text.
   const denied = { deps, summary, artifactId, agentId };
   if (isStrictRequest(deps, name) && agentState === MESIState.INVALID) {
-    const hookRead = isHookRead(body as Record<string, unknown>);
     const recordedBytes = readsRecordedBytes(existingArtifact, contentHash);
     // Nothing awaits between the lookup above and the grant, and one
     // coordinator owns the store, so the version this read was classified
@@ -351,7 +353,7 @@ export async function handlePreRead(
 
   // Re-grant SHARED so this read doesn't re-fire stale on every call.
   deps.registry.grantShared(artifactId, agentId, nowTick, "post_stale_read");
-  if (isHookRead(body as Record<string, unknown>)) deps.sessions.dropStaleDeny(agentId, artifactId);
+  if (hookRead) deps.sessions.dropStaleDeny(agentId, artifactId);
 
   const resp = buildStaleResponse(summary);
   // A1: if THIS session has pending preemption notices, prepend them to the

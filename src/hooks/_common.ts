@@ -389,6 +389,11 @@ export interface Regrant {
  * Grep passes none: its path set is every tracked file under its root, not
  * what it showed, so crediting a held file would advance a baseline the
  * session was just told to re-read.
+ *
+ * Each path granted or credited here also drops the session's stale-deny
+ * record for it: the row is valid again, so the record would otherwise
+ * outlive the staleness it was armed for and admit, with no deny, the first
+ * Read after the next commit -- and an Edit sent with that Read.
  */
 export function applyRegrants(
   deps: HookDeps,
@@ -398,8 +403,12 @@ export function applyRegrants(
 ): void {
   for (const { artifactId, trigger } of regrants) {
     deps.registry.grantShared(artifactId, agentId, opts.nowTick, trigger, opts.commandRuns);
+    deps.sessions.dropStaleDeny(agentId, artifactId);
   }
   if (opts.commandRuns) {
-    for (const artifactId of opts.held) deps.registry.recordObservation(artifactId, agentId);
+    for (const artifactId of opts.held) {
+      deps.registry.recordObservation(artifactId, agentId);
+      deps.sessions.dropStaleDeny(agentId, artifactId);
+    }
   }
 }
