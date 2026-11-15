@@ -224,6 +224,27 @@ test('an untracked subject: key is refused; a key a tracked glob covers is coord
   assert.deepEqual(versions, [['subject:42', 2]]);
 });
 
+test('a key a tracked glob covers is coordinated on pre-edit and post-edit', async (t) => {
+  const door = await openDoor(t, { tracked: ['subject:[0-9]*'] }, CASELESS);
+  const asKey = { name_kind: 'key' };
+
+  const edit = await door.post('/hooks/pre-edit', { session_id: SID_A, path: 'subject:7', ...asKey });
+  const commit = await door.post('/hooks/post-edit', {
+    session_id: SID_A,
+    path: 'subject:7',
+    success: true,
+    content_hash: HASH_1,
+    ...asKey,
+  });
+
+  assert.equal(edit.status, 200, JSON.stringify(edit));
+  assert.equal(edit.body.ok, true, JSON.stringify(edit));
+  assert.equal(commit.status, 200, JSON.stringify(commit));
+  assert.equal(commit.body.ok, true, JSON.stringify(commit));
+  const versions = door.registry.listArtifacts().map((row) => [row.name, row.version]);
+  assert.deepEqual(versions, [['subject:7', 2]]);
+});
+
 test("each route's own request-shape 400 wins over the subject refusal", async (t) => {
   const door = await openDoor(t, ALL_STRICT, CASELESS);
   const malformedId = await door.post('/hooks/pre-edit', {

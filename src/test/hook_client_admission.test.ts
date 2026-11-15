@@ -668,6 +668,13 @@ const NOT_OPTED_IN: ReadonlyArray<[string, { setting: string | null; file: strin
       'a pre-edit of a strict file with the setting off',
       { setting: null, file: STRICT_FILE, sub: 'pre-edit' },
     ],
+    // Only a pre-edit opts in: every other hook carrying a strict file stays today's.
+    ...(['post-edit', 'session-stop', 'subagent-stop', 'pre-bash', 'pre-grep'] as const).map(
+      (sub): [string, { setting: string | null; file: string; sub: string }] => [
+        `a ${sub} carrying a strict file`,
+        { setting: ON, file: STRICT_FILE, sub },
+      ]
+    ),
   ];
 for (const [label, { setting, file, sub }] of NOT_OPTED_IN) {
   for (const shape of SHAPES) {
@@ -947,9 +954,15 @@ for (const [label, where, inject] of INJECTED) {
       if (request.url === where.url) inject(t);
       return answers(request, peer);
     };
-    const decided = await decide(t, { script, shape: where.shape });
+    // The full deadline, so that a throw landing in the peer instead would stall
+    // the answer until the deadline cut it, which the timing below rules out.
+    const decided = await decide(t, { script, shape: where.shape }, DEADLINE_MS);
     assert.deepEqual(decided.answer, unavailableDeny());
     assert.deepEqual(trace(decided.peer), where.routes);
+    assert.ok(
+      decided.elapsedMs < DEADLINE_MS - 10,
+      `denied only at the deadline, after ${decided.elapsedMs} ms: the throw did not land in the client`
+    );
   });
 }
 
