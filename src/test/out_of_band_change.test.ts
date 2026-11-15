@@ -7,7 +7,8 @@
  * hashes the file on disk after an admitted acquire and answers
  * `disk_differs` with the same notice. The template bytes below are copied
  * from the library's `hook_payloads.py`, not from the Node constants, so a
- * drift on either side fails here.
+ * drift on either side fails here. The two #514 texts for a stale reader are
+ * written out the same way: they are the bytes both coordinators emit.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -40,6 +41,20 @@ const outOfBandDeny = (path: string, version: number) =>
   `${path}: the change may be your user's work. Tell your user that ${path} changed outside the ` +
   `coordinator; the read stays denied until the change is committed through the coordinator. This ` +
   `denial is structural (v0.2 strict mode); retrying the same operation will produce the same denial.`;
+
+/** A stale or never-read reader's bytes are not the recorded version, and no write is in flight (#514). */
+const staleOutOfBandDeny = (path: string, version: number) =>
+  `Stale read denied: ${path} on disk does not match v${version}, the last version committed through the ` +
+  `coordinator, and no session committed the change, so it was made outside the coordinator. Do not restore ` +
+  `or overwrite ${path}: the change may be your user's work. Tell your user that ${path} changed outside the ` +
+  `coordinator; the read stays denied until the change is committed through the coordinator. This denial is ` +
+  `structural (v0.2 strict mode); retrying the same operation will produce the same denial.`;
+
+/** The same reader while another session holds an uncommitted write of the file (#514). */
+const writeInFlightDeny = (path: string, version: number) =>
+  `Stale read denied: another agent is writing ${path} and has not committed it yet, so ${path} on disk does ` +
+  `not match v${version}, the last version committed through the coordinator. Wait for that write to be ` +
+  `committed, then Read ${path} again with the Read tool.`;
 
 async function makeServer(strictPatterns: string[] = []) {
   const root = mkdtempSync(join(tmpdir(), "out-of-band-test-"));
@@ -213,17 +228,32 @@ test("pre-read, strict: a MODIFIED holder's own recent commit is not denied (#20
   }
 });
 
-test("pre-read, strict: an INVALID reader whose grant a peer revoked keeps the write template (#205)", async () => {
-  const { registry, sessions, post, cleanup } = await makeServer(["CLAUDE.md"]);
+test("pre-read, strict: an INVALID reader whose grant a peer revoked gets the write-in-flight text, not the valid-grant one (#205, #514)", async () => {
+  const { post, cleanup } = await makeServer(["CLAUDE.md"]);
   try {
-    const id = registry.resolveOrRegisterArtifact("CLAUDE.md", HASH_1);
-    registry.grantShared(id, sessions.registerSession(SID_A), 9);
-    // B's pre-edit revoked A's grant: the change went through the coordinator.
-    registry.acquireExclusive(id, sessions.registerSession(SID_B), 10);
+    assert.deepEqual(await readA(post, HASH_1), { status: "fresh", version: 1 });
+    // B's pre-edit revoked A's grant: the change goes through the coordinator,
+    // and B has not committed it yet.
+    assert.equal((await post("/hooks/pre-edit", { session_id: SID_B, path: "CLAUDE.md" })).ok, true);
     const r = await readA(post, HASH_2);
     const reason = String((r.hookSpecificOutput as Record<string, unknown>).permissionDecisionReason);
     assert.notEqual(reason, outOfBandDeny("CLAUDE.md", 1));
-    assert.ok(reason.startsWith("Stale read denied: CLAUDE.md "), reason);
+    assert.equal(reason, writeInFlightDeny("CLAUDE.md", 1));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("pre-read, strict: a stale reader's bytes no session committed get the stale out-of-band text (#514)", async () => {
+  const { post, cleanup } = await makeServer(["CLAUDE.md"]);
+  try {
+    assert.deepEqual(await readA(post, HASH_1), { status: "fresh", version: 1 });
+    assert.equal((await post("/hooks/pre-edit", { session_id: SID_B, path: "CLAUDE.md" })).ok, true);
+    await post("/hooks/post-edit", { session_id: SID_B, path: "CLAUDE.md", success: true, content_hash: HASH_2 });
+    const r = await readA(post, HASH_3);
+    const reason = String((r.hookSpecificOutput as Record<string, unknown>).permissionDecisionReason);
+    assert.equal(reason, staleOutOfBandDeny("CLAUDE.md", 2));
+    assert.ok(!reason.includes("the version you last read"), reason);
   } finally {
     await cleanup();
   }

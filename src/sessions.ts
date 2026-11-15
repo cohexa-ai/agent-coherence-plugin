@@ -41,6 +41,16 @@ export class SessionRegistry {
   // re-grounding is advisory, never load-bearing).
   private readonly compactPending = new Set<string>();
 
+  // Strict-mode stale-deny record, keyed by `staleDenyKey` (#514). Armed when
+  // a strict deny of a stale copy is the answer sent; while armed, the
+  // identity's next hook Read of the file whose bytes are the recorded ones
+  // is admitted. It holds no version: a commit landing between the deny and
+  // the Read costs no second deny, because the Read returns the newer version.
+  // Process-local like `compactPending`: a coordinator restart costs one
+  // extra deny, never a stale write. A session end leaves it, since a leftover
+  // record only lets a Read through that hash rule.
+  private readonly staleDenied = new Set<string>();
+
   /**
    * Register a session by its Claude Code session_id, optionally scoped to a
    * subagent identity (SB-25 composite derivation — see agent_id.ts).
@@ -95,6 +105,7 @@ export class SessionRegistry {
    * Drop an ended identity from every map keyed or valued by its agent_id,
    * after `ArtifactRegistry.forgetAgent` deleted its rows. The compact-pending
    * flag is keyed by the parent session, which has not ended, so it stays.
+   * A stale-deny record stays too: see `staleDenied`.
    */
   forget(agentId: string): void {
     for (const [cacheKey, cached] of this.bySessionId) {
@@ -169,4 +180,28 @@ export class SessionRegistry {
   expireCompactPending(sessionId: string): void {
     this.compactPending.delete(sessionId);
   }
+
+  /** Record that a strict stale deny of this file was the answer sent to this identity. */
+  armStaleDeny(agentId: string, artifactId: string): void {
+    this.staleDenied.add(staleDenyKey(agentId, artifactId));
+  }
+
+  isStaleDenyArmed(agentId: string, artifactId: string): boolean {
+    return this.staleDenied.has(staleDenyKey(agentId, artifactId));
+  }
+
+  /**
+   * Drop the record once the identity's Read or Edit of the file is admitted,
+   * so a record a shell read left behind cannot skip the deny of a later
+   * staleness event.
+   */
+  dropStaleDeny(agentId: string, artifactId: string): void {
+    this.staleDenied.delete(staleDenyKey(agentId, artifactId));
+  }
+}
+
+// An agent id is fixed-width hex, so the separator cannot occur inside it and
+// no two pairs share a key.
+function staleDenyKey(agentId: string, artifactId: string): string {
+  return `${agentId}/${artifactId}`;
 }

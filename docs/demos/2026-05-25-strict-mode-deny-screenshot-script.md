@@ -91,21 +91,34 @@ claude --include-hook-events \
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
     "permissionDecisionReason": "Stale read denied: docs/plans/feature-x.md
-       was updated by session <peer> at 2026-05-25T... Re-read
-       docs/plans/feature-x.md via the Read tool before proceeding.
-       This denial is structural (v0.2 strict mode); retrying the same
-       operation will produce the same denial."
+       on disk does not match v3, the last version committed through the
+       coordinator, and no session committed the change, so it was made
+       outside the coordinator. Do not restore or overwrite
+       docs/plans/feature-x.md: the change may be your user's work. Tell
+       your user that docs/plans/feature-x.md changed outside the
+       coordinator; the read stays denied until the change is committed
+       through the coordinator. This denial is structural (v0.2 strict
+       mode); retrying the same operation will produce the same denial."
   }
 }
 
-[assistant] I can't proceed — docs/plans/feature-x.md has been updated by
-another session, and the workspace has opted this path into strict mode
-via `.coherence/strict_mode.yaml`. The PreToolUse:Read hook returned
-`permissionDecision: "deny"` rather than the v0.1.1 warn-mode advisory.
-Re-running the Read won't help — the denial is structural. I need a
-fresh session (or for you to confirm the stale content is intentional)
-before I can summarize the plan.
+[assistant] I can't proceed — docs/plans/feature-x.md on disk doesn't match
+the version the coordinator recorded, and the workspace has opted this path
+into strict mode via `.coherence/strict_mode.yaml`. The PreToolUse:Read hook
+returned `permissionDecision: "deny"` rather than the v0.1.1 warn-mode
+advisory. Re-running the Read won't help — the denial is structural. The
+change was made outside the coordinator, so I won't restore or overwrite
+it; please confirm the file's current content is intended, or commit it
+through the coordinator, before I summarize the plan.
 ```
+
+The setup above gives the agent a session that never read the file, reading
+bytes the coordinator never recorded, so the deny is the out-of-band text
+([Cohexa-ai/agent-coherence#514](https://github.com/Cohexa-ai/agent-coherence/issues/514)).
+A session whose own copy went stale after a peer's commit gets
+`Stale read denied: <path> was updated by agent <id> at <time>. Read <path> again with the Read tool: the next Read returns the current version, and edits of <path> are denied until you have read it.`,
+and its next Read of the file is allowed. Before #514 this setup showed the
+peer-commit text, with a sentence saying that a retry gets the same denial.
 
 ## Crop guidance
 

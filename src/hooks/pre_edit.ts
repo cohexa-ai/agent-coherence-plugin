@@ -42,6 +42,7 @@ import {
 } from "../hook_payloads.js";
 import {
   assertNever,
+  aWriteIsInFlight,
   drainNoticeText,
   hasSubagentIdField,
   holdsContentClaim,
@@ -64,20 +65,6 @@ import {
 } from "./door.js";
 
 export type PreEditDeps = HookDeps;
-
-/**
- * Python `_a_write_is_in_flight`: another session holds an uncommitted write
- * claim whose bytes may still be landing, so a differing disk proves nothing.
- * Node records no heartbeats, so only Python's no-heartbeat arm applies: any
- * peer in EXCLUSIVE counts as in flight. Python skips the check only when
- * that peer's heartbeat is within 5 s, so the two differ only for a peer
- * that has held EXCLUSIVE silently for longer, and the check never denies.
- * A peer on another row of the file's fold bucket counts: its bytes land in
- * the same file.
- */
-function aWriteIsInFlight(deps: PreEditDeps, artifactId: string, agentId: string): boolean {
-  return deps.registry.hasExclusivePeer(artifactId, agentId);
-}
 
 /**
  * Python `_recorded_content_missing_from_disk` (#205): the recorded version
@@ -216,6 +203,9 @@ export async function handlePreEdit(
         warning_generated_at_unix_ts: nowUnix(),
         hash_differs: false, // pre-edit doesn't carry content_hash
       };
+      // This deny counts as the session's one stale deny for the file, so its
+      // next Read of the recorded bytes is admitted (#514).
+      deps.sessions.armStaleDeny(agentId, artifactId);
       writeJson(res, 200, {
         ok: false,
         hookSpecificOutput: emitStrictDeny({ source: "pre_edit_strict_deny", summary }),
@@ -255,6 +245,8 @@ export async function handlePreEdit(
     });
     return;
   }
+  // The session now holds the file, so a later staleness starts from a deny.
+  deps.sessions.dropStaleDeny(agentId, artifactId);
 
   // #205: only an admitted editor is told, and the check never denies.
   const outOfBandVersion = peerWriteInFlight

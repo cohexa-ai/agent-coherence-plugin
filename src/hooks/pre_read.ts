@@ -26,6 +26,7 @@ import {
   buildStaleResponse,
   buildFreshWithNotice,
   emitStrictDeny,
+  emitUnrecordedBytesDeny,
   nowUnix,
   outOfBandChangeNotice,
   type StaleSummary,
@@ -33,6 +34,7 @@ import {
 } from "../hook_payloads.js";
 import type { Artifact } from "../registry.js";
 import {
+  aWriteIsInFlight,
   drainNoticeText,
   holdsContentClaim,
   isRecentSelfCommitLag,
@@ -60,6 +62,73 @@ interface PreReadBody {
   path?: unknown;
   content_hash?: unknown;
   name_kind?: unknown;
+  want_owner_generation?: unknown;
+  verify_only?: unknown;
+}
+
+/**
+ * Fields only callers other than the Claude Code hook clients send: the
+ * effect fence's verification read (`verify_only`), CoherentVolume and the
+ * documented raw capture (`want_owner_generation`), and the substrate
+ * adapter (`name_kind`). The hook clients send `{session_id, path,
+ * content_hash, agent_id}`.
+ */
+const NON_HOOK_READ_FIELDS = ["want_owner_generation", "verify_only", "name_kind"] as const;
+
+/**
+ * Whether this pre-read is a Claude Code hook Read. Only such a Read arms,
+ * uses up or is admitted by the stale-deny record: the other callers document
+ * `reacquire()` or a new agent id as their recovery, and the substrate's
+ * commit gate relies on a stale deny staying in place. Presence decides,
+ * whatever the value, so no such caller can reach the admit.
+ */
+function isHookRead(body: Record<string, unknown>): boolean {
+  return NON_HOOK_READ_FIELDS.every((field) => !Object.hasOwn(body, field));
+}
+
+/**
+ * The caller read the bytes of the version the coordinator recorded, or the
+ * record claims no bytes. A missing hash, sent when the file is gone, never
+ * matches a claim.
+ */
+function readsRecordedBytes(artifact: Artifact, contentHash: string | null): boolean {
+  return !holdsContentClaim(artifact.content_hash) || contentHash === artifact.content_hash;
+}
+
+/**
+ * The Read after a stale deny, of the recorded bytes: granted at the current
+ * version through the stale-arm re-grant, which records the observation, and
+ * answered on the fresh arm with any drained notices and no stale warning.
+ * The record is used up, so the next staleness of the file starts from a deny.
+ */
+function admitRereadAfterDeny(
+  deps: PreReadDeps,
+  read: { artifactId: string; agentId: string; nowTick: number; version: number },
+): Record<string, unknown> {
+  deps.registry.grantShared(read.artifactId, read.agentId, read.nowTick, "post_stale_read");
+  deps.sessions.dropStaleDeny(read.agentId, read.artifactId);
+  const fresh: TrackedFreshAnswer = { status: "fresh", version: read.version };
+  const notice = drainNoticeText(deps, read.agentId);
+  return notice === null ? fresh : buildFreshWithNotice(notice, fresh);
+}
+
+/**
+ * The strict deny of a stale or never-read Read. The recorded bytes get the
+ * stale-copy text, which says the next Read returns the current version.
+ * Other bytes, or no hash, get a text naming what clears the deny instead:
+ * the commit of another session's write in flight, or of the change made
+ * outside the coordinator.
+ */
+function staleReadDeny(
+  denied: { deps: PreReadDeps; summary: StaleSummary; artifactId: string; agentId: string },
+  recordedBytes: boolean,
+): Record<string, unknown> {
+  const { deps, summary, artifactId, agentId } = denied;
+  const source = "pre_read_strict_deny";
+  const hookSpecificOutput = recordedBytes
+    ? emitStrictDeny({ source, summary })
+    : emitUnrecordedBytesDeny({ source, summary, writeInFlight: aWriteIsInFlight(deps, artifactId, agentId) });
+  return { hookSpecificOutput, status: "stale", summary };
 }
 
 export async function handlePreRead(
@@ -182,6 +251,9 @@ export async function handlePreRead(
     // denied Bash / Grep command re-armed certifies no read, so this one is
     // the read to record (mirrors Python pre-read's fresh arm).
     if (agentState === MESIState.SHARED) deps.registry.recordObservation(artifactId, agentId);
+    // A record a shell read's re-grant left armed is used up here, so it
+    // cannot skip the deny of a later staleness event.
+    if (isHookRead(body as Record<string, unknown>)) deps.sessions.dropStaleDeny(agentId, artifactId);
     // Python's order: drained notices ride an allow envelope, the out-of-band
     // notice is appended to it (or becomes a context-only one), then any
     // pending re-grounding.
@@ -238,27 +310,48 @@ export async function handlePreRead(
     hash_differs: hashDiffers,
   };
 
-  // v0.2 KTD-O/KTD-P strict-mode deny gate (Unit 6, mirrors Python):
-  // 1. INVALID — true preemption; the session's context carries stale beliefs.
+  // v0.2 strict-mode gate on a stale copy (mirrors Python), #514:
+  // 1. INVALID — the session's context carries a copy older than the record.
+  //    The first stale Read or Edit is denied, which arms the session's
+  //    stale-deny record. While it is armed, the session's next hook Read is
+  //    admitted and granted at the current version when the bytes it read
+  //    are the recorded ones (or the record claims no bytes). A Read of other
+  //    bytes, or with no hash because the file is gone, stays denied: an Edit
+  //    built on it would write bytes the coordinator never recorded. No grant
+  //    is given on the deny itself, so an Edit sent before that Read is still
+  //    denied by pre-edit. Callers other than the hook clients keep the
+  //    sticky deny: they document their own recovery.
   // 2. None AND hash_differs — no prior grant AND the disk bytes diverge from
-  //    the registry's recorded canonical. Hashes matching falls through to
-  //    the warn-mode allow (the (None, matches) truth-table cell must NOT deny).
-  // KTD-T: do NOT re-grant SHARED on deny — the state stays INVALID/None so
-  // every retry produces the same byte-stable deny text.
-  if (
-    isStrictRequest(deps, name) &&
-    (agentState === MESIState.INVALID || (agentState === null && hashDiffers))
-  ) {
-    writeJson(res, 200, {
-      hookSpecificOutput: emitStrictDeny({ source: "pre_read_strict_deny", summary }),
-      status: "stale",
-      summary,
-    });
+  //    the registry's recorded canonical. Always denied, with no record: the
+  //    session has no row to recover. Hashes matching falls through to the
+  //    warn-mode allow (the (None, matches) truth-table cell must NOT deny).
+  // The deny text follows the check that decides the next Read, so no deny
+  // promises a Read that would then be refused. The second arm's next Read is
+  // refused while the bytes still differ, so it never gets the stale-copy text.
+  const denied = { deps, summary, artifactId, agentId };
+  if (isStrictRequest(deps, name) && agentState === MESIState.INVALID) {
+    const hookRead = isHookRead(body as Record<string, unknown>);
+    const recordedBytes = readsRecordedBytes(existingArtifact, contentHash);
+    // Nothing awaits between the lookup above and the grant, and one
+    // coordinator owns the store, so the version this read was classified
+    // against is still the current one when it is granted.
+    if (hookRead && recordedBytes && deps.sessions.isStaleDenyArmed(agentId, artifactId)) {
+      const fresh = admitRereadAfterDeny(deps, { artifactId, agentId, nowTick, version: existingArtifact.version });
+      writeJson(res, 200, withReground(fresh));
+      return;
+    }
+    if (hookRead) deps.sessions.armStaleDeny(agentId, artifactId);
+    writeJson(res, 200, staleReadDeny(denied, recordedBytes));
+    return;
+  }
+  if (isStrictRequest(deps, name) && agentState === null && hashDiffers) {
+    writeJson(res, 200, staleReadDeny(denied, false));
     return;
   }
 
   // Re-grant SHARED so this read doesn't re-fire stale on every call.
   deps.registry.grantShared(artifactId, agentId, nowTick, "post_stale_read");
+  if (isHookRead(body as Record<string, unknown>)) deps.sessions.dropStaleDeny(agentId, artifactId);
 
   const resp = buildStaleResponse(summary);
   // A1: if THIS session has pending preemption notices, prepend them to the

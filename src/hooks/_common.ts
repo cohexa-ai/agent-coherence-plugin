@@ -65,6 +65,20 @@ export function isRecentSelfCommitLag(artifact: Artifact, agentId: string, now: 
   return artifact.last_writer_id === agentId && now - artifact.updated_at <= SHARED_FOREIGN_DENY_LAG_WINDOW_SEC;
 }
 
+/**
+ * Python `_a_write_is_in_flight`: another session holds an uncommitted write
+ * claim whose bytes may still be landing, so a differing disk proves nothing.
+ * Node records no heartbeats, so only Python's no-heartbeat arm applies: any
+ * peer in EXCLUSIVE counts as in flight. Python skips the check only when
+ * that peer's heartbeat is within 5 s, so the two differ only for a peer
+ * that has held EXCLUSIVE silently for longer, and the check never denies.
+ * A peer on another row of the file's fold bucket counts: its bytes land in
+ * the same file.
+ */
+export function aWriteIsInFlight(deps: HookDeps, artifactId: string, agentId: string): boolean {
+  return deps.registry.hasExclusivePeer(artifactId, agentId);
+}
+
 /** Python `HANDLER_FAILURE_REASON_PREFIX`; library clients match it as a prefix. */
 const HANDLER_FAILURE_REASON_PREFIX = "internal: ";
 
