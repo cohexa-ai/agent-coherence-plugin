@@ -343,6 +343,20 @@ test("an opted-in pre-edit with an empty or null subagent id is admitted as the 
   }
 });
 
+test("a malformed camelCase agentId is refused too, unless an agent_id key is present", async () => {
+  const s = await makeServer();
+  try {
+    assertMalformedRefusal(await optedIn(s, SID_S, "camel.md", { agentId: "bad id!" }));
+    // A present agent_id, even null, is the id that is read, so the parent.
+    const parent = sessionToAgentId(SID_S);
+    const both = await optedIn(s, SID_S, "both.md", { agent_id: null, agentId: "bad id!" });
+    assert.deepEqual(both.body, { ok: true });
+    assert.equal(s.registry.getAgentState(idOf(s, "both.md"), parent), MESIState.EXCLUSIVE);
+  } finally {
+    await s.cleanup();
+  }
+});
+
 test("a pre-edit that does not opt in still reads a malformed subagent id as the parent", async () => {
   const s = await makeServer();
   try {
