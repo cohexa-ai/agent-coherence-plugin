@@ -13,13 +13,33 @@
  * packet or a partition. The peer is a stub, not a coordinator of either kind.
  * This pins the transport, not what a hook does next: a hook still admits on
  * every one of these rejections.
+ *
+ * Two quieter cases sit beside them. A workspace with no coordinator port, no
+ * server.pid or one with no port line, is refused with its own type, so a
+ * caller can tell it from a coordinator that is dead or cannot be read, which
+ * keep the plain type. And the hook POST that hands back its status tells an
+ * answer refused by status from a success whose body is not JSON.
  */
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { subscribe, unsubscribe } from "node:diagnostics_channel";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { createServer as createNetServer, type AddressInfo, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { HOOK_REQUEST_TIMEOUT_MS, requestJsonStatus } from "../hook_client_transport.js";
+import { PID_FILE_MAX_BYTES } from "../coordinator_pin.js";
+import { postPresentingPrincipalAnswer } from "../hook_client.js";
+import {
+  CoordinatorPortUnknown,
+  CoordinatorUnavailable,
+  HOOK_REQUEST_TIMEOUT_MS,
+  requestJsonStatus,
+  resolveEndpoint,
+} from "../hook_client_transport.js";
+import { holdCoordinatorLock } from "./coordinator_stand_in.js";
+import { makeFifo } from "./fifo_fixture.js";
 
 /** The ceiling below stays under twice this, so a wait of two limits shows. */
 const TIMEOUT_MS = 600;
@@ -169,4 +189,156 @@ test("a closed port: ECONNREFUSED at once, one attempt", CASE, async (t) => {
   assert.ok(elapsedMs < SLACK_MS, `rejected late, after ${elapsedMs} ms`);
   await delay(SETTLE_MS);
   assert.equal(attempts, 1);
+});
+
+const BEARER = "s".repeat(32);
+
+interface Workspace {
+  root: string;
+  coherenceDir: string;
+  pidFile: string;
+}
+
+/** A workspace whose `.coherence` holds a hook.secret and no server.pid yet; gone after the test. */
+function workspace(t: TestContext): Workspace {
+  const root = mkdtempSync(join(tmpdir(), "transport-silent-"));
+  const coherenceDir = join(root, ".coherence");
+  mkdirSync(coherenceDir, { mode: 0o700 });
+  writeFileSync(join(coherenceDir, "hook.secret"), `${BEARER}\n`, { mode: 0o600 });
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  return { root, coherenceDir, pidFile: join(coherenceDir, "server.pid") };
+}
+
+/** What resolveEndpoint refuses `root` with; a resolve that succeeds fails the test. */
+function refusalAtResolve(root: string): Error {
+  try {
+    resolveEndpoint(root);
+  } catch (err) {
+    return err as Error;
+  }
+  assert.fail("resolveEndpoint did not refuse");
+}
+
+function assertPortUnknown(err: Error): void {
+  assert.ok(err instanceof CoordinatorPortUnknown, `not CoordinatorPortUnknown: ${err.message}`);
+  assert.ok(err instanceof CoordinatorUnavailable, "every existing catch must still take it");
+}
+
+function assertPlainUnavailable(err: Error): void {
+  assert.ok(err instanceof CoordinatorUnavailable, `not CoordinatorUnavailable: ${err.message}`);
+  assert.ok(!(err instanceof CoordinatorPortUnknown), `read as no coordinator: ${err.message}`);
+}
+
+test("no server.pid, or no .coherence at all: refused as CoordinatorPortUnknown", (t) => {
+  const { root } = workspace(t);
+  const bare = mkdtempSync(join(tmpdir(), "transport-silent-bare-"));
+  t.after(() => rmSync(bare, { recursive: true, force: true }));
+
+  assertPortUnknown(refusalAtResolve(root));
+  assertPortUnknown(refusalAtResolve(bare));
+});
+
+for (const [name, content] of [
+  ["a pid line only", "12345\n"],
+  ["an empty file", ""],
+  ["a port line that is no port", "12345\nnot-a-port\n"],
+]) {
+  test(`a server.pid read with no port line (${name}): refused as CoordinatorPortUnknown`, (t) => {
+    const { root, pidFile } = workspace(t);
+    writeFileSync(pidFile, content!);
+
+    assertPortUnknown(refusalAtResolve(root));
+  });
+}
+
+const UNUSABLE_PID_FILES: Record<string, (ws: Workspace) => void> = {
+  "larger than a pid file": ({ pidFile }) => writeFileSync(pidFile, `1\n2\n${"x".repeat(PID_FILE_MAX_BYTES)}`),
+  "a directory": ({ pidFile }) => mkdirSync(pidFile),
+  "a FIFO": ({ pidFile }) => makeFifo(pidFile),
+  "a link to a pid file": ({ coherenceDir, pidFile }) => {
+    writeFileSync(join(coherenceDir, "elsewhere.pid"), `${process.pid}\n2\n`);
+    symlinkSync(join(coherenceDir, "elsewhere.pid"), pidFile);
+  },
+};
+
+for (const [name, make] of Object.entries(UNUSABLE_PID_FILES)) {
+  test(`a server.pid that is ${name}: refused as plain CoordinatorUnavailable`, (t) => {
+    const ws = workspace(t);
+    make(ws);
+
+    assertPlainUnavailable(refusalAtResolve(ws.root));
+  });
+}
+
+test(
+  "an unreadable server.pid: refused as plain CoordinatorUnavailable",
+  { skip: process.getuid?.() === 0 ? "root reads a mode-000 file" : false },
+  (t) => {
+    const { root, pidFile } = workspace(t);
+    writeFileSync(pidFile, `${process.pid}\n2\n`);
+    chmodSync(pidFile, 0o000);
+
+    assertPlainUnavailable(refusalAtResolve(root));
+  },
+);
+
+// No process holds the lock a running coordinator holds on its pid file, so the
+// file names a coordinator that has exited; held, the same file resolves.
+test("a server.pid naming an exited coordinator: refused as plain CoordinatorUnavailable", (t) => {
+  const { root, pidFile } = workspace(t);
+  writeFileSync(pidFile, `${process.pid}\n2\n`);
+
+  assertPlainUnavailable(refusalAtResolve(root));
+  holdCoordinatorLock(pidFile);
+  assert.equal(resolveEndpoint(root).port, 2);
+});
+
+interface HttpPeer {
+  port: number;
+  /** The path of each request that arrived, in order. */
+  paths: string[];
+  close: () => Promise<void>;
+}
+
+/** An HTTP peer that answers every request with `status` and the raw `body`. */
+async function answeringPeer(status: number, body: string): Promise<HttpPeer> {
+  const paths: string[] = [];
+  const server = createHttpServer((req, res) => {
+    paths.push(req.url ?? "");
+    req.resume();
+    res.writeHead(status, { "Content-Type": "application/json" }).end(body);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  return {
+    port: (server.address() as AddressInfo).port,
+    paths,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+/** The hook POST's answer from a peer answering `status` and `body`, behind a Node-shaped pid file, so no principal is claimed. */
+async function hookPostAnswer(t: TestContext, status: number, body: string) {
+  const peer = await answeringPeer(status, body);
+  t.after(() => peer.close());
+  const { root, pidFile } = workspace(t);
+  writeFileSync(pidFile, `${process.pid}\n${peer.port}\nbackend=node\n`);
+  const target = { endpoint: { port: peer.port, bearer: BEARER }, root };
+  const answer = await postPresentingPrincipalAnswer(target, "/hooks/pre-edit", { session_id: "s" });
+  assert.deepEqual(peer.paths, ["/hooks/pre-edit"]);
+  return answer;
+}
+
+test("the hook POST that hands back its status: a 503 keeps its status", async (t) => {
+  assert.deepEqual(await hookPostAnswer(t, 503, '{"error":"busy"}'), {
+    status: 503,
+    body: { error: "busy" },
+  });
+});
+
+test("the hook POST that hands back its status: a 2xx whose body is not JSON has a null body", async (t) => {
+  assert.deepEqual(await hookPostAnswer(t, 200, "not json"), { status: 200, body: null });
 });

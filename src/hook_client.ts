@@ -346,11 +346,9 @@ function report(message: string): void {
 }
 
 /**
- * POST the hook's payload presenting the session's caller principal, and
- * recover a principal refusal: re-claim with the stored mint nonce (see
- * recoverFromPrincipalRefusal) and retry ONCE — safe because a refused request
- * changed nothing. Resolves to the body of a 2xx answer, else null; any other
- * non-2xx degrades to `{}` exactly as before. Rejects on a transport failure.
+ * POST the hook's payload presenting the session's caller principal: the body
+ * of a 2xx answer, else null, so any other non-2xx degrades to `{}` exactly as
+ * before. Rejects on a transport failure.
  */
 async function postPresentingPrincipal(
   endpoint: CoordinatorEndpoint,
@@ -358,6 +356,24 @@ async function postPresentingPrincipal(
   route: string,
   payload: Record<string, unknown>,
 ): Promise<Record<string, unknown> | null> {
+  const answer = await postPresentingPrincipalAnswer({ endpoint, root }, route, payload);
+  return answer.status >= 200 && answer.status < 300 ? answer.body : null;
+}
+
+/**
+ * POST the hook's payload presenting the session's caller principal, and
+ * recover a principal refusal: re-claim with the stored mint nonce (see
+ * recoverFromPrincipalRefusal) and retry ONCE — safe because a refused request
+ * changed nothing. Resolves to the last answer's status beside its body (null
+ * when the body is not a JSON object), so a caller can tell a refusal by
+ * status from a success it cannot read. Rejects on a transport failure.
+ */
+export async function postPresentingPrincipalAnswer(
+  target: { endpoint: CoordinatorEndpoint; root: string },
+  route: string,
+  payload: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> | null }> {
+  const { endpoint, root } = target;
   const sessionId = String(payload.session_id);
   const post = (principal: string | null) =>
     requestJsonStatus(endpoint, "POST", route, payload, principalHeaders(principal));
@@ -378,7 +394,7 @@ async function postPresentingPrincipal(
       }
     }
   }
-  return answer.status >= 200 && answer.status < 300 ? answer.body : null;
+  return answer;
 }
 
 async function readStdin(): Promise<string> {
