@@ -16,7 +16,7 @@
 import { realpathSync } from 'node:fs';
 import { basename, dirname, join, relative } from 'node:path';
 import type { Artifact, FileName } from '../registry.js';
-import type { NameKind, PolicyMatchContext } from '../policy.js';
+import { isUnderSubjectPrefix, type NameKind, type PolicyMatchContext } from '../policy.js';
 import {
   exceedsFoldLimit,
   foldKey,
@@ -130,6 +130,21 @@ export function isTrackedRequest(deps: HookDeps, name: RequestName): boolean {
 
 export function isStrictRequest(deps: HookDeps, name: RequestName): boolean {
   return deps.policy.isStrictMode(name.requested, name.policy);
+}
+
+/**
+ * True when an edit route refuses `name` as a subject, which this coordinator
+ * does not support. A file is refused when its name as sent, tidied or keyed
+ * starts with the reserved prefix, so every spelling that reaches such a row
+ * is. A key under the prefix is refused only when no tracked pattern covers
+ * it: the untracked admit would tell a subject client it was acquired, while a
+ * covered key is coordinated like any other key.
+ */
+export function isSubjectRequest(deps: HookDeps, name: RequestName): boolean {
+  if (name.kind === 'file') {
+    return isUnderSubjectPrefix([name.requested, name.file.tidied, name.file.key]);
+  }
+  return isUnderSubjectPrefix([name.requested]) && !isTrackedRequest(deps, name);
 }
 
 function isFolding(profile: FoldProfile | null): profile is FoldingProfile {

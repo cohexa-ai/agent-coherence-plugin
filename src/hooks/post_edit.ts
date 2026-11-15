@@ -12,6 +12,8 @@
  *   from worktree's post-write state).
  * - Response: `{ok: true}` on commit success; `{ok: true, released: true}`
  *   on success=false release; `{ok: false, reason}` on protocol error.
+ * - A name refused as a subject (`isSubjectRequest`): HTTP 400 `{error,
+ *   reason: "subject_unsupported"}`, after the route's other 400s.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { CoherenceError } from "../coherence_error.js";
@@ -24,8 +26,9 @@ import {
   isValidContentHashRequired,
   isValidContentHashOrAbsent,
   readSubagentId,
+  writeSubjectUnsupported,
 } from "./_common.js";
-import { findRequested, isTrackedRequest, readRequestName } from "./door.js";
+import { findRequested, isSubjectRequest, isTrackedRequest, readRequestName } from "./door.js";
 
 export type PostEditDeps = HookDeps;
 
@@ -63,6 +66,12 @@ export async function handlePostEdit(
       writeError(res, 400, "content_hash must be 64-char hex if provided");
       return;
     }
+  }
+
+  // Before the untracked exit, whose admit a subject client would read as committed.
+  if (isSubjectRequest(deps, name)) {
+    writeSubjectUnsupported(res);
+    return;
   }
 
   const sessionId: string = body.session_id;

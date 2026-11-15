@@ -43,6 +43,10 @@
  * name. A disk that folds nothing uses the first reading alone, so folding
  * only ever adds matches. A key, a name that is not a workspace file, is
  * matched as requested only.
+ *
+ * A file name under the reserved `subject:` prefix, in any of those readings,
+ * matches no pattern at all: it is untracked and never strict. Keys are
+ * matched as before.
  */
 import { randomBytes } from "node:crypto";
 import { writeFileSync, renameSync, mkdirSync, rmSync, lstatSync, realpathSync, type Stats } from "node:fs";
@@ -75,6 +79,18 @@ export interface PolicyMatchContext {
 }
 
 export const UNFOLDED_FILE: PolicyMatchContext = { profile: "none", kind: "file" };
+
+/**
+ * The prefix reserved for subjects. This coordinator does not support
+ * subjects, so it must never coordinate a file under the prefix as an
+ * ordinary file: a subject client would read that answer as its own.
+ */
+const SUBJECT_NAME_PREFIX = "subject:";
+
+/** True when any of the given forms of one name starts with the reserved subject prefix. */
+export function isUnderSubjectPrefix(forms: ReadonlyArray<string | undefined>): boolean {
+  return forms.some((form) => form !== undefined && form.startsWith(SUBJECT_NAME_PREFIX));
+}
 
 /** Mirror of Python coordinator_server.MAX_POLICY_PATHS_PER_REQUEST. */
 export const MAX_POLICY_PATHS_PER_REQUEST = 20;
@@ -858,20 +874,23 @@ interface NameReadings {
   readonly folded: FoldedName | undefined;
 }
 
-/** The readings of `name` under `context`, or null when it is not a relative name. */
+/**
+ * The readings of `name` under `context`, or null when it is not a relative
+ * name or is a file under the reserved subject prefix as typed, tidied or
+ * folded: every spelling that reaches such a file's row, so none of them is
+ * tracked or strict. A key under the prefix is read as any key, because a
+ * tracked pattern may cover it on purpose.
+ */
 function readingsOf(name: string, context: PolicyMatchContext): NameReadings | null {
   const requested = normalizeRelative(name, context.kind);
   if (requested === null) return null;
+  const profile = foldingProfileOf(requested, context);
+  const folded = profile === undefined ? undefined : { text: policyFold(requested, profile), profile };
+  if (context.kind === "file" && isUnderSubjectPrefix([name, requested, folded?.text])) return null;
   const typed = context.kind === "file" ? stripLeadingDotSlash(name) : null;
   const asTyped = typed !== null && typed !== requested ? { asTyped: typed } : {};
-  const profile = foldingProfileOf(requested, context);
-  if (profile === undefined) return { requested, ...asTyped, onDisk: undefined, folded: undefined };
-  return {
-    requested,
-    ...asTyped,
-    onDisk: context.diskSpelling,
-    folded: { text: policyFold(requested, profile), profile },
-  };
+  if (folded === undefined) return { requested, ...asTyped, onDisk: undefined, folded: undefined };
+  return { requested, ...asTyped, onDisk: context.diskSpelling, folded };
 }
 
 /**
