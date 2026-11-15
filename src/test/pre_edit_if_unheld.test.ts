@@ -4,7 +4,8 @@
  * It is refused while another agent holds the path for writing, naming that
  * holder; it reclaims a grant held 30 minutes or more; otherwise it is
  * admitted with no collision warning. Every request that does not send JSON
- * `true` answers exactly as before. A busy store keeps the failure envelope
+ * `true` answers exactly as before. An opted-in request whose subagent id is
+ * present but malformed answers 400. A busy store keeps the failure envelope
  * before the grant and admits without notices when only the notice drain
  * finds it busy.
  */
@@ -120,6 +121,32 @@ function keysAtAnyDepth(value: unknown, into = new Set<string>()): Set<string> {
     }
   }
   return into;
+}
+
+/** Present subagent ids that fail the 1-64 `[A-Za-z0-9_-]` grammar, of each JSON type. */
+const MALFORMED_IDS: unknown[] = ["bad id!", "a".repeat(65), 7, ["x"]];
+
+/**
+ * The 400 for a malformed subagent id, in the Python coordinator's wording
+ * for that fault, so a client sees one answer from either backend.
+ */
+function assertMalformedRefusal(r: { status: number; raw: string }, label = ""): void {
+  assert.equal(r.status, 400, label);
+  assert.deepEqual(JSON.parse(r.raw), { error: "agent_id must be 1-64 chars of [A-Za-z0-9_-]" }, label);
+}
+
+/** Every row the coordinator keeps, read on a separate connection. */
+function snapshotRows(s: Server): Record<string, unknown[]> {
+  const raw = new Database(join(s.root, ".coherence", "state.db"), { readonly: true });
+  try {
+    const tables = ["artifacts", "agent_states", "heartbeats", "pending_notices"];
+    const rows = Object.fromEntries(
+      tables.map((t) => [t, raw.prepare(`SELECT * FROM ${t} ORDER BY rowid`).all()]),
+    ) as Record<string, unknown[]>;
+    return { ...rows, sessions: s.sessions.knownAgentIds() };
+  } finally {
+    raw.close();
+  }
 }
 
 function assertRefusal(r: { status: number; raw: string }, holderAgentId: string): void {
@@ -278,9 +305,108 @@ test("subagents and their parent refuse each other; the holder's own repeat is a
     await preEdit(s, SID_S, "notes.md");
     assertRefusal(await optedIn(s, SID_S, "notes.md", { agent_id: SUB_X }), parent);
     assert.deepEqual((await optedIn(s, SID_S, "notes.md")).body, { ok: true });
-    // A malformed subagent id is read as the parent session, so it is the repeat.
-    assert.deepEqual((await optedIn(s, SID_S, "notes.md", { agent_id: "not a subagent id!" })).body, { ok: true });
+    // An opted-in malformed subagent id is refused, not read as the parent's repeat.
+    assertMalformedRefusal(await optedIn(s, SID_S, "notes.md", { agent_id: "not a subagent id!" }));
     assert.equal(s.registry.getAgentState(idOf(s, "notes.md"), parent), MESIState.EXCLUSIVE);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+// ------------------------------------------------------ a malformed subagent id
+
+test("an opted-in pre-edit with a malformed subagent id answers 400 and changes nothing", async () => {
+  const s = await makeServer();
+  try {
+    await preEdit(s, SID_A, "other.md");
+    const before = snapshotRows(s);
+    for (const bad of MALFORMED_IDS) {
+      assertMalformedRefusal(await optedIn(s, SID_S, "plan.md", { agent_id: bad }), JSON.stringify(bad));
+    }
+    assert.deepEqual(snapshotRows(s), before);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("an opted-in pre-edit with an empty or null subagent id is admitted as the parent", async () => {
+  const s = await makeServer();
+  try {
+    const parent = sessionToAgentId(SID_S);
+    for (const [i, absent] of ["", null].entries()) {
+      const path = `absent-${i}.md`;
+      assert.deepEqual((await optedIn(s, SID_S, path, { agent_id: absent })).body, { ok: true });
+      assert.equal(s.registry.getAgentState(idOf(s, path), parent), MESIState.EXCLUSIVE);
+    }
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("a malformed camelCase agentId is refused too, unless an agent_id key is present", async () => {
+  const s = await makeServer();
+  try {
+    assertMalformedRefusal(await optedIn(s, SID_S, "camel.md", { agentId: "bad id!" }));
+    // A present agent_id, even null, is the id that is read, so the parent.
+    const parent = sessionToAgentId(SID_S);
+    const both = await optedIn(s, SID_S, "both.md", { agent_id: null, agentId: "bad id!" });
+    assert.deepEqual(both.body, { ok: true });
+    assert.equal(s.registry.getAgentState(idOf(s, "both.md"), parent), MESIState.EXCLUSIVE);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("a pre-edit that does not opt in still reads a malformed subagent id as the parent", async () => {
+  const s = await makeServer();
+  try {
+    const parent = sessionToAgentId(SID_S);
+    for (const bad of MALFORMED_IDS) {
+      const r = await preEdit(s, SID_S, "plan.md", { agent_id: bad });
+      assert.equal(r.status, 200, JSON.stringify(bad));
+      assert.deepEqual(r.body, { ok: true }, JSON.stringify(bad));
+    }
+    assert.equal(s.registry.getAgentState(idOf(s, "plan.md"), parent), MESIState.EXCLUSIVE);
+    assert.deepEqual(s.sessions.knownAgentIds(), [parent]);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("an opted-in malformed subagent id is refused on an untracked path too", async () => {
+  const s = await makeServer({ ignored: ["skip.md"] });
+  try {
+    assertMalformedRefusal(await optedIn(s, SID_S, "skip.md", { agent_id: "bad id!" }));
+    assert.equal(s.registry.getArtifactByName("skip.md"), null);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("an opted-in malformed subagent id is refused while its parent holds the path", async () => {
+  const s = await makeServer();
+  try {
+    const parent = sessionToAgentId(SID_S);
+    await preEdit(s, SID_S, "plan.md");
+    const before = snapshotRows(s);
+    assertMalformedRefusal(await optedIn(s, SID_S, "plan.md", { agent_id: "bad id!" }));
+    assert.equal(s.registry.getAgentState(idOf(s, "plan.md"), parent), MESIState.EXCLUSIVE);
+    assert.deepEqual(snapshotRows(s), before);
+  } finally {
+    await s.cleanup();
+  }
+});
+
+test("a valid subagent id is refused by its parent's hold; a 32-hex incarnation id is admitted", async () => {
+  const s = await makeServer();
+  try {
+    await preEdit(s, SID_S, "plan.md");
+    assertRefusal(await optedIn(s, SID_S, "plan.md", { agent_id: "sub1" }), sessionToAgentId(SID_S));
+    // A CoherentVolume names each attempt by a 32-hex incarnation id.
+    const incarnation = "0123456789abcdef0123456789abcdef";
+    assert.deepEqual((await optedIn(s, SID_S, "volume.md", { agent_id: incarnation })).body, { ok: true });
+    const holder = sessionToAgentId(SID_S, incarnation);
+    assert.equal(s.registry.getAgentState(idOf(s, "volume.md"), holder), MESIState.EXCLUSIVE);
   } finally {
     await s.cleanup();
   }

@@ -15,6 +15,9 @@
  *   "other_holder", holder_agent_id}` while another agent holds the path for
  *   writing, in that key order; otherwise an admit that never carries a
  *   collision warning. Any other `if_unheld` value is an ordinary request.
+ *   An opted-in request whose `agent_id` is present but malformed answers
+ *   HTTP 400 `{error}` in the Python coordinator's wording for that fault; an
+ *   ordinary one reads it as the parent.
  *
  * Note on collision detection ordering: the Python handler peeks `exclusiveHolder`
  * BEFORE calling `write()` (which would invalidate the holder). We mirror this:
@@ -40,9 +43,11 @@ import {
 import {
   assertNever,
   drainNoticeText,
+  hasSubagentIdField,
   holdsContentClaim,
   isRecentSelfCommitLag,
   isValidSessionId,
+  MALFORMED_SUBAGENT_ERROR,
   readJsonBody,
   readSubagentId,
   type HookDeps,
@@ -141,6 +146,17 @@ export async function handlePreEdit(
   const sessionId: string = body.session_id;
   const path: string = name.requested;
   const optedIn = body.if_unheld === true;
+
+  // An opted-in caller asks whether ITS OWN identity may take the file. Read
+  // as the parent, a malformed subagent id would answer for the wrong agent:
+  // a subagent whose parent holds the path would be admitted as the parent's
+  // repeat. Refused before the untracked exit, so the answer does not depend
+  // on the policy. An ordinary request still reads it as the parent.
+  const fields = body as Record<string, unknown>;
+  if (optedIn && readSubagentId(fields) === null && hasSubagentIdField(fields)) {
+    writeError(res, 400, MALFORMED_SUBAGENT_ERROR);
+    return;
+  }
 
   // SB-10 U8 (KTD6): the allow-attach seam — runs after every deny
   // decision; strict-deny and refusal bodies pass through untouched.

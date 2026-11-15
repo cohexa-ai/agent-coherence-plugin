@@ -202,6 +202,14 @@ export function hasSubagentIdField(body: Record<string, unknown>): boolean {
   return raw !== undefined && raw !== null && raw !== "";
 }
 
+/**
+ * The 400 `error` for a present subagent id that fails the grammar, on a
+ * request that refuses one rather than reading it as the parent. Python
+ * `_MALFORMED_SUBAGENT_ERROR`, word for word, so a client sees one phrase for
+ * one fault on either backend.
+ */
+export const MALFORMED_SUBAGENT_ERROR = "agent_id must be 1-64 chars of [A-Za-z0-9_-]";
+
 export function isValidSessionId(s: unknown): s is string {
   return typeof s === "string" && SESSION_ID_RE.test(s);
 }
