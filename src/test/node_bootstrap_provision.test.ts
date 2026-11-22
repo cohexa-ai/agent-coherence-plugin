@@ -1985,10 +1985,14 @@ test('NO LOCK TOOL: two starts at once provision unlocked and still publish a wh
   const rig = provisionRig('0.0.1');
   const tools = mkdtempSync(join(tmpdir(), 'provision-nolock-'));
   try {
+    // By name, not existsSync: where /bin is a link to /usr/bin each name comes
+    // twice, and existsSync follows a dangling link to "absent".
+    const linked = new Set<string>();
     for (const dir of ['/bin', '/usr/bin']) {
       for (const name of readdirSync(dir)) {
-        if (/^(perl|flock$|lockf$)/.test(name) || existsSync(join(tools, name))) continue;
+        if (/^(perl|flock$|lockf$)/.test(name) || linked.has(name)) continue;
         symlinkSync(join(dir, name), join(tools, name));
+        linked.add(name);
       }
     }
     symlinkSync(process.execPath, join(tools, 'node'));
