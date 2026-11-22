@@ -9,7 +9,8 @@
 #      js-yaml that refusal is silently off. Probed in the package's own
 #      dist/ (dev checkout) THEN the PLUGIN_DATA copy that
 #      ensure-coordinator-node provisions, with its node_modules, at a
-#      Node-backend SessionStart — a marketplace install is a git clone and
+#      Node-backend SessionStart, and refreshes at a Python-backend one once
+#      a copy is installed (#289) — a marketplace install is a git clone and
 #      dist/ is gitignored, so there the DATA copy is the only Node client
 #      that exists. Backend-agnostic: it POSTs to whichever coordinator holds
 #      .coherence/server.pid.

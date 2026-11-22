@@ -550,3 +550,101 @@ test("CLI shim Probe 0: agent-coherence-status resolves to the Node CLI", () => 
     rmSync(ws, { recursive: true, force: true });
   }
 });
+
+// --------------------------------------------- the installed hook client (#289)
+
+/**
+ * A plugin-root copy whose bootstraps append what ran to `$BOOTSTRAP_LOG`, the
+ * Node one with its provision-only flag; `NODE_BOOTSTRAP_EXIT` sets its status.
+ */
+const LOGGING_ROOT = ((): string => {
+  const root = join(STUBS, "logging-plugin");
+  mkdirSync(join(root, "bin"), { recursive: true });
+  cpSync(join(PLUGIN_ROOT, "bin", "ensure-coordinator-dispatch"), join(root, "bin", "ensure-coordinator-dispatch"));
+  chmodSync(join(root, "bin", "ensure-coordinator-dispatch"), 0o755);
+  writeExecutable(
+    join(root, "bin", "ensure-coordinator"),
+    '#!/usr/bin/env bash\necho PYTHON >>"$BOOTSTRAP_LOG"\necho PYTHON-BOOTSTRAP\n'
+  );
+  writeExecutable(
+    join(root, "bin", "ensure-coordinator-node"),
+    '#!/usr/bin/env bash\necho "NODE provision-only=${AGENT_COHERENCE_PROVISION_ONLY:-}" >>"$BOOTSTRAP_LOG"\n' +
+      'echo NODE-BOOTSTRAP-STDOUT\nexit "${NODE_BOOTSTRAP_EXIT:-0}"\n'
+  );
+  return root;
+})();
+
+interface InstalledClientCase {
+  /** A Node hook client provisioned into CLAUDE_PLUGIN_DATA by an earlier session. */
+  installed: boolean;
+  path?: string;
+  /** The plugin root ships its own dist/ (a dev checkout), which the shim runs first. */
+  rootDist?: boolean;
+  nodeExit?: number;
+}
+
+/** Runs the dispatcher on an established (Python-backend) workspace; returns what ran, in order. */
+function dispatchEstablished(c: InstalledClientCase) {
+  const ws = mkdtempSync(join(tmpdir(), "dispatch5-ws-"));
+  const data = mkdtempSync(join(tmpdir(), "dispatch5-data-"));
+  const root = c.rootDist ? mkdtempSync(join(tmpdir(), "dispatch5-root-")) : LOGGING_ROOT;
+  try {
+    if (c.rootDist) {
+      cpSync(join(LOGGING_ROOT, "bin"), join(root, "bin"), { recursive: true });
+      mkdirSync(join(root, "dist"), { recursive: true });
+      writeFileSync(join(root, "dist", "hook_client.js"), "");
+    }
+    spawnSync("git", ["init", "-q"], { cwd: ws });
+    mkdirSync(join(ws, ".coherence"), { recursive: true });
+    writeFileSync(join(ws, ".coherence", "state.db"), "", "utf8");
+    if (c.installed) {
+      mkdirSync(join(data, "dist"), { recursive: true });
+      writeFileSync(join(data, "dist", "hook_client.js"), "");
+    }
+    const log = join(data, "bootstrap.log");
+    writeFileSync(log, "");
+    const r = spawnSync("/bin/bash", [join(root, "bin", "ensure-coordinator-dispatch")], {
+      cwd: ws,
+      encoding: "utf8",
+      env: {
+        PATH: c.path ?? NODE_24_PATH,
+        HOME: ws,
+        CLAUDE_PLUGIN_ROOT: root,
+        CLAUDE_PLUGIN_DATA: data,
+        BOOTSTRAP_LOG: log,
+        NODE_BOOTSTRAP_EXIT: String(c.nodeExit ?? 0),
+      } as NodeJS.ProcessEnv,
+      timeout: 10000,
+    });
+    return { status: r.status, stdout: r.stdout, stderr: r.stderr, ran: readFileSync(log, "utf8") };
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+    rmSync(data, { recursive: true, force: true });
+    if (c.rootDist) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("dispatcher: a Python-backend start refreshes the Node hook client an earlier session installed, after the Python start", () => {
+  const r = dispatchEstablished({ installed: true });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.ran, "PYTHON\nNODE provision-only=1\n");
+  // The hook's stdout stays the Python bootstrap's alone.
+  assert.equal(r.stdout, "PYTHON-BOOTSTRAP\n");
+});
+
+test("dispatcher: a Python-backend start installs no Node hook client where none was installed", () => {
+  assert.equal(dispatchEstablished({ installed: false }).ran, "PYTHON\n");
+});
+
+test("dispatcher: no refresh where the Node runtime cannot provision, or the plugin root ships its own client", () => {
+  assert.equal(dispatchEstablished({ installed: true, path: NODE_23_PATH }).ran, "PYTHON\n");
+  assert.equal(dispatchEstablished({ installed: true, rootDist: true }).ran, "PYTHON\n");
+});
+
+test("dispatcher: a refresh that fails leaves the Python start's status and stdout, and says so on stderr", () => {
+  const r = dispatchEstablished({ installed: true, nodeExit: 1 });
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout, "PYTHON-BOOTSTRAP\n");
+  assert.equal(r.ran, "PYTHON\nNODE provision-only=1\n");
+  assert.match(r.stderr, /could not refresh the Node hook client/);
+});

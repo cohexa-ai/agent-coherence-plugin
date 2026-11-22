@@ -27,7 +27,9 @@
 #
 # Selected by bin/ensure-coordinator-dispatch at SessionStart when the
 # backend resolves to `node` (env > .coherence/coordinator_backend file >
-# guarded default; see that script's header).
+# guarded default; see that script's header). On the Python backend the
+# dispatcher runs it with AGENT_COHERENCE_PROVISION_ONLY=1, which stops after
+# Stage 2 (see below).
 
 set -uo pipefail
 
@@ -477,11 +479,25 @@ elif [ "$deps_changed" = "1" ] || [ "$dist_stale" = "1" ]; then
     cp -r "${CLAUDE_PLUGIN_ROOT}/src/." "${CLAUDE_PLUGIN_DATA}/src/"
   fi
   cp "${CLAUDE_PLUGIN_ROOT}/tsconfig.json" "${CLAUDE_PLUGIN_DATA}/" || exit 1
-  rm -rf "${CLAUDE_PLUGIN_DATA}/dist"
-  if ! (cd "${CLAUDE_PLUGIN_DATA}" && "$tsc_bin" -p tsconfig.json) >&2; then
-    echo "agent-coherence: tsc build failed; coordinator will not start this session. Next session retries." >&2
+  # Build beside the published dist/ and swap it in only once the build
+  # succeeds: every workspace's hooks and Node coordinators load this one
+  # copy, so a failed or interrupted build must leave the last working one
+  # in place rather than none (#289).
+  staged_dist="${CLAUDE_PLUGIN_DATA}/dist.next"
+  rm -rf "$staged_dist" "${CLAUDE_PLUGIN_DATA}/dist.old"
+  if ! (cd "${CLAUDE_PLUGIN_DATA}" && "$tsc_bin" -p tsconfig.json --outDir "$staged_dist") >&2; then
+    rm -rf "$staged_dist"
+    echo "agent-coherence: tsc build failed; the previous build stays in place, and the coordinator will not start this session. Next session retries." >&2
     exit 1
   fi
+  if [ -d "${CLAUDE_PLUGIN_DATA}/dist" ]; then
+    mv "${CLAUDE_PLUGIN_DATA}/dist" "${CLAUDE_PLUGIN_DATA}/dist.old" || exit 1
+  fi
+  if ! mv "$staged_dist" "${CLAUDE_PLUGIN_DATA}/dist"; then
+    [ -d "${CLAUDE_PLUGIN_DATA}/dist.old" ] && mv "${CLAUDE_PLUGIN_DATA}/dist.old" "${CLAUDE_PLUGIN_DATA}/dist"
+    exit 1
+  fi
+  rm -rf "${CLAUDE_PLUGIN_DATA}/dist.old"
 fi
 
 # Provision verification — never spawn (or report success for) a missing
@@ -491,6 +507,13 @@ if [ ! -f "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" ]; then
   echo "agent-coherence: ${CLAUDE_PLUGIN_DATA}/dist/coordinator.js missing after provisioning; coordinator will not start this session. Next session retries." >&2
   python_backend_hint >&2
   exit 1
+fi
+
+# Provision only: a Python-backend session start runs Stages 0-2 so its hooks
+# stop running the Node hook client an earlier plugin version installed here
+# (#289). It starts no coordinator and stamps no backend.
+if [ "${AGENT_COHERENCE_PROVISION_ONLY:-}" = "1" ]; then
+  exit 0
 fi
 
 # Whether a coordinator holds its lock on server.pid: held, free, or unknown
