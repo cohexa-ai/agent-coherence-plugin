@@ -166,8 +166,9 @@ test("bin shim: CLI shims differ only in NAME + Node-CLI entry; migrate-deny lac
       `${sibling} differs from agent-coherence-status by more than NAME/entry — drift introduced`,
     );
   }
-  // migrate-deny = canonical minus the Probe 0 block.
-  const probe0 = /\n# Probe 0 \(zero-Python Unit 5\)[\s\S]*?\nfi\n/;
+  // migrate-deny = canonical minus the Probe 0 block: its comment, the read of
+  // the published build (#295) and the Node-CLI loop, through the loop's `fi`.
+  const probe0 = /\n# Probe 0 \(zero-Python Unit 5\)[\s\S]*?\n {2}done\nfi\n/;
   assert.match(canonical, probe0, "canonical shim must carry the Probe 0 block");
   const canonicalSansProbe0 = canonical.replace(probe0, "");
   const migrateDeny = readFileSync(join(BIN_DIR, "agent-coherence-migrate-deny"), "utf-8");

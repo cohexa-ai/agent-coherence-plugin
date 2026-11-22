@@ -146,11 +146,14 @@ refuse_coherence_dir() {   # 0 = refused (JSON printed), 1 = go on
 # Python backend would keep running whichever copy a Node-backend session last
 # built, through every later plugin upgrade (#289). So a Python-backend start
 # refreshes that copy too, with the Node bootstrap's own Stages 0-2 and no
-# coordinator. Only a copy the shim would run is refreshed: with none
-# installed, the hooks run the Python client and this start leaves them so.
+# coordinator. Only a client the shim would run is refreshed, a published
+# build (`current`, #295) or the PLUGIN_DATA/dist an older plugin version
+# built: with neither installed, the hooks run the Python client and this
+# start leaves them so.
 refresh_installed_hook_client() {
   local plugin_root="${CLAUDE_PLUGIN_ROOT:-$(dirname "$self_dir")}"
-  [ -n "${CLAUDE_PLUGIN_DATA:-}" ] && [ -f "${CLAUDE_PLUGIN_DATA}/dist/hook_client.js" ] || return 0
+  [ -n "${CLAUDE_PLUGIN_DATA:-}" ] || return 0
+  [ -f "${CLAUDE_PLUGIN_DATA}/current" ] || [ -f "${CLAUDE_PLUGIN_DATA}/dist/hook_client.js" ] || return 0
   [ -f "${plugin_root}/dist/hook_client.js" ] && return 0
   node_runtime_usable || return 0
   if ! AGENT_COHERENCE_PROVISION_ONLY=1 "$self_dir/ensure-coordinator-node" </dev/null >&2; then

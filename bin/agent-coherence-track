@@ -29,14 +29,30 @@ self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)"
 # Probe 0 (zero-Python Unit 5): prefer the plugin's bundled Node CLI — it
 # uses only node: builtins (no node_modules, no pip) and is backend-agnostic
 # (talks to whichever coordinator holds .coherence/server.pid). Probed in
-# the package's own dist/ (dev checkout) THEN the PLUGIN_DATA copy that
-# ensure-coordinator-node provisions at SessionStart — a marketplace install
-# is a git clone and dist/ is gitignored, so there the DATA copy is the only
-# Node CLI that exists. The Python console-script probes below remain as the
+# the package's own dist/ (dev checkout), THEN the build published under
+# PLUGIN_DATA that ensure-coordinator-node provisions at SessionStart, THEN the
+# PLUGIN_DATA/dist that plugin versions 0.7.1 and earlier provision — a
+# marketplace install is a git clone and dist/ is gitignored, so there the DATA
+# copy is the only Node CLI that exists. The Python console-script probes below remain as the
 # no-node fallback.
 plugin_root="${CLAUDE_PLUGIN_ROOT:-$(dirname "$self_dir")}"
+# >>> published-build: keep byte-identical in hook-client and the three CLI
+# shims (pinned by a test). The build `current` names under CLAUDE_PLUGIN_DATA:
+# bin/ensure-coordinator-node replaces that file only by rename(2), once the
+# build it names is whole, and never writes a published build again (#295).
+# Read with the `read` builtin, so the shim forks nothing for it.
+data_dist=""
+if [ -n "${CLAUDE_PLUGIN_DATA:-}" ] && [ -f "${CLAUDE_PLUGIN_DATA}/current" ]; then
+  published_build=""
+  IFS= read -r published_build <"${CLAUDE_PLUGIN_DATA}/current" || true
+  case "$published_build" in
+    "" | */* | .*) ;;
+    *) data_dist="${CLAUDE_PLUGIN_DATA}/builds/${published_build}/dist" ;;
+  esac
+fi
+# <<< published-build
 if command -v node >/dev/null 2>&1; then
-  for node_cli in "${plugin_root}/dist/cli_track.js" "${CLAUDE_PLUGIN_DATA:-}/dist/cli_track.js"; do
+  for node_cli in "${plugin_root}/dist/cli_track.js" ${data_dist:+"$data_dist/cli_track.js"} "${CLAUDE_PLUGIN_DATA:-}/dist/cli_track.js"; do
     if [ -f "$node_cli" ]; then
       exec node "$node_cli" "$@"
     fi

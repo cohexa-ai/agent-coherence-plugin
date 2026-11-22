@@ -577,6 +577,8 @@ const LOGGING_ROOT = ((): string => {
 interface InstalledClientCase {
   /** A Node hook client provisioned into CLAUDE_PLUGIN_DATA by an earlier session. */
   installed: boolean;
+  /** That client is a build published through CLAUDE_PLUGIN_DATA/current (#295), not PLUGIN_DATA/dist. */
+  published?: boolean;
   path?: string;
   /** The plugin root ships its own dist/ (a dev checkout), which the shim runs first. */
   rootDist?: boolean;
@@ -597,7 +599,11 @@ function dispatchEstablished(c: InstalledClientCase) {
     spawnSync("git", ["init", "-q"], { cwd: ws });
     mkdirSync(join(ws, ".coherence"), { recursive: true });
     writeFileSync(join(ws, ".coherence", "state.db"), "", "utf8");
-    if (c.installed) {
+    if (c.installed && c.published) {
+      mkdirSync(join(data, "builds", "k.aaaaaa", "dist"), { recursive: true });
+      writeFileSync(join(data, "builds", "k.aaaaaa", "dist", "hook_client.js"), "");
+      writeFileSync(join(data, "current"), "k.aaaaaa\n");
+    } else if (c.installed) {
       mkdirSync(join(data, "dist"), { recursive: true });
       writeFileSync(join(data, "dist", "hook_client.js"), "");
     }
@@ -630,6 +636,10 @@ test("dispatcher: a Python-backend start refreshes the Node hook client an earli
   assert.equal(r.ran, "PYTHON\nNODE provision-only=1\n");
   // The hook's stdout stays the Python bootstrap's alone.
   assert.equal(r.stdout, "PYTHON-BOOTSTRAP\n");
+});
+
+test("dispatcher: a Python-backend start refreshes a published Node hook client build too (#295)", () => {
+  assert.equal(dispatchEstablished({ installed: true, published: true }).ran, "PYTHON\nNODE provision-only=1\n");
 });
 
 test("dispatcher: a Python-backend start installs no Node hook client where none was installed", () => {

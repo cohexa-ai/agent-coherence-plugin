@@ -27,6 +27,8 @@ import {
   renameSync,
   lstatSync,
   readlinkSync,
+  readdirSync,
+  statSync,
   utimesSync,
 } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -79,16 +81,29 @@ const CRASHING_COORDINATOR_TS = 'throw new Error("stub coordinator crash on boot
 const HEALTHY_PREBUILT_JS = 'import { mkdirSync, writeFileSync } from "node:fs";\n' + SERVE_LIKE_A_COORDINATOR;
 
 // The exact crash a Node-major change produces once node_modules holds a
-// binary built for the previous ABI — the failure this file's ABI-stamp
+// binary built for the previous ABI — the failure this file's SELF-HEAL
 // tests exist to make self-healing.
 const ABI_CRASH_COORDINATOR_TS =
   "throw new Error(\"The module '/x/better_sqlite3.node' was compiled against a " +
   'different Node.js version using NODE_MODULE_VERSION 131. This version of Node.js ' +
   'requires NODE_MODULE_VERSION 137.");\n';
 
-/** The ABI the running node binds native addons to — what the stamp records. */
+/** The ABI the running node binds native addons to — what a build is sealed for. */
 const RUNNING_ABI = process.versions.modules;
-const ABI_STAMP = '.node-abi';
+
+/**
+ * Where a provision publishes its build (#295): builds/<name>/, named by the
+ * one-line file `current` and sealed by `.ok` ("<abi> <install digest>").
+ */
+function publishedBuild(data: string): string {
+  return readFileSync(join(data, 'current'), 'utf8').trim();
+}
+function publishedDir(data: string): string {
+  return join(data, 'builds', publishedBuild(data));
+}
+function sealedAbi(buildDir: string): string {
+  return readFileSync(join(buildDir, '.ok'), 'utf8').split(' ')[0]!.trim();
+}
 
 interface StubRootOpts {
   /** When set, the package ships src/coordinator.ts + tsconfig.json (marketplace shape). */
@@ -172,8 +187,8 @@ test('REGRESSION: dist-less package (marketplace clone) self-builds src/ and spa
       assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
       assert.match(r.stderr, /building src\//);
       assert.ok(
-        existsSync(join(data, 'dist', 'coordinator.js')),
-        'built entry must exist in PLUGIN_DATA'
+        existsSync(join(publishedDir(data), 'dist', 'coordinator.js')),
+        'built entry must exist in the build PLUGIN_DATA publishes'
       );
       const m = /spawned Node coordinator \(pid=(\d+)/.exec(r.stderr);
       assert.ok(m, `no spawn line in stderr:\n${r.stderr}`);
@@ -204,6 +219,7 @@ test('provisioning is keyed: an unchanged package skips the rebuild and just spa
     killSpawned(first.stderr ?? '');
     assert.equal(first.status, 0, `first bootstrap failed:\n${first.stdout}\n${first.stderr}`);
     assert.match(first.stderr, /building src\//);
+    const built = publishedBuild(data);
 
     const second = runBootstrap(root, data, ws);
     try {
@@ -214,12 +230,13 @@ test('provisioning is keyed: an unchanged package skips the rebuild and just spa
       );
       // Same package.json, same ABI, entry already built → no install, no
       // rebuild. The ABI key must not turn every session into a reinstall.
+      assert.equal(publishedBuild(data), built, 'the published build is reused, not rebuilt');
       assert.doesNotMatch(second.stderr, /installing Node deps/);
       assert.doesNotMatch(second.stderr, /building src\//);
       assert.doesNotMatch(second.stderr, /Node ABI changed/);
       assert.match(second.stderr, /spawned Node coordinator/);
       assert.doesNotMatch(second.stderr, /has not started serving/);
-      assert.equal(readFileSync(join(data, ABI_STAMP), 'utf8').trim(), RUNNING_ABI);
+      assert.equal(sealedAbi(publishedDir(data)), RUNNING_ABI);
     } finally {
       killSpawned(second.stderr ?? '');
     }
@@ -258,9 +275,9 @@ test("LIVENESS GATE: a coordinator that dies on boot → exit 1 with a log excer
     // A FAILED boot must not stamp the workspace as node-backed.
     assert.equal(existsSync(join(ws, '.coherence', 'coordinator_backend')), false);
     // ...but a crash with no NODE_MODULE_VERSION in it is NOT an ABI problem,
-    // so the ABI stamp must survive. Invalidating it on any crash would turn
+    // so the build's seal must survive. Removing it on any crash would turn
     // an ordinary coordinator bug into a full npm reinstall every session.
-    assert.equal(readFileSync(join(data, ABI_STAMP), 'utf8').trim(), RUNNING_ABI);
+    assert.equal(sealedAbi(publishedDir(data)), RUNNING_ABI);
     assert.doesNotMatch(r.stderr, /next session reprovisions/);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -636,8 +653,8 @@ test('dev-checkout shape: a package WITH dist/ is mirrored (no build) and spawns
     try {
       assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
       assert.ok(
-        existsSync(join(data, 'dist', 'coordinator.js')),
-        'mirrored entry must exist in PLUGIN_DATA'
+        existsSync(join(publishedDir(data), 'dist', 'coordinator.js')),
+        'mirrored entry must exist in the build PLUGIN_DATA publishes'
       );
       assert.doesNotMatch(r.stderr, /building src\//);
       assert.match(r.stderr, /spawned Node coordinator/);
@@ -882,7 +899,7 @@ test('the first-provision stamp follows no link planted after the start check, a
   }
 });
 
-test('ABI STAMP: a successful provision records the running Node ABI', () => {
+test('ABI KEY: a successful provision names and seals its build for the running Node ABI', () => {
   const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
   const { data, ws, cleanup } = makeDirs();
   try {
@@ -891,7 +908,11 @@ test('ABI STAMP: a successful provision records the running Node ABI', () => {
       assert.equal(r.status, 0, `bootstrap failed:\n${r.stdout}\n${r.stderr}`);
       // process.versions.modules — NOT the Node version. A binary is bound to
       // the ABI, and two Node majors can share one (as 24 and 25 nearly did).
-      assert.equal(readFileSync(join(data, ABI_STAMP), 'utf8').trim(), RUNNING_ABI);
+      assert.ok(
+        publishedBuild(data).startsWith(`${RUNNING_ABI}-${process.platform}-${process.arch}-`),
+        `build name does not carry the ABI: ${publishedBuild(data)}`
+      );
+      assert.equal(sealedAbi(publishedDir(data)), RUNNING_ABI);
     } finally {
       killSpawned(r.stderr ?? '');
     }
@@ -901,7 +922,7 @@ test('ABI STAMP: a successful provision records the running Node ABI', () => {
   }
 });
 
-test('REGRESSION: a Node-major change (stale ABI stamp) forces a CLEAN reinstall', () => {
+test('REGRESSION: a Node-major change forces a CLEAN install, beside the build published for the old ABI', () => {
   const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
   const { data, ws, cleanup } = makeDirs();
   try {
@@ -909,16 +930,18 @@ test('REGRESSION: a Node-major change (stale ABI stamp) forces a CLEAN reinstall
     killSpawned(first.stderr ?? '');
     assert.equal(first.status, 0, `first bootstrap failed:\n${first.stdout}\n${first.stderr}`);
 
-    // Stand in for the tree a previous Node major left behind: node_modules
-    // present, holding a binary compiled for ABI 131 (Node 23). The sentinel
-    // is the load-bearing part — a plain `npm install` over this tree leaves
-    // it untouched, because npm sees a satisfying version already installed,
+    // Stand in for the build a previous Node major published: node_modules
+    // holding a binary compiled for ABI 131 (Node 23). The sentinel is the
+    // load-bearing part — a plain `npm install` over this tree leaves it
+    // untouched, because npm sees a satisfying version already installed,
     // which is exactly how the 0.3.1 -> 0.4.0 bump shipped a stale binary to
-    // a Node 24 user. Only a teardown removes it.
-    const sentinel = join(data, 'node_modules', 'STALE-ABI-131-ARTIFACT');
-    mkdirSync(join(data, 'node_modules'), { recursive: true });
+    // a Node 24 user. Only a clean install leaves it behind.
+    const oldName = publishedBuild(data).replace(/^\d+-/, '131-');
+    renameSync(publishedDir(data), join(data, 'builds', oldName));
+    writeFileSync(join(data, 'current'), `${oldName}\n`);
+    writeFileSync(join(data, 'builds', oldName, '.ok'), '131 stale\n');
+    const sentinel = join(data, 'builds', oldName, 'node_modules', 'STALE-ABI-131-ARTIFACT');
     writeFileSync(sentinel, 'compiled for NODE_MODULE_VERSION 131\n');
-    writeFileSync(join(data, ABI_STAMP), '131\n');
 
     const second = runBootstrap(root, data, ws);
     try {
@@ -929,12 +952,17 @@ test('REGRESSION: a Node-major change (stale ABI stamp) forces a CLEAN reinstall
       );
       assert.match(second.stderr, new RegExp(`Node ABI changed \\(131 -> ${RUNNING_ABI}\\)`));
       assert.match(second.stderr, /installing Node deps/);
+      assert.notEqual(publishedBuild(data), oldName);
       assert.equal(
-        existsSync(sentinel),
+        existsSync(join(publishedDir(data), 'node_modules', 'STALE-ABI-131-ARTIFACT')),
         false,
-        'stale node_modules must be torn down, not installed over'
+        'the new ABI gets a clean install, not one over the stale tree'
       );
-      assert.equal(readFileSync(join(data, ABI_STAMP), 'utf8').trim(), RUNNING_ABI);
+      assert.equal(existsSync(sentinel), true, 'the old ABI\'s build is left whole, not torn down under its readers');
+      // The sources did not change: tsc output is plain JavaScript, bound to
+      // no ABI, so the old build's dist/ is reused rather than rebuilt.
+      assert.doesNotMatch(second.stderr, /building src\//);
+      assert.equal(sealedAbi(publishedDir(data)), RUNNING_ABI);
       assert.match(second.stderr, /spawned Node coordinator/);
     } finally {
       killSpawned(second.stderr ?? '');
@@ -945,7 +973,7 @@ test('REGRESSION: a Node-major change (stale ABI stamp) forces a CLEAN reinstall
   }
 });
 
-test('a stamp left behind by a hand-deleted node_modules does not vouch for the missing tree', () => {
+test('a seal left behind by a hand-deleted node_modules does not vouch for the missing tree', () => {
   const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
   const { data, ws, cleanup } = makeDirs();
   try {
@@ -953,11 +981,11 @@ test('a stamp left behind by a hand-deleted node_modules does not vouch for the 
     killSpawned(first.stderr ?? '');
     assert.equal(first.status, 0, `first bootstrap failed:\n${first.stdout}\n${first.stderr}`);
 
-    // A CURRENT-ABI stamp over a tree that isn't there. Reading the stamp
-    // without checking the tree would take the fast path and spawn straight
-    // into a MODULE_NOT_FOUND crash loop.
-    rmSync(join(data, 'node_modules'), { recursive: true, force: true });
-    writeFileSync(join(data, ABI_STAMP), `${RUNNING_ABI}\n`);
+    // A sealed build whose tree isn't there. Reading the seal without
+    // checking the tree would take the fast path and spawn straight into a
+    // MODULE_NOT_FOUND crash loop.
+    const gutted = publishedBuild(data);
+    rmSync(join(publishedDir(data), 'node_modules'), { recursive: true, force: true });
 
     const second = runBootstrap(root, data, ws);
     try {
@@ -967,29 +995,12 @@ test('a stamp left behind by a hand-deleted node_modules does not vouch for the 
         `second bootstrap failed:\n${second.stdout}\n${second.stderr}`
       );
       assert.match(second.stderr, /spawned Node coordinator/);
-      assert.equal(readFileSync(join(data, ABI_STAMP), 'utf8').trim(), RUNNING_ABI);
+      assert.notEqual(publishedBuild(data), gutted, 'a new build replaces the gutted one');
+      assert.ok(existsSync(join(publishedDir(data), 'node_modules')));
+      assert.equal(sealedAbi(publishedDir(data)), RUNNING_ABI);
     } finally {
       killSpawned(second.stderr ?? '');
     }
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-    cleanup();
-  }
-});
-
-test('SELF-HEAL: a NODE_MODULE_VERSION crash invalidates the stamp so the next session reprovisions', () => {
-  const root = makeStubRoot({ srcCoordinatorTs: ABI_CRASH_COORDINATOR_TS, withTsc: true });
-  const { data, ws, cleanup } = makeDirs();
-  try {
-    const r = runBootstrap(root, data, ws);
-    assert.equal(r.status, 1, `expected loud failure:\n${r.stdout}\n${r.stderr}`);
-    assert.match(r.stderr, /exited before it started serving/);
-    assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
-    // The stamp vouched for a tree that cannot load. Dropping it is what
-    // turns "dead until the user figures it out" into one bad session: the
-    // next run finds no stamp, probes, and reinstalls.
-    assert.match(r.stderr, /next session reprovisions/);
-    assert.equal(existsSync(join(data, ABI_STAMP)), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
     cleanup();
@@ -1022,7 +1033,7 @@ test('STAGE 2: a src/ change with no package.json change still rebuilds dist/', 
       );
       assert.match(second.stderr, /building src\//);
       assert.doesNotMatch(second.stderr, /installing Node deps/);
-      assert.match(readFileSync(join(data, 'dist', 'coordinator.js'), 'utf8'), /SECOND-REVISION/);
+      assert.match(readFileSync(join(publishedDir(data), 'dist', 'coordinator.js'), 'utf8'), /SECOND-REVISION/);
     } finally {
       killSpawned(second.stderr ?? '');
     }
@@ -1547,7 +1558,10 @@ test('PROVISION ONLY: refreshes the client in PLUGIN_DATA and starts no coordina
     const r = provisionOnly(root, data, ws);
     try {
       assert.equal(r.status, 0, `provision-only failed:\n${r.stdout}\n${r.stderr}`);
-      assert.match(readFileSync(join(data, 'dist', 'hook_client.js'), 'utf8'), /BUILT_BY_THIS_PACKAGE/);
+      assert.match(readFileSync(join(publishedDir(data), 'dist', 'hook_client.js'), 'utf8'), /BUILT_BY_THIS_PACKAGE/);
+      // The copy the earlier plugin version built is its own: sessions of
+      // that version keep running it, and nothing here writes it (#295).
+      assert.equal(readFileSync(join(data, 'dist', 'hook_client.js'), 'utf8'), STALE_CLIENT_JS);
       assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
       assert.equal(existsSync(join(ws, '.coherence', 'server.pid')), false, 'no coordinator started');
       assert.equal(existsSync(join(ws, '.coherence', 'coordinator_backend')), false, 'no backend stamp');
@@ -1562,15 +1576,653 @@ test('PROVISION ONLY: refreshes the client in PLUGIN_DATA and starts no coordina
 test('STAGE 2: a build that fails leaves the last working build in PLUGIN_DATA (#289)', () => {
   // Every workspace's hooks run this one copy, so a failed rebuild must not
   // leave them with none.
-  const { root, data, ws, cleanup } = stalePluginData('const broken: number = "not a number";\n');
+  const { root, data, ws, cleanup } = stalePluginData(HEALTHY_COORDINATOR_TS);
   try {
+    const good = provisionOnly(root, data, ws);
+    assert.equal(good.status, 0, `the first build failed:\n${good.stderr}`);
+    const published = publishedBuild(data);
+    writeFileSync(join(root, 'src', 'coordinator.ts'), 'const broken: number = "not a number";\n');
+
     const r = provisionOnly(root, data, ws);
     assert.equal(r.status, 1, `expected the build to fail:\n${r.stdout}\n${r.stderr}`);
     assert.match(r.stderr, /tsc build failed; the previous build stays in place/);
+    assert.equal(publishedBuild(data), published);
+    assert.match(readFileSync(join(publishedDir(data), 'dist', 'hook_client.js'), 'utf8'), /BUILT_BY_THIS_PACKAGE/);
     assert.equal(readFileSync(join(data, 'dist', 'hook_client.js'), 'utf8'), STALE_CLIENT_JS);
-    assert.equal(existsSync(join(data, 'dist.next')), false, 'no staged build left behind');
+    assert.deepEqual(readdirSync(join(data, 'builds')), [published], 'no unfinished build left behind');
+    assert.equal(existsSync(join(data, 'dist.next')), false);
     assert.equal(existsSync(join(data, 'dist.old')), false);
   } finally {
     cleanup();
+  }
+});
+
+// ----------------------------------- #295: readers while a session start provisions
+//
+// Every workspace's hooks, CLI shims and Node coordinators load from the one
+// CLAUDE_PLUGIN_DATA, and Claude Code runs a session's SessionStart hooks at
+// once, so provisioning always races readers starting up, and other session
+// starts. These tests go through bin/hook-client, whatever layout the data
+// directory has, with a stub npm that does what npm's reify does to a changed
+// package: the installed copy goes, then the new one is unpacked.
+
+/** A package whose hook client imports a package its install provides. */
+function dependentPackageJson(version: string): string {
+  return JSON.stringify({
+    name: 'provision-stub',
+    version,
+    private: true,
+    type: 'module',
+    dependencies: { 'fake-dep': '1.0.0' },
+  });
+}
+
+function dependentClientTs(version: string): string {
+  return (
+    '// @ts-ignore -- fake-dep ships no types; Node resolves it at run time.\n' +
+    'import { ok } from "fake-dep";\n' +
+    'declare const process: { stdout: { write(s: string): void } };\n' +
+    `process.stdout.write(JSON.stringify({ ok, v: "${version}" }));\n`
+  );
+}
+
+function setDependentVersion(root: string, version: string): void {
+  writeFileSync(join(root, 'package.json'), dependentPackageJson(version));
+  writeFileSync(join(root, 'src', 'hook_client.ts'), dependentClientTs(version));
+}
+
+/** A marketplace-shaped package (src/, no dist/) with the hook-client shim. */
+function makeDependentRoot(version: string): string {
+  const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
+  cpSync(join(PLUGIN_ROOT, 'bin', 'hook-client'), join(root, 'bin', 'hook-client'));
+  chmodSync(join(root, 'bin', 'hook-client'), 0o755);
+  setDependentVersion(root, version);
+  return root;
+}
+
+/**
+ * A stub `npm install`. It records each run and any two runs at once, removes
+ * fake-dep from the directory it runs in, waits until $NPM_SIGNAL/release
+ * exists (and $NPM_HOLD_S more), then unpacks fake-dep there, unless
+ * $NPM_SKIP_UNPACK is set. With $NPM_SLEEPER set it first leaves behind a
+ * process in a group of its own, as an npm child that outlives a killed start
+ * would be. Anything other than an install with $NPM_SIGNAL set, such as
+ * writeExecutable's warm-up run, does nothing.
+ */
+const REIFY_NPM =
+  '#!/usr/bin/env bash\n' +
+  '[ "${1:-}" = install ] && [ -n "${NPM_SIGNAL:-}" ] || exit 0\n' +
+  'mkdir "$NPM_SIGNAL/inside" 2>/dev/null || echo overlap >>"$NPM_SIGNAL/overlaps"\n' +
+  'echo "$PWD" >>"$NPM_SIGNAL/entries"\n' +
+  'if [ -n "${NPM_SLEEPER:-}" ]; then\n' +
+  '  perl -e \'setpgrp(0, 0); sleep 60\' </dev/null >/dev/null 2>&1 &\n' +
+  '  echo "$!" >"$NPM_SIGNAL/sleeper.pid"\n' +
+  'fi\n' +
+  'rm -rf node_modules/fake-dep\n' +
+  ': >"$NPM_SIGNAL/entered"\n' +
+  'for _ in $(seq 1 1200); do [ -e "$NPM_SIGNAL/release" ] && break; sleep 0.05; done\n' +
+  '[ -n "${NPM_HOLD_S:-}" ] && sleep "$NPM_HOLD_S"\n' +
+  'if [ -z "${NPM_SKIP_UNPACK:-}" ]; then\n' +
+  '  mkdir -p node_modules/fake-dep\n' +
+  '  printf \'%s\\n\' \'{"name":"fake-dep","version":"1.0.0","type":"module","main":"index.js"}\' >node_modules/fake-dep/package.json\n' +
+  '  printf \'%s\\n\' \'export const ok = true;\' >node_modules/fake-dep/index.js\n' +
+  'fi\n' +
+  'rmdir "$NPM_SIGNAL/inside" 2>/dev/null\n' +
+  'exit 0\n';
+
+interface ProvisionRig {
+  root: string;
+  data: string;
+  ws: string;
+  signal: string;
+  env: (extra?: Record<string, string>) => NodeJS.ProcessEnv;
+  cleanup: () => void;
+}
+
+function provisionRig(version: string): ProvisionRig {
+  const root = makeDependentRoot(version);
+  const { data, ws, cleanup } = makeDirs();
+  const stubBin = mkdtempSync(join(tmpdir(), 'provision-npmstub-'));
+  const signal = mkdtempSync(join(tmpdir(), 'provision-signal-'));
+  writeExecutable(join(stubBin, 'npm'), REIFY_NPM);
+  return {
+    root,
+    data,
+    ws,
+    signal,
+    env: (extra = {}) =>
+      ({
+        ...process.env,
+        PATH: `${stubBin}:${process.env.PATH ?? ''}`,
+        CLAUDE_PLUGIN_ROOT: root,
+        CLAUDE_PLUGIN_DATA: data,
+        AGENT_COHERENCE_PROVISION_ONLY: '1',
+        NPM_SIGNAL: signal,
+        ...extra,
+      }) as NodeJS.ProcessEnv,
+    cleanup: () => {
+      for (const dir of [stubBin, signal, root]) rmSync(dir, { recursive: true, force: true });
+      cleanup();
+    },
+  };
+}
+
+function provisionNow(rig: ProvisionRig, extra: Record<string, string> = {}) {
+  return spawnSync('bash', [join(rig.root, 'bin', 'ensure-coordinator-node')], {
+    cwd: rig.ws,
+    encoding: 'utf8',
+    timeout: 120000,
+    env: rig.env(extra),
+  });
+}
+
+function provisionLater(rig: ProvisionRig, extra: Record<string, string> = {}, detached = false) {
+  const child = spawn('bash', [join(rig.root, 'bin', 'ensure-coordinator-node')], {
+    cwd: rig.ws,
+    env: rig.env(extra),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached,
+  });
+  let stderr = '';
+  child.stderr!.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
+  child.stdout!.resume();
+  const exited = new Promise<{ status: number | null; stderr: string }>((resolve) =>
+    child.once('exit', (status) => resolve({ status, stderr }))
+  );
+  return { child, exited, stderr: () => stderr };
+}
+
+async function waitUntil(what: string, check: () => boolean, timeoutMs = 60000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/** What the hook client prints for a pre-edit, run the way Claude Code runs it. */
+function runHookClient(rig: ProvisionRig) {
+  return spawnSync('bash', [join(rig.root, 'bin', 'hook-client'), 'pre-edit'], {
+    cwd: rig.ws,
+    encoding: 'utf8',
+    input: '{}',
+    timeout: 30000,
+    env: { ...process.env, CLAUDE_PLUGIN_ROOT: rig.root, CLAUDE_PLUGIN_DATA: rig.data } as NodeJS.ProcessEnv,
+  });
+}
+
+async function waitForPath(path: string, timeoutMs = 60000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+test('#295: a hook that starts while a session start installs an upgrade runs the client published before', async () => {
+  const rig = provisionRig('0.0.1');
+  try {
+    writeFileSync(join(rig.signal, 'release'), '');
+    const first = provisionNow(rig);
+    assert.equal(first.status, 0, `first provision failed:\n${first.stderr}`);
+    assert.equal(runHookClient(rig).stdout, '{"ok":true,"v":"0.0.1"}');
+
+    // A plugin upgrade: a new package.json and new sources. Its install now
+    // blocks with fake-dep removed, as npm's reify leaves a changed package.
+    setDependentVersion(rig.root, '0.0.2');
+    rmSync(join(rig.signal, 'release'));
+    rmSync(join(rig.signal, 'entered'));
+    const upgrade = provisionLater(rig);
+    await waitForPath(join(rig.signal, 'entered'));
+    const during = runHookClient(rig);
+    writeFileSync(join(rig.signal, 'release'), '');
+    const done = await upgrade.exited;
+
+    assert.equal(during.status, 0, `a hook failed while the upgrade installed:\n${during.stderr}`);
+    assert.equal(during.stdout, '{"ok":true,"v":"0.0.1"}', 'the hook ran a whole client: the one published before');
+    assert.equal(done.status, 0, `the upgrade failed:\n${done.stderr}`);
+    assert.equal(runHookClient(rig).stdout, '{"ok":true,"v":"0.0.2"}', 'the upgrade is published once it is whole');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('#295: two session starts at once after an upgrade install and build one at a time, and both succeed', async () => {
+  const rig = provisionRig('0.0.1');
+  try {
+    writeFileSync(join(rig.signal, 'release'), '');
+    const first = provisionNow(rig);
+    assert.equal(first.status, 0, `first provision failed:\n${first.stderr}`);
+    rmSync(join(rig.signal, 'entries'));
+
+    // Two session starts (two workspaces, or a Node and a Python one) after
+    // the upgrade, each install held open long enough to overlap.
+    setDependentVersion(rig.root, '0.0.2');
+    const a = provisionLater(rig, { NPM_HOLD_S: '1.5' });
+    const b = provisionLater(rig, { NPM_HOLD_S: '1.5' });
+    const [doneA, doneB] = await Promise.all([a.exited, b.exited]);
+
+    assert.equal(existsSync(join(rig.signal, 'overlaps')), false, 'two npm installs ran at once');
+    assert.equal(
+      readFileSync(join(rig.signal, 'entries'), 'utf8').trim().split('\n').length,
+      1,
+      'the start that waited found the upgrade already done'
+    );
+    assert.equal(doneA.status, 0, `start A failed:\n${doneA.stderr}`);
+    assert.equal(doneB.status, 0, `start B failed:\n${doneB.stderr}`);
+    const after = runHookClient(rig);
+    assert.equal(after.status, 0, `the hook failed after both starts:\n${after.stderr}`);
+    assert.equal(after.stdout, '{"ok":true,"v":"0.0.2"}');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+// ------------------------------------------- #295: the provisioning lock and builds
+
+/** The build directories under PLUGIN_DATA, sorted. */
+function buildNames(data: string): string[] {
+  return existsSync(join(data, 'builds')) ? readdirSync(join(data, 'builds')).sort() : [];
+}
+
+test('LOCK: a start that waited for another makes no build of its own', async () => {
+  const rig = provisionRig('0.0.1');
+  try {
+    writeFileSync(join(rig.signal, 'release'), '');
+    assert.equal(provisionNow(rig).status, 0);
+    setDependentVersion(rig.root, '0.0.2');
+    rmSync(join(rig.signal, 'release'));
+    rmSync(join(rig.signal, 'entered'));
+    const a = provisionLater(rig);
+    await waitForPath(join(rig.signal, 'entered'));
+    const b = provisionLater(rig);
+    await waitUntil('start B to wait for the lock', () => /another session start is provisioning/.test(b.stderr()));
+    writeFileSync(join(rig.signal, 'release'), '');
+    const [doneA, doneB] = await Promise.all([a.exited, b.exited]);
+    assert.equal(doneA.status, 0, doneA.stderr);
+    assert.equal(doneB.status, 0, doneB.stderr);
+    assert.match(doneB.stderr, /another session start is provisioning .*; waiting up to 120s/);
+    // The 0.0.1 build, kept as the one retired last, and the one 0.0.2 build.
+    assert.equal(buildNames(rig.data).length, 2, `builds: ${buildNames(rig.data).join(', ')}`);
+    assert.equal(runHookClient(rig).stdout, '{"ok":true,"v":"0.0.2"}');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('LOCK: a start that cannot get the lock in time builds nothing, and says what it runs instead', async () => {
+  const rig = provisionRig('0.0.1');
+  let holder: Awaited<ReturnType<typeof holdPidFileLock>> | undefined;
+  try {
+    writeFileSync(join(rig.signal, 'release'), '');
+    assert.equal(provisionNow(rig).status, 0);
+    const published = publishedBuild(rig.data);
+    setDependentVersion(rig.root, '0.0.2');
+    holder = await holdPidFileLock(join(rig.data, '.provision.lock'));
+
+    // A Python-backend refresh: nothing built for its key, so it stops.
+    // Zero-padded, as an operator may write it: decimal, not octal.
+    const refresh = provisionNow(rig, { AGENT_COHERENCE_PROVISION_WAIT_S: '08' });
+    assert.equal(refresh.status, 1, refresh.stderr);
+    assert.match(refresh.stderr, /held .*\.provision\.lock for 8s and no build for this package and Node .* is ready/);
+    assert.deepEqual(buildNames(rig.data), [published], 'it wrote nothing');
+
+    // A coordinator start: the published build was made for this ABI, so it
+    // spawns from that one rather than wait or race the holder, and says that
+    // the coordinator keeps that older build until it is stopped.
+    const start = provisionNow(rig, { AGENT_COHERENCE_PROVISION_WAIT_S: '1', AGENT_COHERENCE_PROVISION_ONLY: '' });
+    try {
+      assert.equal(start.status, 0, start.stderr);
+      assert.match(start.stderr, new RegExp(`this session uses the build published before it \\(${published}\\)`));
+      assert.match(start.stderr, /keeps it until it stops: once that start has finished, stop it \(kill "\$\(head -n 1 '.*server\.pid'\)"\)/);
+      assert.match(start.stderr, /spawned Node coordinator/);
+      assert.equal(publishedBuild(rig.data), published);
+      assert.equal(readFileSync(join(rig.ws, '.coherence', 'coordinator_backend'), 'utf8').trim(), 'node');
+    } finally {
+      killSpawned(start.stderr ?? '');
+    }
+  } finally {
+    if (holder) await killAndWait(holder);
+    rig.cleanup();
+  }
+});
+
+for (const kill of ['SIGKILL', 'SIGTERM then SIGKILL'] as const) {
+  test(`LOCK: a provisioner killed mid-install (${kill}) frees the lock and leaves the published build as it was`, async () => {
+    const rig = provisionRig('0.0.1');
+    let sleeper: number | undefined;
+    try {
+      writeFileSync(join(rig.signal, 'release'), '');
+      assert.equal(provisionNow(rig).status, 0);
+      const published = publishedBuild(rig.data);
+      setDependentVersion(rig.root, '0.0.2');
+      rmSync(join(rig.signal, 'release'));
+      rmSync(join(rig.signal, 'entered'));
+      const killed = provisionLater(rig, { NPM_SLEEPER: '1' }, true);
+      await waitForPath(join(rig.signal, 'entered'));
+      sleeper = Number(readFileSync(join(rig.signal, 'sleeper.pid'), 'utf8'));
+      // Claude Code's time box signals the hook's whole process group: SIGTERM,
+      // then SIGKILL 1.5 s later.
+      if (kill === 'SIGTERM then SIGKILL') {
+        process.kill(-killed.child.pid!, 'SIGTERM');
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+      try {
+        process.kill(-killed.child.pid!, 'SIGKILL');
+      } catch {
+        // the group is already gone
+      }
+      await killed.exited;
+      assert.equal(publishedBuild(rig.data), published);
+      assert.equal(runHookClient(rig).stdout, '{"ok":true,"v":"0.0.1"}');
+      assert.doesNotThrow(() => process.kill(sleeper!, 0), "npm's child outside the group outlived the kill");
+
+      rmSync(join(rig.signal, 'inside'), { recursive: true, force: true });
+      writeFileSync(join(rig.signal, 'release'), '');
+      const next = provisionNow(rig, { AGENT_COHERENCE_PROVISION_WAIT_S: '5' });
+      assert.equal(next.status, 0, next.stderr);
+      assert.doesNotMatch(next.stderr, /waiting/, 'nothing still held the lock, not even the surviving child');
+      assert.equal(runHookClient(rig).stdout, '{"ok":true,"v":"0.0.2"}');
+      // On SIGTERM the EXIT trap removes the unfinished build; after a bare
+      // SIGKILL it stays, never published, until a later collection past its hour.
+      assert.equal(buildNames(rig.data).length, kill === 'SIGKILL' ? 3 : 2, buildNames(rig.data).join(', '));
+    } finally {
+      if (sleeper !== undefined) {
+        try {
+          process.kill(sleeper, 'SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      rig.cleanup();
+    }
+  });
+}
+
+test('LOCK: the provisioning lock is closed on each child or ( subshell ), never on a { group } or a function call', () => {
+  // bash 3.2 (macOS /bin/bash) runs `{ cmd; } 9>&-` and `func 9>&-` with fd 9
+  // saved on another descriptor that every command inside inherits, so the
+  // lock outlives a provisioner killed mid-install in any child npm leaves
+  // running. `cmd 9>&-`, `( cmd ) 9>&-` and `(exec 9>&-; cmd)` do close it.
+  const script = readFileSync(join(PLUGIN_ROOT, 'bin', 'ensure-coordinator-node'), 'utf8');
+  const functions = [...script.matchAll(/^([A-Za-z_][A-Za-z0-9_]*)\(\) \{/gm)].map((m) => m[1]!);
+  assert.ok(functions.includes('copy_tree'), 'found the functions the script defines');
+  const offenders = script.split('\n').flatMap((line, i) => {
+    if (/^\s*#/.test(line) || !line.includes('9>&-')) return [];
+    const group = /(?:^|[\s;])\}\s*9>&-/.test(line);
+    const call = functions.some((name) => new RegExp(`(?:^|[\\s;&|!({])${name}(?:\\s[^;&|]*)?\\s9>&-`).test(line));
+    return group || call ? [`bin/ensure-coordinator-node:${i + 1}: ${line.trim()}`] : [];
+  });
+  assert.deepEqual(
+    offenders,
+    [],
+    'close fd 9 on the child itself or a ( subshell ): bash 3.2 keeps the provisioning lock open, on a saved copy of fd 9, for a { group } or a function call'
+  );
+});
+
+test('LOCK: the coordinator a start spawns does not hold the provisioning lock', async () => {
+  const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
+  const { data, ws, cleanup } = makeDirs();
+  try {
+    const r = runBootstrap(root, data, ws);
+    try {
+      assert.equal(r.status, 0, r.stderr);
+      assert.match(r.stderr, /spawned Node coordinator/);
+      // It runs for as long as the workspace is in use; holding the lock it
+      // inherited would stop every later provision.
+      await killAndWait(await holdPidFileLock(join(data, '.provision.lock')));
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('NO LOCK TOOL: two starts at once provision unlocked and still publish a whole build', async () => {
+  // A PATH with every system tool except perl, flock(1) and lockf(1).
+  const rig = provisionRig('0.0.1');
+  const tools = mkdtempSync(join(tmpdir(), 'provision-nolock-'));
+  try {
+    for (const dir of ['/bin', '/usr/bin']) {
+      for (const name of readdirSync(dir)) {
+        if (/^(perl|flock$|lockf$)/.test(name) || existsSync(join(tools, name))) continue;
+        symlinkSync(join(dir, name), join(tools, name));
+      }
+    }
+    symlinkSync(process.execPath, join(tools, 'node'));
+    const stubBin = rig.env().PATH!.split(':')[0]!;
+    const path = `${stubBin}:${tools}`;
+    writeFileSync(join(rig.signal, 'release'), '');
+    const first = provisionNow(rig, { PATH: path });
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(first.stderr, /nothing here can lock .*; provisioning unlocked/);
+
+    setDependentVersion(rig.root, '0.0.2');
+    const a = provisionLater(rig, { PATH: path, NPM_HOLD_S: '1' });
+    const b = provisionLater(rig, { PATH: path, NPM_HOLD_S: '1' });
+    const [doneA, doneB] = await Promise.all([a.exited, b.exited]);
+    assert.equal(doneA.status, 0, doneA.stderr);
+    assert.equal(doneB.status, 0, doneB.stderr);
+    assert.equal(runHookClient(rig).stdout, '{"ok":true,"v":"0.0.2"}');
+  } finally {
+    rmSync(tools, { recursive: true, force: true });
+    rig.cleanup();
+  }
+});
+
+test('LEGACY: a provision never writes the layout plugin versions 0.7.1 and earlier use', () => {
+  const rig = provisionRig('0.0.1');
+  try {
+    const legacy: Record<string, string> = {
+      'package.json': '{"name":"older"}\n',
+      'package-lock.json': '{}\n',
+      '.node-abi': '131\n',
+      'tsconfig.json': '{}\n',
+      'src/coordinator.ts': '// older\n',
+      'dist/hook_client.js': '// the client an older version built\n',
+      'node_modules/fake-dep/index.js': '// older\n',
+    };
+    const old = new Date('2026-01-01');
+    for (const [rel, body] of Object.entries(legacy)) {
+      mkdirSync(dirname(join(rig.data, rel)), { recursive: true });
+      writeFileSync(join(rig.data, rel), body);
+      utimesSync(join(rig.data, rel), old, old);
+    }
+    writeFileSync(join(rig.signal, 'release'), '');
+    assert.equal(provisionNow(rig).status, 0);
+    setDependentVersion(rig.root, '0.0.2');
+    assert.equal(provisionNow(rig).status, 0);
+
+    for (const [rel, body] of Object.entries(legacy)) {
+      assert.equal(readFileSync(join(rig.data, rel), 'utf8'), body, rel);
+      assert.equal(statSync(join(rig.data, rel)).mtimeMs, old.getTime(), `${rel} was rewritten`);
+    }
+    assert.deepEqual(readdirSync(join(rig.data, 'dist')), ['hook_client.js']);
+    assert.equal(runHookClient(rig).stdout, '{"ok":true,"v":"0.0.2"}');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('GC: a publish removes builds no reader can still be loading, and keeps the rest', () => {
+  const rig = provisionRig('0.0.1');
+  try {
+    writeFileSync(join(rig.signal, 'release'), '');
+    assert.equal(provisionNow(rig).status, 0);
+    const first = publishedBuild(rig.data);
+    const builds = join(rig.data, 'builds');
+    const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000);
+    const fake = (name: string, opts: { sealed: boolean; retiredMinutesAgo?: number; ageMinutes: number }) => {
+      mkdirSync(join(builds, name, 'node_modules'), { recursive: true });
+      mkdirSync(join(builds, name, 'dist'), { recursive: true });
+      writeFileSync(join(builds, name, 'dist', 'coordinator.js'), '');
+      if (opts.sealed) writeFileSync(join(builds, name, '.ok'), `${RUNNING_ABI} x\n`);
+      if (opts.retiredMinutesAgo !== undefined) {
+        writeFileSync(join(builds, name, '.retired'), '');
+        utimesSync(join(builds, name, '.retired'), ago(opts.retiredMinutesAgo), ago(opts.retiredMinutesAgo));
+      }
+      utimesSync(join(builds, name), ago(opts.ageMinutes), ago(opts.ageMinutes));
+    };
+    fake('retired-long-ago.aaaaaa', { sealed: true, retiredMinutesAgo: 120, ageMinutes: 180 });
+    fake('retired-in-grace.bbbbbb', { sealed: true, retiredMinutesAgo: 5, ageMinutes: 180 });
+    fake('unfinished-stale.cccccc', { sealed: false, ageMinutes: 120 });
+    fake('unfinished-fresh.dddddd', { sealed: false, ageMinutes: 1 });
+    // Finished builds nothing published or retired, as a start that lost a race
+    // to publish leaves them: one sealed long ago, one sealed just now.
+    fake('stray-old.eeeeee', { sealed: true, ageMinutes: 180 });
+    utimesSync(join(builds, 'stray-old.eeeeee', '.ok'), ago(180), ago(180));
+    fake('stray-fresh.ffffff', { sealed: true, ageMinutes: 1 });
+    const freshOk = join(builds, 'stray-fresh.ffffff', '.ok');
+
+    setDependentVersion(rig.root, '0.0.2');
+    assert.equal(provisionNow(rig).status, 0);
+    const second = publishedBuild(rig.data);
+    assert.deepEqual(
+      buildNames(rig.data),
+      [first, second, 'retired-in-grace.bbbbbb', 'stray-fresh.ffffff', 'unfinished-fresh.dddddd'].sort()
+    );
+    // A stray's grace runs from when it was sealed, so it never passes for the
+    // build retired last: the old one is gone, the fresh one kept.
+    const freshRetired = join(builds, 'stray-fresh.ffffff', '.retired');
+    assert.equal(statSync(freshRetired).mtimeMs, statSync(freshOk).mtimeMs);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('SHIMS: hook-client and the CLI shims run the build `current` names, then PLUGIN_DATA/dist', () => {
+  const root = mkdtempSync(join(tmpdir(), 'provision-root-'));
+  const { data, ws, cleanup } = makeDirs();
+  try {
+    mkdirSync(join(root, 'bin'), { recursive: true });
+    for (const shim of ['hook-client', 'agent-coherence-status']) {
+      cpSync(join(PLUGIN_ROOT, 'bin', shim), join(root, 'bin', shim));
+      chmodSync(join(root, 'bin', shim), 0o755);
+    }
+    const put = (dir: string, marker: string) => {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'hook_client.js'), `process.stdout.write(${JSON.stringify(marker)});\n`);
+      writeFileSync(join(dir, 'cli_status.js'), `process.stdout.write(${JSON.stringify(marker)});\n`);
+    };
+    put(join(data, 'dist'), 'legacy');
+    put(join(data, 'builds', 'k1.aaaaaa', 'dist'), 'published');
+    const run = (shim: string) =>
+      spawnSync('bash', [join(root, 'bin', shim), 'pre-read'], {
+        cwd: ws,
+        encoding: 'utf8',
+        input: '{}',
+        timeout: 30000,
+        env: { ...process.env, CLAUDE_PLUGIN_ROOT: root, CLAUDE_PLUGIN_DATA: data } as NodeJS.ProcessEnv,
+      }).stdout;
+
+    // No build published yet: the copy an older version provisioned.
+    assert.equal(run('hook-client'), 'legacy');
+    assert.equal(run('agent-coherence-status'), 'legacy');
+    writeFileSync(join(data, 'current'), 'k1.aaaaaa\n');
+    assert.equal(run('hook-client'), 'published');
+    assert.equal(run('agent-coherence-status'), 'published');
+    // A line that is not a plain name inside builds/ is ignored.
+    for (const line of ['../dist', '.hidden', '']) {
+      writeFileSync(join(data, 'current'), `${line}\n`);
+      assert.equal(run('hook-client'), 'legacy', `line ${JSON.stringify(line)}`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+// ------------------------------------------------------- #295: the seal and its checks
+
+/** Provision with a coordinator start, then stop the coordinator it spawned. */
+function provisionAndStop(rig: ProvisionRig) {
+  const r = provisionNow(rig, { AGENT_COHERENCE_PROVISION_ONLY: '' });
+  killSpawned(r.stderr ?? '');
+  return r;
+}
+
+test('SELF-HEAL: a NODE_MODULE_VERSION crash of a build whose install does not load unseals it, so the next session reprovisions', () => {
+  const rig = provisionRig('0.0.1');
+  try {
+    writeFileSync(join(rig.signal, 'release'), '');
+    assert.equal(provisionAndStop(rig).status, 0);
+    // The published build's install no longer loads here, and its coordinator
+    // dies the way an ABI-stale addon makes it die.
+    rmSync(join(publishedDir(rig.data), 'node_modules', 'fake-dep'), { recursive: true });
+    writeFileSync(join(publishedDir(rig.data), 'dist', 'coordinator.js'), ABI_CRASH_COORDINATOR_TS);
+
+    const r = provisionAndStop(rig);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /exited before it started serving/);
+    // The seal vouched for a tree that cannot load. Removing it is what turns
+    // "dead until the user figures it out" into one bad session: the next run
+    // finds no finished build for its key and makes one.
+    assert.match(r.stderr, /next session reprovisions/);
+    assert.equal(existsSync(join(publishedDir(rig.data), '.ok')), false);
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('SELF-HEAL: a stale NODE_MODULE_VERSION line in the shared log does not unseal a build that loads', () => {
+  const rig = provisionRig('0.0.1');
+  try {
+    writeFileSync(join(rig.signal, 'release'), '');
+    assert.equal(provisionAndStop(rig).status, 0);
+    // coordinator.log is every workspace's: a line from another coordinator,
+    // or an older crash, then an unrelated crash of this one.
+    writeFileSync(join(rig.data, 'coordinator.log'), 'Error: ... NODE_MODULE_VERSION 131 ...\n', { flag: 'a' });
+    writeFileSync(join(publishedDir(rig.data), 'dist', 'coordinator.js'), CRASHING_COORDINATOR_TS);
+
+    const r = provisionAndStop(rig);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /exited before it started serving/);
+    assert.doesNotMatch(r.stderr, /next session reprovisions/);
+    assert.ok(existsSync(join(publishedDir(rig.data), '.ok')), 'a build whose install loads keeps its seal');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('SEAL: an install missing a declared package is never sealed, though the package sits in the legacy tree', () => {
+  const rig = provisionRig('0.0.1');
+  try {
+    // The copy an older version installed: Node would resolve fake-dep from it.
+    mkdirSync(join(rig.data, 'node_modules', 'fake-dep'), { recursive: true });
+    writeFileSync(join(rig.data, 'node_modules', 'fake-dep', 'package.json'), '{"name":"fake-dep","main":"index.js"}\n');
+    writeFileSync(join(rig.signal, 'release'), '');
+    const r = provisionNow(rig, { NPM_SKIP_UNPACK: '1' });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /npm install reported success but node_modules lacks a package package\.json declares/);
+    assert.equal(existsSync(join(rig.data, 'current')), false, 'nothing published');
+    assert.deepEqual(buildNames(rig.data), [], 'the unsealed build is removed');
+  } finally {
+    rig.cleanup();
+  }
+});
+
+test('SEAL: a build whose install no longer loads is not installed over: the next build installs clean', () => {
+  const rig = provisionRig('0.0.1');
+  try {
+    writeFileSync(join(rig.signal, 'release'), '');
+    assert.equal(provisionNow(rig).status, 0);
+    const broken = publishedBuild(rig.data);
+    rmSync(join(publishedDir(rig.data), 'node_modules', 'fake-dep'), { recursive: true });
+    writeFileSync(join(publishedDir(rig.data), 'node_modules', 'STALE-SENTINEL'), '');
+    // New sources, the same package.json: the broken install would be this
+    // build's starting point.
+    writeFileSync(join(rig.root, 'src', 'hook_client.ts'), `${dependentClientTs('0.0.1')}// revised\n`);
+
+    const r = provisionNow(rig);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stderr, /provisioned native addon does not load under Node .*; reinstalling/);
+    assert.notEqual(publishedBuild(rig.data), broken);
+    assert.ok(existsSync(join(publishedDir(rig.data), 'node_modules', 'fake-dep', 'package.json')));
+    assert.equal(existsSync(join(publishedDir(rig.data), 'node_modules', 'STALE-SENTINEL')), false);
+    assert.equal(runHookClient(rig).stdout, '{"ok":true,"v":"0.0.1"}');
+  } finally {
+    rig.cleanup();
   }
 });
