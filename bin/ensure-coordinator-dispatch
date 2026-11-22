@@ -134,6 +134,26 @@ refuse_coherence_dir() {   # 0 = refused (JSON printed), 1 = go on
 }
 # <<< coherence-dir-check
 
+# bin/hook-client runs the Node hook client under CLAUDE_PLUGIN_DATA whenever
+# the plugin root ships no dist/ of its own (a marketplace install), and only
+# the Node bootstrap provisions that copy. Without this, a workspace on the
+# Python backend would keep running whichever copy a Node-backend session last
+# built, through every later plugin upgrade (#289). So a Python-backend start
+# refreshes that copy too, with the Node bootstrap's own Stages 0-2 and no
+# coordinator. Only a copy the shim would run is refreshed: with none
+# installed, the hooks run the Python client and this start leaves them so.
+# Never on stdout (the hook's output is the Python bootstrap's), never on
+# stdin, and a failure only says so: the hooks keep the copy they had.
+refresh_installed_hook_client() {
+  local plugin_root="${CLAUDE_PLUGIN_ROOT:-$(dirname "$self_dir")}"
+  [ -n "${CLAUDE_PLUGIN_DATA:-}" ] && [ -f "${CLAUDE_PLUGIN_DATA}/dist/hook_client.js" ] || return 0
+  [ -f "${plugin_root}/dist/hook_client.js" ] && return 0
+  { command -v node && command -v npm; } >/dev/null 2>&1 && node_abi_supported || return 0
+  if ! AGENT_COHERENCE_PROVISION_ONLY=1 "$self_dir/ensure-coordinator-node" </dev/null >&2; then
+    echo "agent-coherence: could not refresh the Node hook client in ${CLAUDE_PLUGIN_DATA}; hooks keep running the copy installed before" >&2
+  fi
+}
+
 backend="${COHERENCE_COORDINATOR_BACKEND:-}"
 # Resolved whatever selects the backend, so the check below runs with an
 # explicit backend too: this is the .coherence the Python coordinator and the
@@ -194,7 +214,12 @@ case "$backend" in
     exec "$self_dir/ensure-coordinator-node"
     ;;
   *)
-    # python (explicit or default) — the existing bootstrap.
-    exec "$self_dir/ensure-coordinator"
+    # python (explicit or default) — the existing bootstrap, then a refresh of
+    # the Node hook client an earlier session installed. The Python start goes
+    # first, so a refresh that outruns the hook's time box cannot cost it.
+    "$self_dir/ensure-coordinator"
+    status=$?
+    refresh_installed_hook_client
+    exit "$status"
     ;;
 esac

@@ -1505,3 +1505,35 @@ test('a build that emits no coordinator.js offers the Python backend only when t
     }
   }
 });
+
+test('PROVISION ONLY: refreshes the client in PLUGIN_DATA and starts no coordinator (#289)', () => {
+  // What a Python-backend session start runs, so that its hooks stop running
+  // the Node client an earlier plugin installed.
+  const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
+  const { data, ws, cleanup } = makeDirs();
+  try {
+    const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
+      cwd: ws,
+      encoding: 'utf8',
+      timeout: 120000,
+      env: {
+        ...process.env,
+        CLAUDE_PLUGIN_ROOT: root,
+        CLAUDE_PLUGIN_DATA: data,
+        AGENT_COHERENCE_PROVISION_ONLY: '1',
+      } as NodeJS.ProcessEnv,
+    });
+    try {
+      assert.equal(r.status, 0, `provision-only failed:\n${r.stdout}\n${r.stderr}`);
+      assert.ok(existsSync(join(data, 'dist', 'coordinator.js')), 'built entry must exist in PLUGIN_DATA');
+      assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
+      assert.equal(existsSync(join(ws, '.coherence', 'server.pid')), false, 'no coordinator started');
+      assert.equal(existsSync(join(ws, '.coherence', 'coordinator_backend')), false, 'no backend stamp');
+    } finally {
+      killSpawned(r.stderr ?? '');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});

@@ -27,7 +27,9 @@
 #
 # Selected by bin/ensure-coordinator-dispatch at SessionStart when the
 # backend resolves to `node` (env > .coherence/coordinator_backend file >
-# guarded default; see that script's header).
+# guarded default; see that script's header). On the Python backend the
+# dispatcher runs it with AGENT_COHERENCE_PROVISION_ONLY=1, which stops after
+# Stage 2 (see below).
 
 set -uo pipefail
 
@@ -491,6 +493,13 @@ if [ ! -f "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" ]; then
   echo "agent-coherence: ${CLAUDE_PLUGIN_DATA}/dist/coordinator.js missing after provisioning; coordinator will not start this session. Next session retries." >&2
   python_backend_hint >&2
   exit 1
+fi
+
+# Provision only: a Python-backend session start runs Stages 0-2 so its hooks
+# stop running the Node hook client an earlier plugin version installed here
+# (#289). It starts no coordinator and stamps no backend.
+if [ "${AGENT_COHERENCE_PROVISION_ONLY:-}" = "1" ]; then
+  exit 0
 fi
 
 # Whether a coordinator holds its lock on server.pid: held, free, or unknown
