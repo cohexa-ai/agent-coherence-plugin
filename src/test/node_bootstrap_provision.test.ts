@@ -27,6 +27,7 @@ import {
   renameSync,
   lstatSync,
   readlinkSync,
+  utimesSync,
 } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -1506,26 +1507,47 @@ test('a build that emits no coordinator.js offers the Python backend only when t
   }
 });
 
+/** The client a Python-backend start refreshes; any compilable body will do. */
+const HOOK_CLIENT_TS = 'export const BUILT_BY_THIS_PACKAGE = true;\n';
+const STALE_CLIENT_JS = '// a hook client an earlier plugin version built\n';
+
+/** A package with a hook-client source, and PLUGIN_DATA holding a stale, older build of it. */
+function stalePluginData(coordinatorTs: string): { root: string; data: string; ws: string; cleanup: () => void } {
+  const root = makeStubRoot({ srcCoordinatorTs: coordinatorTs, withTsc: true });
+  writeFileSync(join(root, 'src', 'hook_client.ts'), HOOK_CLIENT_TS);
+  const dirs = makeDirs();
+  mkdirSync(join(dirs.data, 'dist'), { recursive: true });
+  for (const name of ['coordinator.js', 'hook_client.js']) {
+    writeFileSync(join(dirs.data, 'dist', name), STALE_CLIENT_JS);
+    // Older than the package's sources, as a plugin upgrade leaves it.
+    utimesSync(join(dirs.data, 'dist', name), new Date('2026-01-01'), new Date('2026-01-01'));
+  }
+  return { root, ...dirs, cleanup: () => { rmSync(root, { recursive: true, force: true }); dirs.cleanup(); } };
+}
+
+function provisionOnly(root: string, data: string, ws: string) {
+  return spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
+    cwd: ws,
+    encoding: 'utf8',
+    timeout: 120000,
+    env: {
+      ...process.env,
+      CLAUDE_PLUGIN_ROOT: root,
+      CLAUDE_PLUGIN_DATA: data,
+      AGENT_COHERENCE_PROVISION_ONLY: '1',
+    } as NodeJS.ProcessEnv,
+  });
+}
+
 test('PROVISION ONLY: refreshes the client in PLUGIN_DATA and starts no coordinator (#289)', () => {
   // What a Python-backend session start runs, so that its hooks stop running
   // the Node client an earlier plugin installed.
-  const root = makeStubRoot({ srcCoordinatorTs: HEALTHY_COORDINATOR_TS, withTsc: true });
-  const { data, ws, cleanup } = makeDirs();
+  const { root, data, ws, cleanup } = stalePluginData(HEALTHY_COORDINATOR_TS);
   try {
-    const r = spawnSync('bash', [join(root, 'bin', 'ensure-coordinator-node')], {
-      cwd: ws,
-      encoding: 'utf8',
-      timeout: 120000,
-      env: {
-        ...process.env,
-        CLAUDE_PLUGIN_ROOT: root,
-        CLAUDE_PLUGIN_DATA: data,
-        AGENT_COHERENCE_PROVISION_ONLY: '1',
-      } as NodeJS.ProcessEnv,
-    });
+    const r = provisionOnly(root, data, ws);
     try {
       assert.equal(r.status, 0, `provision-only failed:\n${r.stdout}\n${r.stderr}`);
-      assert.ok(existsSync(join(data, 'dist', 'coordinator.js')), 'built entry must exist in PLUGIN_DATA');
+      assert.match(readFileSync(join(data, 'dist', 'hook_client.js'), 'utf8'), /BUILT_BY_THIS_PACKAGE/);
       assert.doesNotMatch(r.stderr, /spawned Node coordinator/);
       assert.equal(existsSync(join(ws, '.coherence', 'server.pid')), false, 'no coordinator started');
       assert.equal(existsSync(join(ws, '.coherence', 'coordinator_backend')), false, 'no backend stamp');
@@ -1533,7 +1555,22 @@ test('PROVISION ONLY: refreshes the client in PLUGIN_DATA and starts no coordina
       killSpawned(r.stderr ?? '');
     }
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    cleanup();
+  }
+});
+
+test('STAGE 2: a build that fails leaves the last working build in PLUGIN_DATA (#289)', () => {
+  // Every workspace's hooks run this one copy, so a failed rebuild must not
+  // leave them with none.
+  const { root, data, ws, cleanup } = stalePluginData('const broken: number = "not a number";\n');
+  try {
+    const r = provisionOnly(root, data, ws);
+    assert.equal(r.status, 1, `expected the build to fail:\n${r.stdout}\n${r.stderr}`);
+    assert.match(r.stderr, /tsc build failed; the previous build stays in place/);
+    assert.equal(readFileSync(join(data, 'dist', 'hook_client.js'), 'utf8'), STALE_CLIENT_JS);
+    assert.equal(existsSync(join(data, 'dist.next')), false, 'no staged build left behind');
+    assert.equal(existsSync(join(data, 'dist.old')), false);
+  } finally {
     cleanup();
   }
 });
