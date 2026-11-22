@@ -10,9 +10,10 @@
  *
  * Layout invariant: package.json sits one directory above this compiled
  * module (dist/version.js → repo root). That holds in the repo checkout and
- * in installed plugins, where bin/ensure-coordinator-node stages package.json
- * (Stage 1) and dist/ (Stage 2) as siblings under ${CLAUDE_PLUGIN_DATA} —
- * and Stage 4 only spawns the coordinator after Stage 1 guaranteed the copy.
+ * in installed plugins, where bin/ensure-coordinator-node puts package.json
+ * (Stage 1) and dist/ (Stage 2) as siblings in each build under
+ * ${CLAUDE_PLUGIN_DATA}/builds/ — and Stage 4 only spawns the coordinator from
+ * a build it verified whole.
  * version_source.test.ts pins the resolution.
  */
 import { readFileSync } from "node:fs";

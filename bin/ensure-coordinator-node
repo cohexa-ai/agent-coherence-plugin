@@ -6,19 +6,20 @@
 # install deps lazily into PLUGIN_DATA on first use; persist across plugin
 # updates; retry on next session if install fails.
 #
-# Why this script copies BOTH package.json AND dist/ to PLUGIN_DATA (vs the
-# documented snippet which only copies package.json + relies on NODE_PATH):
-# the coordinator uses ESM (`"type": "module"` in package.json), and Node's
-# ESM resolver does NOT honor NODE_PATH — it walks the import tree from the
-# importing file's directory. Putting dist/ under PLUGIN_DATA puts
-# coordinator.js in the same tree as node_modules, so `import "better-sqlite3"`
-# resolves cleanly.
+# Why this script puts package.json, node_modules AND dist/ together in one
+# build under PLUGIN_DATA (vs the documented snippet which only copies
+# package.json + relies on NODE_PATH): the coordinator uses ESM (`"type":
+# "module"` in package.json), and Node's ESM resolver does NOT honor NODE_PATH
+# — it walks the import tree from the importing file's directory. Putting
+# dist/ beside node_modules puts coordinator.js in the same tree, so `import
+# "better-sqlite3"` resolves cleanly. Each build is its own directory,
+# published once whole (#295; see "Published builds" below).
 #
 # Where dist/ comes from: a marketplace install is a git clone, and dist/ is
 # gitignored — so NO released package contains compiled output (the release
 # workflow's dist.tar.gz is a GitHub-Release asset the marketplace flow never
 # consumes). When ${CLAUDE_PLUGIN_ROOT}/dist is absent, Stage 2 therefore
-# BUILDS src/ → PLUGIN_DATA/dist at provision time, with the tsc that Stage
+# BUILDS src/ into the build's dist/ at provision time, with the tsc that Stage
 # 1's dev-inclusive `npm install` (or the installer's own npm install in the
 # plugin cache) provides. Before this landed, Stage 4 spawned a nonexistent
 # entry point and reported success while the coordinator crash-looped
@@ -161,10 +162,215 @@ esac
 # better_sqlite3.node is actually bound to — 131 for Node 23, 137 for Node
 # 24 — and a binary built for one is a hard load error under the other. It
 # is the provisioning key package.json cannot express; see Stage 1.
-NODE_ABI="$(node -p 'process.versions.modules' 2>/dev/null || echo unknown)"
-ABI_STAMP="${CLAUDE_PLUGIN_DATA}/.node-abi"
+#
+# The same node call fingerprints the package (#295): a SHA-256 over
+# package.json, package-lock.json and what a build is made from, src/ and
+# tsconfig.json, or a dev checkout's own dist/. BUILD_KEY, which adds the
+# ABI, platform and arch a native addon is bound to, names the build this
+# start needs; DEPS_DIGEST, over the two manifests alone, says whether npm
+# has anything to do.
+build_from=src
+if [ -f "${CLAUDE_PLUGIN_ROOT}/dist/coordinator.js" ]; then
+  build_from=dist
+fi
+FINGERPRINT_JS='
+const { createHash } = require("node:crypto");
+const { readFileSync, readdirSync } = require("node:fs");
+const [root, from] = process.argv.slice(1);
+const digest = (paths) => {
+  const hash = createHash("sha256").update("agent-coherence build 1\0" + from + "\0");
+  const add = (rel) => {
+    let bytes;
+    try { bytes = readFileSync(root + "/" + rel); } catch { bytes = Buffer.from("\0missing"); }
+    hash.update(rel + "\0" + bytes.length + "\0").update(bytes);
+  };
+  const walk = (rel) => {
+    let entries;
+    try { entries = readdirSync(root + "/" + rel, { withFileTypes: true }); } catch { add(rel); return; }
+    entries
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+      .forEach((entry) => (entry.isDirectory() ? walk(rel + "/" + entry.name) : add(rel + "/" + entry.name)));
+  };
+  paths.forEach(walk);
+  return hash.digest("hex").slice(0, 16);
+};
+const manifests = ["package.json", "package-lock.json"];
+const sources = from === "dist" ? ["dist"] : ["tsconfig.json", "src"];
+const abi = process.versions.modules;
+console.log(abi, abi + "-" + process.platform + "-" + process.arch, digest([...manifests, ...sources]), digest(manifests));
+'
+read -r NODE_ABI ABI_TAG SRC_DIGEST DEPS_DIGEST <<<"$(node -e "$FINGERPRINT_JS" "$CLAUDE_PLUGIN_ROOT" "$build_from" 2>/dev/null)"
+NODE_ABI="${NODE_ABI:-unknown}"
+if [ -z "${DEPS_DIGEST:-}" ]; then
+  echo "agent-coherence: could not fingerprint ${CLAUDE_PLUGIN_ROOT}; coordinator will not start this session. Next session retries." >&2
+  exit 1
+fi
+BUILD_KEY="${ABI_TAG}-${SRC_DIGEST}"
 
-# Does the provisioned native addon actually load under THIS node?
+# Published builds (#295). Every workspace's hooks, CLI shims and Node
+# coordinators load from this one CLAUDE_PLUGIN_DATA, and Claude Code runs a
+# session's SessionStart hooks at once, so a provision always races readers
+# starting up, and other session starts, on any workspace and either backend.
+# Writing the tree they load in place tore it under them: a reinstall after a
+# Node-major change deleted node_modules for its whole run, an upgrade's npm
+# install unpacked each changed package straight into the live path, and two
+# starts at once built into one dist.next and could nest one build inside
+# the other or delete it.
+#
+# So nothing a reader loads is ever written in place. Each provision builds
+# into a directory of its own, builds/<BUILD_KEY>.<random>, sealed by .ok,
+# written last, and never written again; it is published by replacing the
+# one-line file `current` with rename(2), which no reader sees half done.
+# The shims read that line and run the build it names, and Stage 4 spawns
+# the build this start verified. A lock on .provision.lock serializes the
+# provisioners, but no build depends on it: a host that cannot lock only
+# builds twice.
+#
+# The layout older plugin versions use, DATA/{dist,node_modules,package.json,
+# package-lock.json,src,tsconfig.json,.node-abi}, is theirs alone. This script
+# never writes it, so their provisioning cannot reach a build this one
+# published, and sessions of those versions keep running the build their own
+# version made.
+BUILDS="${CLAUDE_PLUGIN_DATA}/builds"
+POINTER="${CLAUDE_PLUGIN_DATA}/current"
+# Never unlinked: the lock lives on its inode.
+PROVISION_LOCK="${CLAUDE_PLUGIN_DATA}/.provision.lock"
+PROVISION_WAIT_S="${AGENT_COHERENCE_PROVISION_WAIT_S:-120}"
+case "$PROVISION_WAIT_S" in '' | *[!0-9]*) PROVISION_WAIT_S=120 ;; esac
+# Decimal, also when zero-padded: $(( )) reads 08 as a malformed octal number.
+PROVISION_WAIT_S=$((10#$PROVISION_WAIT_S))
+# Longer than Claude Code's 600 s hook time box, so no hook is still loading a
+# build when it is removed.
+BUILD_GRACE_MIN=15
+# An unfinished build this old is no start's work in progress: a start that
+# could not lock may still be writing a younger one.
+UNFINISHED_BUILD_MIN=60
+STALE_POINTER_TMP_MIN=5
+
+# One LOCK_EX|LOCK_NB attempt on the open file behind fd 9, by a helper that
+# inherits fd 9 and exits. A flock belongs to the open file, not to the
+# process that asked for it, so the lock stays with this shell's fd 9 until it
+# is closed, and goes when this shell dies, however it dies (the helpers in
+# src/coordinator_lock.ts lock server.pid the same way). Every child that can
+# outlive a moment runs with 9>&-, so none keeps the lock once this shell is
+# gone: on the child itself or a ( subshell ), never on a { group } or a
+# function call, which bash 3.2 runs with the lock still open on a saved copy
+# of fd 9. Returns 0 taken, 1 held by another start, 3 cannot lock here.
+provision_lock_try() {
+  local status
+  # perl first: it alone tells a held lock (1) from a file system that cannot
+  # lock (3).
+  if command -v perl >/dev/null 2>&1; then
+    perl -MFcntl=:flock -e 'open(my $fh, "+<&=", 9) or exit 2; exit 0 if flock($fh, LOCK_EX | LOCK_NB); exit($!{EWOULDBLOCK} ? 1 : 3)' 2>/dev/null
+    status=$?
+    case "$status" in 0 | 1 | 3) return "$status" ;; esac
+  fi
+  if command -v flock >/dev/null 2>&1; then
+    flock -x -n 9 2>/dev/null
+    status=$?
+    # BusyBox flock(1) exits 1 for a held lock and for one the file system
+    # cannot take alike: a lock on a file of this start's own tells them apart.
+    if [ "$status" = 1 ] && ! provision_fs_can_lock; then
+      return 3
+    fi
+    case "$status" in 0 | 1) return "$status" ;; esac
+  fi
+  case "${OSTYPE:-}" in
+    darwin*)
+      lockf -s -t 0 9 2>/dev/null
+      status=$?
+      case "$status" in 0) return 0 ;; 75) return 1 ;; esac
+      ;;
+  esac
+  return 3
+}
+provision_fs_can_lock() {
+  local probe="${CLAUDE_PLUGIN_DATA}/.provision.lock.probe.$$" status
+  : >"$probe" 2>/dev/null || return 1
+  flock -x -n "$probe" true 2>/dev/null
+  status=$?
+  rm -f "$probe"
+  [ "$status" = 0 ]
+}
+# Take the lock, waiting at most PROVISION_WAIT_S. While it waits it reads
+# `current`, and stops waiting once that names a finished build for this key:
+# the start holding the lock built what this one needs. Returns 0 locked,
+# 1 gave up, 2 the build this start needs is published, 3 nothing here can
+# lock (provision unlocked: at worst a build is made twice).
+acquire_provision_lock() {
+  local deadline=$((SECONDS + PROVISION_WAIT_S)) said=0 status
+  { exec 9<>"$PROVISION_LOCK"; } 2>/dev/null || return 3
+  while :; do
+    provision_lock_try
+    status=$?
+    [ "$status" = 0 ] && return 0
+    if [ "$status" != 1 ]; then
+      exec 9>&-
+      return 3
+    fi
+    read_pointer
+    if published_is_wanted; then
+      exec 9>&-
+      return 2
+    fi
+    if [ "$said" = 0 ]; then
+      echo "agent-coherence: another session start is provisioning ${CLAUDE_PLUGIN_DATA}; waiting up to ${PROVISION_WAIT_S}s" >&2
+      said=1
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      exec 9>&-
+      return 1
+    fi
+    sleep 0.25 9>&- 2>/dev/null || sleep 1 9>&-
+  done
+}
+# LOCK_UN as well as the close, so a straggler that inherited fd 9 cannot
+# keep the lock.
+release_provision_lock() {
+  perl -MFcntl=:flock -e 'open(my $fh, "+<&=", 9) and flock($fh, LOCK_UN)' 2>/dev/null || flock -u 9 2>/dev/null || true
+  exec 9>&-
+}
+
+# The build `current` names, in $published: empty when there is none, or when
+# the line is not a plain name inside builds/.
+read_pointer() {
+  published=""
+  if [ -f "$POINTER" ]; then
+    IFS= read -r published <"$POINTER" || true
+  fi
+  case "$published" in "" | */* | .*) published="" ;; esac
+}
+# Finished: .ok, written last, is there, and so is what it vouched for.
+build_complete() {
+  [ -n "$1" ] && [ -f "$BUILDS/$1/.ok" ] && [ -d "$BUILDS/$1/node_modules" ] && [ -f "$BUILDS/$1/dist/coordinator.js" ]
+}
+published_is_wanted() {
+  case "$published" in "$BUILD_KEY".*) build_complete "$published" ;; *) return 1 ;; esac
+}
+# Prints the name of a finished build matching glob $1, the published one first.
+find_build() {
+  local dir
+  case "$published" in $1) build_complete "$published" && { printf '%s' "$published"; return 0; } ;; esac
+  for dir in "$BUILDS"/$1; do
+    build_complete "${dir##*/}" && { printf '%s' "${dir##*/}"; return 0; }
+  done
+  return 1
+}
+# Copy directory $1 to the new path $2: a clone where the file system can make
+# one (APFS through cp -c, GNU cp --reflink), else a plain copy.
+copy_tree() {
+  cp -cpR "$1" "$2" 9>&- 2>/dev/null ||
+    { rm -rf "$2" 9>&-; cp -pR --reflink=auto "$1" "$2" 9>&- 2>/dev/null; } ||
+    { rm -rf "$2" 9>&-; cp -pR "$1" "$2" 9>&-; }
+}
+
+# Is the install in directory $1 whole, and does its native addon load under
+# THIS node? Exits 0 yes, 4 a package package.json declares is missing, other
+# non-zero the addon does not load.
+#
+# Every declared package must be in $1's own node_modules: Node resolves a
+# missing one from an ancestor directory, and DATA/node_modules above a build
+# is an older version's install.
 #
 # Deliberately CONSTRUCTS a Database: better-sqlite3 resolves its addon
 # through `bindings` at first use, not at require time, so a bare
@@ -172,107 +378,33 @@ ABI_STAMP="${CLAUDE_PLUGIN_DATA}/.node-abi"
 # ABI-stale — a probe keyed on require alone passes in exactly the broken
 # states it exists to catch.
 #
-# Keyed on what the provisioned package.json DECLARES, not on what resolves:
-# a package that never depended on better-sqlite3 (the provisioning tests'
-# zero-dependency stub) is healthy by definition, while one that declares it
-# and cannot resolve it is broken — an unresolvable-means-fine probe would
-# call a wiped node_modules healthy.
+# Keyed on what the package.json DECLARES, not on what resolves: a package
+# that never depended on better-sqlite3 (the provisioning tests' stub) needs
+# no addon.
 native_module_loads() {
   (
-    cd "${CLAUDE_PLUGIN_DATA}" 2>/dev/null || exit 1
+    cd "$1" 2>/dev/null || exit 1
     node -e '
+      const { existsSync } = require("node:fs");
       const deps = require("./package.json").dependencies || {};
+      for (const name of Object.keys(deps)) {
+        if (!existsSync("node_modules/" + name + "/package.json")) process.exit(4);
+      }
       if (!deps["better-sqlite3"]) process.exit(0);
       new (require("better-sqlite3"))(":memory:").close();
     '
-  ) >/dev/null 2>&1
+  ) 9>&- >/dev/null 2>&1
 }
 
-# Stage 1: lazy `npm install`, keyed on BOTH signals that can invalidate the
-# provisioned tree:
-#
-#   (a) package.json differs — initial install or package update. The
-#       documented pattern, with the fail-then-rm-marker recovery for
-#       next-session retry. `deps_changed` keys Stage 2's rebuild the same
-#       way the diff keys the install.
-#   (b) the Node ABI differs from the one the tree was provisioned under. A
-#       compiled better_sqlite3.node is bound to process.versions.modules,
-#       which package.json cannot express — so (a) alone is blind to a user
-#       installing a new Node major, and the coordinator crash-loops
-#       "compiled against a different Node.js version using
-#       NODE_MODULE_VERSION 131 ... requires NODE_MODULE_VERSION 137"
-#       forever, with no session ever repairing it. Worse, (a) firing does
-#       NOT repair it either: npm sees better-sqlite3 already present at a
-#       satisfying version and leaves the stale binary untouched, so the
-#       0.3.1 -> 0.4.0 package bump ran a full install and still shipped an
-#       ABI-131 binary to a Node 24 user.
-#
-# On (b) the node_modules tree is TORN DOWN rather than installed over: a
-# clean install is what makes prebuild-install refetch the prebuilt for this
-# ABI. `npm rebuild` is deliberately not used — it compiles from source via
-# node-gyp, which needs Python and a C++ toolchain, the exact dependencies
-# decision B's zero-Python guarantee forbids.
-deps_changed=0
-if ! diff -q "${CLAUDE_PLUGIN_ROOT}/package.json" "${CLAUDE_PLUGIN_DATA}/package.json" >/dev/null 2>&1; then
-  deps_changed=1
-fi
-
-# Native gate: is the provisioned tree valid for THIS node?
-#
-# A stamp from a previous successful provision is the cheap answer, and it
-# is read only OVER a populated node_modules — a stamp left behind by a
-# hand-deleted tree vouches for nothing, and taking its word would wave a
-# MODULE_NOT_FOUND crash loop straight through. Anything else (a tree from
-# before this gate existed, one the liveness gate below invalidated, one
-# whose node_modules is gone) is settled by probing rather than reinstalling
-# blindly: a healthy legacy tree then costs only a stamp backfill — no
-# network, no reinstall — while a genuinely stale one is rebuilt.
-native_stale=0
-stamped_abi=""
-if [ -d "${CLAUDE_PLUGIN_DATA}/node_modules" ]; then
-  stamped_abi="$(cat "$ABI_STAMP" 2>/dev/null || true)"
-fi
-if [ -n "$stamped_abi" ]; then
-  if [ "$stamped_abi" != "$NODE_ABI" ]; then
-    native_stale=1
-    echo "agent-coherence: Node ABI changed (${stamped_abi} -> ${NODE_ABI}); reinstalling native deps" >&2
-  fi
-elif [ "$deps_changed" = "0" ]; then
-  # No usable stamp and no install already queued — probe. (An install about
-  # to run makes the answer moot, so the common first-provision path pays
-  # nothing for this.)
-  if native_module_loads; then
-    printf '%s\n' "$NODE_ABI" >"$ABI_STAMP"
-  else
-    native_stale=1
-    echo "agent-coherence: provisioned native addon does not load under Node ${NODE_VERSION_RAW} (ABI ${NODE_ABI}); reinstalling" >&2
-  fi
-fi
-
-if [ "$deps_changed" = "1" ] || [ "$native_stale" = "1" ]; then
-  echo "agent-coherence: installing Node deps into ${CLAUDE_PLUGIN_DATA}" >&2
-  cp "${CLAUDE_PLUGIN_ROOT}/package.json" "${CLAUDE_PLUGIN_DATA}/" || exit 1
-  if [ -f "${CLAUDE_PLUGIN_ROOT}/package-lock.json" ]; then
-    cp "${CLAUDE_PLUGIN_ROOT}/package-lock.json" "${CLAUDE_PLUGIN_DATA}/" || true
-  fi
-  # Clear the stamp BEFORE the install, not just rewrite it after: if the
-  # install dies partway, the next session must see "unstamped" and probe —
-  # never a stamp vouching for a tree that was torn down.
-  rm -f "$ABI_STAMP"
-  if [ "$native_stale" = "1" ]; then
-    rm -rf "${CLAUDE_PLUGIN_DATA}/node_modules"
-  fi
+install_deps() {
+  local dir="$1"
+  echo "agent-coherence: installing Node deps into ${dir}" >&2
   # --engine-strict turns the engines.node range into a hard install-time
   # gate (npm only warns by default), so the Stage-0 list above can never
   # silently drift past package.json.
   # Capture as well as show, so the failure below can be CLASSIFIED rather
   # than guessed at. PIPESTATUS[0] is npm's status; $? would be tee's.
   npm_log="$(mktemp "${TMPDIR:-/tmp}/agent-coherence-npm.XXXXXX" 2>/dev/null || echo "")"
-  # The in-line `rm`s below cover the ordinary exits; this covers the ones
-  # that skip them. A cold `npm install` regularly outruns the SessionStart
-  # hook's time box, and without the trap every timed-out provision leaves a
-  # full npm log behind in TMPDIR.
-  trap 'rm -f "$npm_log"' EXIT
   if [ -n "$npm_log" ]; then
     # --loglevel=http is what makes the failure below CLASSIFIABLE: npm passes
     # it down as npm_config_loglevel, and prebuild-install gates its own
@@ -302,17 +434,16 @@ if [ "$deps_changed" = "1" ] || [ "$native_stale" = "1" ]; then
     # classifier reading everything npm said while the operator reads less.
     # The two alternatives below are a snapshot of npm's http vocabulary;
     # a third shape would leak noise to the display, never hide a diagnostic.
-    (cd "${CLAUDE_PLUGIN_DATA}" && npm install --engine-strict --no-audit --no-fund --no-progress --loglevel=http 2>&1) \
-      | tee "$npm_log" | grep -v '^npm http \(cache\|fetch GET 200\)'
+    (cd "$dir" && npm install --engine-strict --no-audit --no-fund --no-progress --loglevel=http 2>&1) 9>&- \
+      | tee "$npm_log" 9>&- | grep -v '^npm http \(cache\|fetch GET 200\)' 9>&-
     # Must stay on the line immediately after the pipeline: PIPESTATUS is
     # clobbered by the next command. Still index 0 through three stages.
     npm_status=${PIPESTATUS[0]}
   else
-    (cd "${CLAUDE_PLUGIN_DATA}" && npm install --engine-strict --no-audit --no-fund --no-progress 2>&1)
+    (cd "$dir" && npm install --engine-strict --no-audit --no-fund --no-progress 2>&1) 9>&-
     npm_status=$?
   fi
   if [ "$npm_status" -ne 0 ]; then
-    rm -f "${CLAUDE_PLUGIN_DATA}/package.json"
     echo "agent-coherence: npm install failed; coordinator will not start this session. Next session retries." >&2
     # WHY CLASSIFY, and why the order below is load-bearing. Every failure
     # here ends in the same node-gyp "find Python" trace, because
@@ -411,100 +542,252 @@ if [ "$deps_changed" = "1" ] || [ "$native_stale" = "1" ]; then
   # arrived: better-sqlite3's install script IS the prebuilt download, so an
   # `ignore-scripts=true` in any npmrc suppresses it silently and yields a
   # tree that installs "successfully" and then crash-loops at first Database
-  # open. Prove the addon loads before stamping this ABI as good.
-  if ! native_module_loads; then
-    rm -f "${CLAUDE_PLUGIN_DATA}/package.json"
+  # open. Prove the addon loads before the build is sealed.
+  native_module_loads "$dir"
+  native_status=$?
+  if [ "$native_status" = 4 ]; then
+    echo "agent-coherence: npm install reported success but node_modules lacks a package package.json declares; coordinator will not start this session. Next session retries." >&2
+    exit 1
+  fi
+  if [ "$native_status" != 0 ]; then
     echo "agent-coherence: npm install reported success but the better-sqlite3 native addon does not load; coordinator will not start this session. Next session retries." >&2
     echo "agent-coherence: (most likely 'ignore-scripts' is set in an npmrc — better-sqlite3's install" >&2
     echo "agent-coherence: script is the prebuilt download, so suppressing it leaves no binary behind.)" >&2
     exit 1
   fi
-  printf '%s\n' "$NODE_ABI" >"$ABI_STAMP"
-fi
+}
 
-# Stage 2: provision dist/ into PLUGIN_DATA so coordinator.js sits in the
-# same directory tree as node_modules (ESM resolution requirement). Two
-# sources, first match wins:
-#   (i)  The package ships a built dist/ (dev checkout after `npm run
-#        build`): mirror it. rsync only copies changed files; the cp -r
-#        fallback covers systems without rsync.
-#   (ii) No dist/ — the normal marketplace shape: build src/ with tsc,
-#        keyed on a package change or a stale built entry. tsc is a
-#        devDependency, so it lives in PLUGIN_DATA's install and usually in
-#        the plugin cache's own node_modules too.
-#
-# "Stale" is the Stage-1 ABI lesson applied to this key: package.json is
-# only a PROXY for "the package changed", so a plugin update that touches
-# src/ without bumping the version would otherwise keep the old dist/
-# forever. A git update rewrites mtimes, so newer-than-the-built-entry is
-# the signal that actually tracks the sources. A missing entry also counts,
-# which is what makes a FAILED build retry next session.
-#
-# An ABI change deliberately does NOT key this rebuild: dist/ is tsc output,
-# plain JavaScript, with no binding to process.versions.modules.
-dist_stale=0
-if [ ! -f "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" ]; then
-  dist_stale=1
-elif [ -n "$(find "${CLAUDE_PLUGIN_ROOT}/src" "${CLAUDE_PLUGIN_ROOT}/tsconfig.json" \
-  -newer "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" -print -quit 2>/dev/null)" ]; then
-  dist_stale=1
-fi
-if [ -f "${CLAUDE_PLUGIN_ROOT}/dist/coordinator.js" ]; then
-  mkdir -p "${CLAUDE_PLUGIN_DATA}/dist"
-  if command -v rsync >/dev/null 2>&1; then
-    rsync -a --delete "${CLAUDE_PLUGIN_ROOT}/dist/" "${CLAUDE_PLUGIN_DATA}/dist/"
-  else
-    cp -r "${CLAUDE_PLUGIN_ROOT}/dist/." "${CLAUDE_PLUGIN_DATA}/dist/"
-  fi
-elif [ "$deps_changed" = "1" ] || [ "$dist_stale" = "1" ]; then
-  tsc_bin=""
-  for cand in "${CLAUDE_PLUGIN_DATA}/node_modules/.bin/tsc" "${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsc"; do
+# Stage 2 into build directory $1: build src/ with tsc, which is a
+# devDependency, so it lives in the build's own install and usually in the
+# plugin cache's node_modules too.
+compile_dist() {
+  local dir="$1" tsc_bin="" cand
+  for cand in "$dir/node_modules/.bin/tsc" "${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsc"; do
     if [ -x "$cand" ]; then
       tsc_bin="$cand"
       break
     fi
   done
   if [ -z "$tsc_bin" ]; then
-    echo "agent-coherence: plugin package has no dist/ and no tsc to build src/ (checked ${CLAUDE_PLUGIN_DATA}/node_modules/.bin and ${CLAUDE_PLUGIN_ROOT}/node_modules/.bin); coordinator will not start this session. Next session retries." >&2
+    echo "agent-coherence: plugin package has no dist/ and no tsc to build src/ (checked ${dir}/node_modules/.bin and ${CLAUDE_PLUGIN_ROOT}/node_modules/.bin); coordinator will not start this session. Next session retries." >&2
     exit 1
   fi
-  echo "agent-coherence: plugin package has no dist/ (marketplace clone); building src/ into ${CLAUDE_PLUGIN_DATA}/dist" >&2
-  # Stage src + tsconfig next to node_modules and clean-build so no stale
-  # compiled files from a previous version survive a layout change.
-  if command -v rsync >/dev/null 2>&1; then
-    rsync -a --delete "${CLAUDE_PLUGIN_ROOT}/src/" "${CLAUDE_PLUGIN_DATA}/src/"
-  else
-    rm -rf "${CLAUDE_PLUGIN_DATA}/src"
-    mkdir -p "${CLAUDE_PLUGIN_DATA}/src"
-    cp -r "${CLAUDE_PLUGIN_ROOT}/src/." "${CLAUDE_PLUGIN_DATA}/src/"
+  echo "agent-coherence: plugin package has no dist/ (marketplace clone); building src/ into ${dir}/dist" >&2
+  if ! { copy_tree "${CLAUDE_PLUGIN_ROOT}/src" "$dir/src" && cp "${CLAUDE_PLUGIN_ROOT}/tsconfig.json" "$dir/"; }; then
+    echo "agent-coherence: could not copy src/ and tsconfig.json from ${CLAUDE_PLUGIN_ROOT}; coordinator will not start this session. Next session retries." >&2
+    exit 1
   fi
-  cp "${CLAUDE_PLUGIN_ROOT}/tsconfig.json" "${CLAUDE_PLUGIN_DATA}/" || exit 1
-  # Build beside the published dist/ and swap it in only once the build
-  # succeeds: every workspace's hooks and Node coordinators load this one
-  # copy, so a failed or interrupted build must leave the last working one
-  # in place rather than none (#289).
-  staged_dist="${CLAUDE_PLUGIN_DATA}/dist.next"
-  rm -rf "$staged_dist" "${CLAUDE_PLUGIN_DATA}/dist.old"
-  if ! (cd "${CLAUDE_PLUGIN_DATA}" && "$tsc_bin" -p tsconfig.json --outDir "$staged_dist") >&2; then
-    rm -rf "$staged_dist"
+  if ! (cd "$dir" && "$tsc_bin" -p tsconfig.json --outDir "$dir/dist") 9>&- >&2; then
     echo "agent-coherence: tsc build failed; the previous build stays in place, and the coordinator will not start this session. Next session retries." >&2
     exit 1
   fi
-  if [ -d "${CLAUDE_PLUGIN_DATA}/dist" ]; then
-    mv "${CLAUDE_PLUGIN_DATA}/dist" "${CLAUDE_PLUGIN_DATA}/dist.old" || exit 1
+}
+
+# Stage 1 into build directory $1.
+stage_node_modules() {
+  local dir="$1" seed seed_deps=""
+  # Started from a finished build's node_modules for this same ABI,
+  # the install is the incremental one an in-place install was, into a tree
+  # no reader loads. Never started from another ABI's: a compiled
+  # better_sqlite3.node is bound to process.versions.modules, and npm leaves a
+  # package it finds at a satisfying version alone, so only a clean install
+  # makes prebuild-install fetch the prebuilt for this ABI. `npm rebuild` is
+  # deliberately not used: it compiles from source via node-gyp, which needs
+  # Python and a C++ toolchain, the exact dependencies decision B's zero-Python
+  # guarantee forbids. And never started from DATA/node_modules: an older
+  # plugin version may be rewriting it.
+  seed="$(find_build "$ABI_TAG-*")" || seed=""
+  if [ -n "$seed" ]; then
+    copy_tree "$BUILDS/$seed/node_modules" "$dir/node_modules" || exit 1
+    read -r _ seed_deps <"$BUILDS/$seed/.ok" || true
+  elif [ -n "$published" ] && [ "${published%%-*}" != "$NODE_ABI" ]; then
+    echo "agent-coherence: Node ABI changed (${published%%-*} -> ${NODE_ABI}); reinstalling native deps" >&2
   fi
-  if ! mv "$staged_dist" "${CLAUDE_PLUGIN_DATA}/dist"; then
-    [ -d "${CLAUDE_PLUGIN_DATA}/dist.old" ] && mv "${CLAUDE_PLUGIN_DATA}/dist.old" "${CLAUDE_PLUGIN_DATA}/dist"
+  if [ "$seed_deps" = "$DEPS_DIGEST" ]; then
+    if ! native_module_loads "$dir"; then
+      # A seed whose addon does not load: install over it would leave the
+      # stale binary in place, so start this one clean.
+      echo "agent-coherence: provisioned native addon does not load under Node ${NODE_VERSION_RAW} (ABI ${NODE_ABI}); reinstalling" >&2
+      rm -rf "$dir/node_modules" 9>&-
+      install_deps "$dir"
+    fi
+  else
+    install_deps "$dir"
+  fi
+  # A package with no dependencies gets no node_modules from npm.
+  mkdir -p "$dir/node_modules" || exit 1
+}
+
+# Stage 2 into build directory $1.
+stage_dist() {
+  local dir="$1" same_src
+  # dist/ beside node_modules in the same build, so coordinator.js
+  # sits in the same directory tree as node_modules (ESM resolution
+  # requirement). A dev checkout ships its own dist/; a build of the same
+  # sources for another ABI already holds this dist/ (tsc output is plain
+  # JavaScript, bound to no ABI); else src/ is built.
+  if [ "$build_from" = dist ]; then
+    copy_tree "${CLAUDE_PLUGIN_ROOT}/dist" "$dir/dist" || exit 1
+  elif same_src="$(find_build "*-${SRC_DIGEST}.*")"; then
+    copy_tree "$BUILDS/$same_src/dist" "$dir/dist" || exit 1
+  else
+    compile_dist "$dir"
+  fi
+}
+
+# Make the build for BUILD_KEY in a new directory nothing else writes, seal
+# it, and set BUILD. Any failure exits 1, and the EXIT trap removes the
+# unfinished directory, so a failed or interrupted provision changes nothing a
+# reader loads (one killed outright is left for collect_builds).
+build_new() {
+  local dir
+  if ! { mkdir -p "$BUILDS" && dir="$(mktemp -d "$BUILDS/$BUILD_KEY.XXXXXX")"; } 2>/dev/null; then
+    echo "agent-coherence: could not create a build directory under ${BUILDS}; coordinator will not start this session. Next session retries." >&2
     exit 1
   fi
-  rm -rf "${CLAUDE_PLUGIN_DATA}/dist.old"
+  NEW_BUILD_DIR="$dir"
+  # A cold `npm install` regularly outruns the SessionStart hook's time box,
+  # and without the trap every timed-out provision leaves a full npm log
+  # behind in TMPDIR, and its unfinished build in builds/ until it is collected.
+  trap 'rm -f "${npm_log:-}"; [ -z "${NEW_BUILD_DIR:-}" ] || rm -rf "$NEW_BUILD_DIR"' EXIT
+  # package.json first: it makes the build directory npm's project root.
+  cp "${CLAUDE_PLUGIN_ROOT}/package.json" "$dir/" || exit 1
+  if [ -f "${CLAUDE_PLUGIN_ROOT}/package-lock.json" ]; then
+    cp "${CLAUDE_PLUGIN_ROOT}/package-lock.json" "$dir/" || exit 1
+  fi
+  stage_node_modules "$dir"
+  stage_dist "$dir"
+  # Provision verification — never seal (and so never publish or spawn) a
+  # missing entry point.
+  if [ ! -f "$dir/dist/coordinator.js" ]; then
+    echo "agent-coherence: ${dir}/dist/coordinator.js missing after provisioning; coordinator will not start this session. Next session retries." >&2
+    python_backend_hint >&2
+    exit 1
+  fi
+  # The seal, written last. Its ABI and install digest let a later build for
+  # this ABI start from this one's node_modules.
+  printf '%s %s\n' "$NODE_ABI" "$DEPS_DIGEST" >"$dir/.ok" || exit 1
+  NEW_BUILD_DIR=""
+  BUILD="${dir##*/}"
+}
+
+# Point `current` at build $1. The line is written beside it, then renamed over
+# it: rename(2) replaces a regular file atomically, so a reader finds the old
+# name or the new, never a partial line. The build named before is marked
+# retired, which starts its grace.
+publish_build() {
+  local name="$1" previous="$published" staged="${POINTER}.$$.tmp"
+  rm -f "$BUILDS/$name/.retired"
+  [ "$name" = "$previous" ] && return 0
+  if ! { printf '%s\n' "$name" >"$staged" && mv -f "$staged" "$POINTER"; } 2>/dev/null; then
+    rm -f "$staged"
+    echo "agent-coherence: could not publish ${BUILDS}/${name}; hooks keep the build published before, and the coordinator will not start this session. Next session retries." >&2
+    exit 1
+  fi
+  published="$name"
+  if [ -n "$previous" ] && [ -d "$BUILDS/$previous" ]; then
+    : >"$BUILDS/$previous/.retired"
+  fi
+}
+
+# Remove the builds no reader can still be loading. Kept: the published build;
+# the one retired last, so a flip between two Node majors or plugin versions
+# goes back to it without a rebuild; any retired less than BUILD_GRACE_MIN
+# ago; and any unfinished one younger than UNFINISHED_BUILD_MIN. .ok goes first, so a removal cut short never
+# looks finished. A running coordinator keeps working after its build is
+# removed: it loads everything it needs when it starts.
+collect_builds() {
+  local dir name last_retired
+  last_retired="$(ls -t "$BUILDS"/*/.retired 2>/dev/null | head -n 1)"
+  for dir in "$BUILDS"/*/; do
+    dir="${dir%/}"
+    name="${dir##*/}"
+    [ -d "$dir" ] || continue
+    [ "$name" = "$published" ] && continue
+    [ "$dir/.retired" = "$last_retired" ] && continue
+    if [ -f "$dir/.ok" ]; then
+      # A finished build nothing retired, made by a start that lost a race to
+      # publish: its grace runs from when it was sealed, so it never passes
+      # for the build retired last.
+      if [ ! -f "$dir/.retired" ]; then
+        : >"$dir/.retired"
+        touch -r "$dir/.ok" "$dir/.retired"
+        continue
+      fi
+      [ -n "$(find "$dir/.retired" -mmin +"$BUILD_GRACE_MIN" 2>/dev/null)" ] || continue
+    else
+      [ -n "$(find "$dir" -maxdepth 0 -mmin +"$UNFINISHED_BUILD_MIN" 2>/dev/null)" ] || continue
+    fi
+    rm -f "$dir/.ok"
+    rm -rf "$dir" 9>&-
+  done
+  find "$CLAUDE_PLUGIN_DATA" -maxdepth 1 -name 'current.*.tmp' -mmin +"$STALE_POINTER_TMP_MIN" -exec rm -f {} + 2>/dev/null
+}
+
+# Another start held the lock for PROVISION_WAIT_S. Writing anyway would race
+# it, so this start runs a finished build for its key if there is one, else,
+# to start a coordinator, the published build when it was made for this ABI.
+# Otherwise it stops, and the next session retries.
+use_build_on_lock_timeout() {
+  local usable
+  usable="$(find_build "$BUILD_KEY.*")" || usable=""
+  if [ -z "$usable" ] && [ "${AGENT_COHERENCE_PROVISION_ONLY:-}" != "1" ]; then
+    case "$published" in "$ABI_TAG"-*) build_complete "$published" && usable="$published" ;; esac
+  fi
+  if [ -z "$usable" ]; then
+    echo "agent-coherence: another session start has held ${PROVISION_LOCK} for ${PROVISION_WAIT_S}s and no build for this package and Node ${NODE_VERSION_RAW} is ready; coordinator will not start this session. Next session retries." >&2
+    exit 1
+  fi
+  BUILD="$usable"
+  case "$usable" in
+    "$BUILD_KEY".*)
+      echo "agent-coherence: another session start has held ${PROVISION_LOCK} for ${PROVISION_WAIT_S}s; this session runs the finished build for this package (${usable}). Next session publishes it." >&2
+      ;;
+    *)
+      # Stage 3 keeps any live coordinator, so one started from the older
+      # build runs it until it stops.
+      echo "agent-coherence: another session start has held ${PROVISION_LOCK} for ${PROVISION_WAIT_S}s and is still building this package; this session uses the build published before it (${usable}). A coordinator started from that build keeps it until it stops: once that start has finished, stop it (kill \"\$(head -n 1 '${PIDFILE}')\") and start a new session to run the new build." >&2
+      ;;
+  esac
+}
+
+# Stages 1-2: have a finished build for BUILD_KEY, published. The common case
+# takes no lock and writes nothing.
+BUILD=""
+read_pointer
+if published_is_wanted; then
+  BUILD="$published"
+else
+  acquire_provision_lock
+  lock_status=$?
+  case "$lock_status" in
+    1) use_build_on_lock_timeout ;;
+    2) BUILD="$published" ;;
+    *)
+      if [ "$lock_status" = 3 ]; then
+        echo "agent-coherence: nothing here can lock ${PROVISION_LOCK}; provisioning unlocked, into a build directory no other start writes" >&2
+      fi
+      # A start that waited reads `current` again: the one it waited for most
+      # likely built this very key.
+      read_pointer
+      if ! BUILD="$(find_build "$BUILD_KEY.*")"; then
+        # Provisions killed mid-build leave unfinished builds behind.
+        collect_builds
+        build_new
+      fi
+      publish_build "$BUILD"
+      collect_builds
+      release_provision_lock
+      ;;
+  esac
 fi
+BUILD_DIR="${BUILDS}/${BUILD}"
 
 # Provision verification — never spawn (or report success for) a missing
 # entry point. Before this check, a dist-less package produced an infinite
 # MODULE_NOT_FOUND crash loop behind a false "spawned" message.
-if [ ! -f "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" ]; then
-  echo "agent-coherence: ${CLAUDE_PLUGIN_DATA}/dist/coordinator.js missing after provisioning; coordinator will not start this session. Next session retries." >&2
+if [ ! -f "${BUILD_DIR}/dist/coordinator.js" ]; then
+  echo "agent-coherence: ${BUILD_DIR}/dist/coordinator.js missing after provisioning; coordinator will not start this session. Next session retries." >&2
   python_backend_hint >&2
   exit 1
 fi
@@ -668,7 +951,7 @@ const log = openSync(logPath, "a");
 const child = spawn(process.execPath, [entry], { detached: true, stdio: ["ignore", log, log] });
 if (child.pid !== undefined) process.stdout.write(String(child.pid));
 child.unref();
-' "${CLAUDE_PLUGIN_DATA}/dist/coordinator.js" "$COORD_LOG" 2>>"$COORD_LOG"
+' "${BUILD_DIR}/dist/coordinator.js" "$COORD_LOG" 2>>"$COORD_LOG"
 }
 pidfile_before_spawn="$(cat "$PIDFILE" 2>/dev/null)"
 SPAWNED_PID="$(launch_coordinator)"
@@ -736,15 +1019,17 @@ fi
 if [ "$gate_outcome" != "serving" ] && ! kill -0 "$SPAWNED_PID" 2>/dev/null; then
   echo "agent-coherence: Node coordinator exited before it started serving; recent ${COORD_LOG}:" >&2
   tail -n 12 "$COORD_LOG" >&2 2>/dev/null || true
-  # A NODE_MODULE_VERSION death means node_modules is ABI-stale despite a
-  # stamp that vouched for it — a hand-restored tree, a partial install, a
-  # stamp written before this session's node changed underneath it. Drop the
-  # stamp so the next session probes and reinstalls instead of crash-looping
-  # forever. Scoped to that one error, and self-limiting: an unstamped tree
-  # that actually loads is only backfilled, never reinstalled, so an
-  # unrelated coordinator crash cannot turn into a reinstall every session.
-  if tail -n 40 "$COORD_LOG" 2>/dev/null | grep -q 'NODE_MODULE_VERSION'; then
-    rm -f "$ABI_STAMP"
+  # A NODE_MODULE_VERSION death means the build's node_modules is ABI-stale
+  # despite the seal that vouched for it — a hand-restored tree, a seal
+  # written before this session's node changed underneath it. Remove the seal
+  # so the next session makes a new build instead of crash-looping forever.
+  # coordinator.log is every workspace's, so the line may be another
+  # coordinator's or an older crash's: the seal goes only when this build's
+  # addon does not load here, so an unrelated crash cannot turn into a rebuild
+  # every session. Hooks keep running the build meanwhile: they load no
+  # native addon.
+  if tail -n 40 "$COORD_LOG" 2>/dev/null | grep -q 'NODE_MODULE_VERSION' && ! native_module_loads "$BUILD_DIR"; then
+    rm -f "${BUILD_DIR}/.ok"
     echo "agent-coherence: (native-ABI mismatch detected; next session reprovisions node_modules.)" >&2
   fi
   exit 1

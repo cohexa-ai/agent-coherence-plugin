@@ -16,7 +16,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -336,7 +336,10 @@ test(
       // build/config.gypi at configure time. The .node present proves the
       // module installed; config.gypi absent proves it arrived as a prebuilt
       // and NOT via a silent local compile with system Python.
-      const bs3 = join(root, "plugin-data", "node_modules", "better-sqlite3");
+      // The install lives in the build the bootstrap published (#295).
+      const pluginData = join(root, "plugin-data");
+      const published = readFileSync(join(pluginData, "current"), "utf8").trim();
+      const bs3 = join(pluginData, "builds", published, "node_modules", "better-sqlite3");
       assert.equal(
         existsSync(join(bs3, "build", "Release", "better_sqlite3.node")),
         true,

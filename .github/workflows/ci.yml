@@ -222,7 +222,7 @@ jobs:
           echo "--- hook stderr ---"; cat hook.err
           test "$ec" -eq 0
           grep -q "spawned Node coordinator" hook.err
-          test -f /tmp/plugin-data/dist/coordinator.js
+          test -f "/tmp/plugin-data/builds/$(cat /tmp/plugin-data/current)/dist/coordinator.js"
           pid=$(sed -n 's/.*pid=\([0-9]\{1,\}\).*/\1/p' hook.err | head -1)
           sleep 2
           kill -0 "$pid"
@@ -230,9 +230,9 @@ jobs:
           # First provision must stamp the backend so the dispatcher's
           # state.db guard cannot reroute session 2 to the python default.
           test "$(cat .coherence/coordinator_backend)" = "node"
-          # The hook client must resolve its Node client from the provisioned
-          # PLUGIN_DATA dist (the package has none) and complete a real wire
-          # round-trip — a fresh pre-read of a default-tracked artifact.
+          # The hook client must resolve its Node client from the build
+          # provisioned under PLUGIN_DATA (the package has none) and complete a
+          # real wire round-trip — a fresh pre-read of a default-tracked artifact.
           echo hello > CLAUDE.md
           printf '{"session_id":"44444444-4444-4444-8444-444444444444","tool_input":{"file_path":"%s/CLAUDE.md"}}' "$PWD" \
             | bash "$CLAUDE_PLUGIN_ROOT/bin/hook-client" pre-read > client.out
