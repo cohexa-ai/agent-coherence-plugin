@@ -74,6 +74,12 @@ node_abi_supported() {
   esac
 }
 
+# What the Node bootstrap needs to provision: node and npm on PATH, and a
+# Node major with a better-sqlite3 prebuilt.
+node_runtime_usable() {
+  command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && node_abi_supported
+}
+
 # >>> coherence-dir-check: keep byte-identical in ensure-coordinator-dispatch
 # and ensure-coordinator-node (pinned by a test). cohexa-ai/agent-coherence#498.
 #
@@ -142,13 +148,11 @@ refuse_coherence_dir() {   # 0 = refused (JSON printed), 1 = go on
 # refreshes that copy too, with the Node bootstrap's own Stages 0-2 and no
 # coordinator. Only a copy the shim would run is refreshed: with none
 # installed, the hooks run the Python client and this start leaves them so.
-# Never on stdout (the hook's output is the Python bootstrap's), never on
-# stdin, and a failure only says so: the hooks keep the copy they had.
 refresh_installed_hook_client() {
   local plugin_root="${CLAUDE_PLUGIN_ROOT:-$(dirname "$self_dir")}"
   [ -n "${CLAUDE_PLUGIN_DATA:-}" ] && [ -f "${CLAUDE_PLUGIN_DATA}/dist/hook_client.js" ] || return 0
   [ -f "${plugin_root}/dist/hook_client.js" ] && return 0
-  { command -v node && command -v npm; } >/dev/null 2>&1 && node_abi_supported || return 0
+  node_runtime_usable || return 0
   if ! AGENT_COHERENCE_PROVISION_ONLY=1 "$self_dir/ensure-coordinator-node" </dev/null >&2; then
     echo "agent-coherence: could not refresh the Node hook client in ${CLAUDE_PLUGIN_DATA}; hooks keep running the copy installed before" >&2
   fi
@@ -183,7 +187,7 @@ if [ -z "$backend" ]; then
       # (Node-born stores never reach this arm — the Node bootstrap's
       # first-provision stamp resolves them explicitly at the file step.)
       backend="python"
-    elif command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && node_abi_supported; then
+    elif node_runtime_usable; then
       # (b) Fresh workspace with a usable Node runtime → the zero-Python path.
       backend="node"
     else
@@ -218,8 +222,8 @@ case "$backend" in
     # the Node hook client an earlier session installed. The Python start goes
     # first, so a refresh that outruns the hook's time box cannot cost it.
     "$self_dir/ensure-coordinator"
-    status=$?
+    python_bootstrap_status=$?
     refresh_installed_hook_client
-    exit "$status"
+    exit "$python_bootstrap_status"
     ;;
 esac
